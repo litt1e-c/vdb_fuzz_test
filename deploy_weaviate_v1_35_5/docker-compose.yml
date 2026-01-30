@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+  weaviate:
+    image: cr.weaviate.io/semitechnologies/weaviate:1.35.5
+    container_name: weaviate-1.35.5
+    restart: unless-stopped
+
+    ports:
+      - "8080:8080"     # HTTP REST API
+      - "50051:50051"   # gRPC API
+
+    environment:
+      # Query defaults
+      QUERY_DEFAULTS_LIMIT: 25
+
+      # Anonymous access (no auth)
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+
+      # Persistence path inside container
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+
+      # Pure vector mode (no built-in embedding models)
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: ''
+
+      # Optional: gRPC explicitly enabled (1.35.x默认已开，写上更稳)
+      GRPC_PORT: 50051
+
+      # Optional logging
+      LOG_LEVEL: info
+
+    volumes:
+      # Persistent data storage
+      - ./weaviate_data:/var/lib/weaviate
+
+    networks:
+      - weaviate_net
+
+
+networks:
+  weaviate_net:
+    driver: bridge

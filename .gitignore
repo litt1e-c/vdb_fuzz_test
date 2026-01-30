@@ -1,0 +1,34 @@
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# ===== Logs & outputs =====
+*.log
+*.txt
+*.csv
+*.json
+
+# ===== Fuzz / test artifacts =====
+*_test_*.log
+*_probe_*.log
+*_result*.log
+
+# ===== Databases / runtime data =====
+*.db
+*.sqlite
+*.sqlite3
+
+# ===== Docker / volume data =====
+volumes/
+*/volumes/
+*/data/
+*/weaviate_data/
+*/etcd/
+*/member/
+
+# ===== OS =====
+.DS_Store
