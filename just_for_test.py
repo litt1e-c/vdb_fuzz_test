@@ -1,125 +1,96 @@
-import time
 import random
-import json
 from pymilvus import (
     connections,
-    utility,
     FieldSchema,
     CollectionSchema,
     DataType,
     Collection,
+    utility
 )
 
-# --- 配置 ---
-HOST = "127.0.0.1"
-PORT = "19531"
-COLLECTION_NAME = "test_issue_45670_json_array"
-DIM = 8
+# 1. 连接 Milvus
+print("Connecting to Milvus on port 19531...")
+connections.connect(alias="default", host="localhost", port="19531")
 
-def reproduce():
-    # 1. 连接 Milvus
-    print(f"🔌 Connecting to {HOST}:{PORT}...")
-    try:
-        connections.connect("default", host=HOST, port=PORT)
-    except Exception as e:
-        print(f"❌ Connection failed: {e}")
-        return
+collection_name = "test_offset_mode_validity_bug"
+dim = 8
 
-    # 2. 清理环境
-    if utility.has_collection(COLLECTION_NAME):
-        utility.drop_collection(COLLECTION_NAME)
+# 2. 定义 Schema
+# 必须包含 Nullable 的 Array
+fields = [
+    FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
+    FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dim),
+    FieldSchema(name="tags", dtype=DataType.ARRAY, element_type=DataType.INT64, max_capacity=10, nullable=True)
+]
 
-    # 3. 定义 Schema
-    fields = [
-        FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
-        FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=DIM),
-        FieldSchema(name="meta_json", dtype=DataType.JSON),
-    ]
-    schema = CollectionSchema(fields, enable_dynamic_field=True)
-    col = Collection(COLLECTION_NAME, schema)
-    
-    # 4. 插入数据
-    print("🌊 Inserting data...")
-    rows = []
-    target_count = 0
-    for i in range(1000):
-        vec = [random.random() for _ in range(DIM)]
-        if i % 2 == 0:
-            json_payload = {"tags": [10, 20], "info": "target"}
-            target_count += 1
-        else:
-            json_payload = {"tags": [30, 40], "info": "noise"}
-            
-        rows.append({
-            "id": i,
-            "vector": vec,
-            "meta_json": json_payload
-        })
-    
-    col.insert(rows)
-    print(f"✅ Inserted {len(rows)} rows. Expected hits: {target_count}")
+schema = CollectionSchema(fields, description="Reproduce Offset Mode Validity Bug")
 
-    # --- Prerequisite: Vector Index ---
-    print("🔨 Building Vector Index...")
-    col.create_index("vector", {"index_type": "FLAT", "metric_type": "L2", "params": {}})
+if utility.has_collection(collection_name):
+    utility.drop_collection(collection_name)
 
-    # 5. 【阶段一：内存查询】
-    print("📥 Loading collection for Phase 1...")
-    col.load()
-    
-    expr = 'meta_json["tags"][0] == 10'
-    print(f"\n🔍 [Phase 1] Querying Growing Segment (Memory)...")
-    print(f"   Expr: {expr}")
-    
-    res_mem = col.query(expr, output_fields=["id"])
-    print(f"   Hits: {len(res_mem)}")
-    
-    if len(res_mem) == target_count:
-        print("   -> ✅ Memory Query Correct.")
-    else:
-        print(f"   -> ⚠️ Memory Query Incorrect! Expected {target_count}, got {len(res_mem)}")
+collection = Collection(name=collection_name, schema=schema)
 
-    # 6. 【制造 Issue 场景：建立通用 JSON 索引】
-    print(f"\n🔨 [Trigger] Building Generic Inverted Index on 'meta_json'...")
-    col.release() 
-    
-    try:
-        # ========================================================
-        # 【关键修复】：不指定 json_path，建立全字段倒排索引
-        # 这会覆盖 meta_json 下的所有路径，包括 "tags"
-        # 优化器容易因此误判，认为可以用这个索引去查 tags[0]
-        # ========================================================
-        index_params = {
-            "index_type": "INVERTED", 
-            "params": {} # 空参数表示索引整个 JSON
-        }
-        col.create_index("meta_json", index_name="idx_json_generic", index_params=index_params)
-        print("   -> JSON Generic Index built successfully.")
-    except Exception as e:
-        print(f"   -> ❌ Index build failed: {e}")
-        return
+# 3. 准备数据
+# 2000 行
+# Row 0: tags = None (Null)
+# Row 1-1999: tags = [1, 2, 3]
+count = 2000
+ids = list(range(count))
+vectors = [[0.1] * dim for _ in range(count)]
+tags = []
+tags.append(None) # Row 0 is Null
+for i in range(1, count):
+    tags.append([1, 2, 3])
 
-    # 7. 【阶段二：落盘与重载】
-    print(f"\n💾 [Phase 2] Flushing and Reloading (Sealed Segment)...")
-    col.flush()
-    col.load()
-    
-    # 8. 【阶段三：磁盘查询】
-    print(f"\n🔍 [Phase 3] Querying Sealed Segment (Disk + Index)...")
-    try:
-        res_disk = col.query(expr, output_fields=["id"])
-        print(f"   Hits: {len(res_disk)}")
-        
-        if len(res_disk) == target_count:
-            print("   -> ✅ Sealed Query Correct. (System works fine)")
-        elif len(res_disk) == 0:
-            print("   -> ❌ BUG REPRODUCED! Hits dropped to 0 after Flush/Index.")
-            print("      [Analysis]: Optimizer failed to handle array index access on sealed segment.")
-        else:
-            print(f"   -> ⚠️ Result Mismatch. Expected {target_count}, got {len(res_disk)}")
-            
-    except Exception as e:
-        print(f"   -> 💥 Query Crashed: {e}")
+data = [ids, vectors, tags]
 
-if __name__ == "__main__":
-    reproduce()
+print(f"Inserting {count} rows (Row 0 is Null)...")
+collection.insert(data)
+collection.flush()
+
+print("Creating Index...")
+index_params = {
+    "metric_type": "L2",
+    "index_type": "IVF_FLAT",
+    "params": {"nlist": 32}
+}
+collection.create_index("vector", index_params)
+collection.load()
+
+# 4. 执行触发 Bug 的查询
+# 关键组合：
+# 1. id >= 0: 选中所有行，迫使 Miss Ratio = 0，触发 Offset Mode。
+# 2. array_length(tags) == 0: 
+#    Offset Mode 会忽略 Row 0 的 Null 标记，读取到底层默认的空数组，导致 length==0 成立。
+expr = "id >= 0 and array_length(tags) == 0"
+
+print(f"\nExecuting Query: {expr}")
+results = collection.query(
+    expr=expr,
+    output_fields=["id", "tags"]
+)
+
+# 5. 验证结果
+print("-" * 50)
+print(f"Result count: {len(results)}")
+
+bug_reproduced = False
+for res in results:
+    if res['id'] == 0:
+        bug_reproduced = True
+        print(f"❌ BUG REPRODUCED: Found Row 0! Tags: {res['tags']}")
+        print("Reason: Offset Mode ignored the 'validity' bitmap. It treated the Null array as an empty array (length=0).")
+        break
+
+if not bug_reproduced:
+    print("✅ BEHAVIOR CORRECT: Row 0 was filtered out.")
+    if len(results) > 0:
+        print(f"Note: Found other rows: {[r['id'] for r in results]}")
+else:
+    print("-" * 50)
+    print("Code Proof:")
+    print("In 'ElementFilterBitsNode.cpp', the 'offset_mode' block calls 'RowBitsetToElementOffsets'.")
+    print("It uses 'doc_bitset' (data) but completely ignores 'doc_bitset_valid' (validity).")
+    print("So Null rows (which have valid=0) are processed as if they are valid.")
+
+# collection.drop()

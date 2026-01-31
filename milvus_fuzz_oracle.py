@@ -27,7 +27,17 @@ BATCH_SIZE = 200         # 批次大小（内存模式可以大一些）
 SLEEP_INTERVAL = 0.01    # 每次插入后暂停 10ms（内存模式更快）
 FLUSH_INTERVAL = 500     # 每 500 条刷盘
 
-INDEX_TYPE = random.choice(["FLAT", "HNSW", "IVF_FLAT"])  # 【随机化】每次运行选择不同的索引类型
+# 稳定的索引类型列表（移除不稳定或需要特殊配置的索引）
+ALL_INDEX_TYPES = [
+    "FLAT", "HNSW", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"
+]
+INDEX_TYPE = random.choice(ALL_INDEX_TYPES)  # 【随机化】每次运行选择不同的索引类型
+
+# 全局度量类型（L2 欧氏距离）
+METRIC_TYPE = "L2"
+
+# 记录当前索引类型（用于索引重建时避免重复）
+CURRENT_INDEX_TYPE = INDEX_TYPE
 VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)  # 【随机化】20-80% 概率做向量+标量联合校验
 VECTOR_TOPK = random.randint(50, 200)          # 【随机化】TopK 在 50-200 之间随机
 
@@ -54,12 +64,12 @@ def get_type_name(dtype):
     return type_map.get(dtype, str(dtype))
 
 class DataManager:
-    def generate_single_row(self):
+    def generate_single_row(self, id_override=None):
         """生成一行与schema一致的新数据（含唯一id），与generate_data逻辑保持一致"""
         rng = np.random.default_rng()
         row = {}
         # 生成唯一id
-        row["id"] = int(time.time() * 1000000) + random.randint(1, 1000000)
+        row["id"] = int(id_override) if id_override is not None else int(time.time() * 1000000) + random.randint(1, 1000000)
         
         for field in self.schema_config:
             fname = field["name"]
@@ -355,6 +365,22 @@ class MilvusManager:
                 "params": {"nlist": 128}
             }
 
+        elif INDEX_TYPE == "IVF_SQ8":
+            print("🔨 Building IVF_SQ8 Index...")
+            index_params = {
+                "metric_type": "L2",
+                "index_type": "IVF_SQ8",
+                "params": {"nlist": 128}
+            }
+
+        elif INDEX_TYPE == "IVF_PQ":
+            print("🔨 Building IVF_PQ Index...")
+            index_params = {
+                "metric_type": "L2",
+                "index_type": "IVF_PQ",
+                "params": {"nlist": 128, "m": 8, "nbits": 8}
+            }
+
         try:
             # 创建索引
             self.col.create_index("vector", index_params)
@@ -407,7 +433,9 @@ class OracleQueryGenerator:
         专门生成高级 JSON 查询
         """
         json_fields = [f for f in self.schema if f["type"] == DataType.JSON]
-        if not json_fields: return ("", None)
+        if not json_fields:
+            # 兜底表达式，永远为真
+            return ("id > 0", None)
         field = random.choice(json_fields); name = field["name"]; series = self.df[name]
         strategy = random.choice(["range", "nested", "index", "multi_key"])
 
@@ -475,7 +503,8 @@ class OracleQueryGenerator:
 
             return (expr, series.apply(check_multi))
 
-        return ("", None)
+        # 兜底表达式，永远为真
+        return ("id > 0", None)
     def get_value_for_query(self, fname, ftype):
         """
         获取一个用于查询的值，有 10% 的概率返回该类型的一个“不存在的值”。
@@ -548,7 +577,8 @@ class OracleQueryGenerator:
         # 获取查询值
         val = self.get_value_for_query(name, ftype)
         if val is None:
-            return (f"{name} is null", series.isnull())
+            # 兜底表达式，永远为真
+            return ("id > 0", series.notnull())
 
         mask = None
         expr = ""
@@ -1030,11 +1060,87 @@ def run_equivalence_mode(rounds=100, seed=None):
         for i in range(rounds):
             print(f"\r⚖️  Test {i+1}/{rounds}...", end="", flush=True)
             
+            # --- 【动态数据变动】每轮有 20% 概率触发 ---
+            if i > 0 and random.random() < 0.2:
+                op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
+                batch_count = random.randint(1, 5)
+
+                if op == "insert":
+                    new_rows = []
+                    rows_with_vec = []
+                    for _ in range(batch_count):
+                        row = dm.generate_single_row()
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        new_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+                    try:
+                        mm.col.insert(rows_with_vec)
+                        mm.col.flush()
+                        dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                        dm.vectors = np.vstack([dm.vectors, np.array([r["vector"] for r in rows_with_vec])])
+                        file_log(f"[Dynamic] Inserted {len(new_rows)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Insert failed: {e}")
+
+                elif op == "delete" and len(dm.df) > 100:
+                    del_count = min(batch_count, len(dm.df) - 100)
+                    del_ids = random.sample(dm.df["id"].tolist(), del_count)
+                    try:
+                        expr = f"id in {del_ids}"
+                        mm.col.delete(expr)
+                        mm.col.flush()
+                        idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
+                        dm.df = dm.df.drop(idx).reset_index(drop=True)
+                        dm.vectors = np.delete(dm.vectors, idx, axis=0)
+                        file_log(f"[Dynamic] Deleted {len(del_ids)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Delete failed: {e}")
+
+                else:  # upsert
+                    upsert_rows = []
+                    rows_with_vec = []
+                    new_rows_list = []
+                    new_vectors = []
+                    for _ in range(batch_count):
+                        use_existing = (not dm.df.empty) and (random.random() < 0.7)
+                        if use_existing:
+                            target_id = random.choice(dm.df["id"].tolist())
+                        else:
+                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+                        row = dm.generate_single_row(id_override=target_id)
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        upsert_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+                    try:
+                        mm.col.upsert(rows_with_vec)
+                        mm.col.flush()
+                        for row, row_with_vec in zip(upsert_rows, rows_with_vec):
+                            rid = row["id"]
+                            match_idx = dm.df.index[dm.df["id"] == rid].tolist()
+                            if match_idx:
+                                idx = match_idx[0]
+                                for k, v in row.items():
+                                    dm.df.at[idx, k] = v
+                                dm.vectors[idx] = row_with_vec["vector"]
+                            else:
+                                new_rows_list.append(row)
+                                new_vectors.append(row_with_vec["vector"])
+                        if new_rows_list:
+                            dm.df = pd.concat([dm.df, pd.DataFrame(new_rows_list)], ignore_index=True)
+                            dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
+                        file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Upsert failed: {e}")
+
             # 1. 生成一个基础查询 (Base Query)
             # 使用较小的深度，方便人类阅读 debug
             base_expr = ""
             while not base_expr:
-                base_expr, _ = qg.gen_complex_expr(depth=random.randint(1, 10))
+                base_expr, _ = qg.gen_complex_expr(depth=random.randint(1, 15))
             
             # 2. 生成变体 (Mutations)
             mutations = qg.mutate_expr(base_expr)
@@ -1210,44 +1316,174 @@ def run(rounds = 100, seed=None):
         for i in range(total_test):
             print(f"\r⏳ Running Test {i+1}/{total_test}...", end="", flush=True)
 
-            # --- 动态插入/删除 ---
-            if i > 0 and i % 10 == 0:
-                op = random.choice(["insert", "delete"])
-                if op == "insert":
-                    # 生成新数据（与schema一致）
-                    new_row = dm.generate_single_row()
+            # --- 随机触发 compaction ---
+            if i > 0 and i % 25 == 0:
+                try:
+                    mm.col.compact()
+                    file_log(f"[Maintenance] Triggered compaction at round {i}")
+                except Exception as e:
+                    file_log(f"[Maintenance] Compaction failed at round {i}: {e}")
+
+            # --- 随机触发索引重建 ---
+            if i > 0 and i % 40 == 0:
+                global CURRENT_INDEX_TYPE
+                try:
+                    # 选择一个不同于当前的索引类型
+                    candidates = [t for t in ALL_INDEX_TYPES if t != CURRENT_INDEX_TYPE]
+                    if not candidates:
+                        candidates = ALL_INDEX_TYPES
+                    new_index_type = random.choice(candidates)
+                    old_index_type = CURRENT_INDEX_TYPE
+                    
+                    # 根据索引类型设置参数（注意 Milvus 参数结构）
+                    if new_index_type == "HNSW":
+                        create_params = {
+                            "index_type": "HNSW",
+                            "metric_type": METRIC_TYPE,
+                            "params": {"M": 8, "efConstruction": 64}
+                        }
+                    elif new_index_type == "IVF_PQ":
+                        # IVF_PQ 需要额外的 m 和 nbits 参数
+                        create_params = {
+                            "index_type": "IVF_PQ",
+                            "metric_type": METRIC_TYPE,
+                            "params": {"nlist": 128, "m": 8, "nbits": 8}
+                        }
+                    elif new_index_type.startswith("IVF"):
+                        # IVF_FLAT, IVF_SQ8 等
+                        create_params = {
+                            "index_type": new_index_type,
+                            "metric_type": METRIC_TYPE,
+                            "params": {"nlist": 128}
+                        }
+                    else:
+                        # FLAT 不需要额外参数
+                        create_params = {
+                            "index_type": new_index_type,
+                            "metric_type": METRIC_TYPE,
+                            "params": {}
+                        }
+                    
+                    # 必须先 release 才能 drop_index
+                    mm.col.release()
+                    file_log(f"[Maintenance] Released collection before drop index at round {i}")
+                    
+                    # drop_index() 不需要 field_name 参数，直接删除默认索引
+                    mm.col.drop_index()
+                    file_log(f"[Maintenance] Dropped vector index (was {old_index_type}) at round {i}")
+                    
+                    mm.col.create_index(
+                        field_name="vector",
+                        index_params=create_params
+                    )
+                    # 等待索引构建完成
+                    utility.wait_for_index_building_complete(COLLECTION_NAME)
+                    file_log(f"[Maintenance] Rebuilt index to {new_index_type} at round {i}")
+                    CURRENT_INDEX_TYPE = new_index_type
+                    mm.col.load()
+                    file_log(f"[Maintenance] Reloaded collection after index rebuild at round {i}")
+                except Exception as e:
+                    file_log(f"[Maintenance] Index rebuild failed at round {i}: {e}")
+                    # 尝试恢复：重新 load collection
                     try:
-                        # 插入Milvus
-                        row_with_vec = new_row.copy()
-                        row_with_vec["vector"] = dm.generate_single_vector()
-                        mm.col.insert([row_with_vec])
+                        file_log(f"[Maintenance] Attempting recovery - reloading collection at round {i}")
+                        mm.col.load()
+                        file_log(f"[Maintenance] Recovery successful - collection reloaded at round {i}")
+                    except Exception as e2:
+                        file_log(f"[Maintenance] Recovery failed at round {i}: {e2}")
+
+            # --- 动态插入/删除/Upsert ---
+            if i > 0 and i % 10 == 0:
+                op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
+                batch_count = random.randint(1, 5)
+
+                if op == "insert":
+                    new_rows = []
+                    rows_with_vec = []
+                    for _ in range(batch_count):
+                        row = dm.generate_single_row()
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        new_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+
+                    try:
+                        mm.col.insert(rows_with_vec)
                         mm.col.flush()
-                        # 插入Pandas
-                        dm.df = pd.concat([dm.df, pd.DataFrame([new_row])], ignore_index=True)
-                        # 追加向量
-                        dm.vectors = np.vstack([dm.vectors, [row_with_vec["vector"]]])
-                        file_log(f"[Dynamic] Inserted new row: id={new_row['id']}")
+                        dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                        dm.vectors = np.vstack([dm.vectors, np.array([r["vector"] for r in rows_with_vec])])
+                        inserted_ids = [r["id"] for r in new_rows]
+                        file_log(f"[Dynamic] Inserted {len(new_rows)} rows: ids={inserted_ids}")
                     except Exception as e:
                         file_log(f"[Dynamic] Insert failed: {e}")
-                else:
-                    # 删除
+
+                elif op == "delete":
                     if not dm.df.empty:
-                        del_id = random.choice(dm.df["id"].tolist())
+                        del_count = min(batch_count, len(dm.df))
+                        del_ids = random.sample(dm.df["id"].tolist(), del_count)
                         try:
-                            expr = f"id == {del_id}"
+                            expr = f"id in {del_ids}"
                             mm.col.delete(expr)
                             mm.col.flush()
-                            # 删除Pandas
-                            idx = dm.df[dm.df["id"] == del_id].index
+                            idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
                             dm.df = dm.df.drop(idx).reset_index(drop=True)
-                            # 删除向量
                             dm.vectors = np.delete(dm.vectors, idx, axis=0)
-                            file_log(f"[Dynamic] Deleted row: id={del_id}")
+                            file_log(f"[Dynamic] Deleted {len(del_ids)} rows: ids={del_ids}")
                         except Exception as e:
                             file_log(f"[Dynamic] Delete failed: {e}")
 
+                else:
+                    # upsert
+                    upsert_rows = []
+                    rows_with_vec = []
+                    updated_ids = []
+                    new_rows = []
+                    new_vectors = []
+
+                    for _ in range(batch_count):
+                        use_existing = (not dm.df.empty) and (random.random() < 0.7)
+                        if use_existing:
+                            target_id = random.choice(dm.df["id"].tolist())
+                            updated_ids.append(target_id)
+                        else:
+                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+
+                        row = dm.generate_single_row(id_override=target_id)
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        upsert_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+
+                    try:
+                        mm.col.upsert(rows_with_vec)
+                        mm.col.flush()
+
+                        for row, row_with_vec in zip(upsert_rows, rows_with_vec):
+                            rid = row["id"]
+                            match_idx = dm.df.index[dm.df["id"] == rid].tolist()
+                            if match_idx:
+                                idx = match_idx[0]
+                                for k, v in row.items():
+                                    dm.df.at[idx, k] = v
+                                dm.vectors[idx] = row_with_vec["vector"]
+                            else:
+                                new_rows.append(row)
+                                new_vectors.append(row_with_vec["vector"])
+
+                        if new_rows:
+                            dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                            dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
+
+                        file_log(
+                            f"[Dynamic] Upserted {len(upsert_rows)} rows: updated={len(updated_ids)} inserted={len(new_rows)}"
+                        )
+                    except Exception as e:
+                        file_log(f"[Dynamic] Upsert failed: {e}")
+
             # 生成查询
-            depth = random.randint(1, 10)
+            depth = random.randint(1, 15)
             expr_str = ""
             while not expr_str:
                 expr_str, pandas_mask = qg.gen_complex_expr(depth)
@@ -1361,12 +1597,30 @@ def run(rounds = 100, seed=None):
                         q_vec = dm.vectors[q_idx].tolist()
 
                         search_k = min(VECTOR_TOPK, len(dm.df))
-                        ef_param = max(64, search_k + 8)  # ef must be > k for HNSW
+                        
+                        # 从当前索引动态获取 metric type
+                        current_metric_type = METRIC_TYPE
+                        try:
+                            for idx in mm.col.indexes:
+                                if idx.field_name == "vector":
+                                    current_metric_type = idx.params.get("metric_type", METRIC_TYPE)
+                                    break
+                        except:
+                            pass
+                        
+                        # 根据当前索引类型动态设置搜索参数
+                        if CURRENT_INDEX_TYPE == "HNSW":
+                            ef_param = max(64, search_k + 8)  # ef must be > k for HNSW
+                            search_params = {"metric_type": current_metric_type, "params": {"ef": ef_param}}
+                        elif CURRENT_INDEX_TYPE.startswith("IVF"):
+                            search_params = {"metric_type": current_metric_type, "params": {"nprobe": 16}}
+                        else:  # FLAT 或其他
+                            search_params = {"metric_type": current_metric_type, "params": {}}
 
                         search_res = mm.col.search(
                             data=[q_vec],
                             anns_field="vector",
-                            param={"metric_type": "L2", "params": {"ef": ef_param}},
+                            param=search_params,
                             limit=search_k,
                             expr=expr_str,
                             output_fields=["id"],
@@ -1454,40 +1708,117 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         return False
 
+    def gen_multi_field_true_expr(self, row, n=None):
+        """
+        基于pivot_row自动拼接n个字段的必真表达式，优先包含id字段。
+        """
+        if n is None:
+            n = random.randint(2, 4)
+        
+        valid_fields = []
+        # schema 是 list of dict, e.g. [{'name': 'id', 'type': <DataType.INT64: 5>}, ...]
+        for f in self.schema:
+            fname = f["name"]
+            ftype = f["type"]
+            if fname == "vector": continue
+            if fname not in row: continue
+            
+            val = row[fname]
+            # 简单的非空校验
+            if val is None: continue
+            if isinstance(val, float) and np.isnan(val): continue
+            
+            # 目前只处理标量，简单起见
+            if ftype in [DataType.INT64, DataType.VARCHAR, DataType.BOOL, DataType.DOUBLE]:
+                 valid_fields.append(f)
+
+        if not valid_fields:
+            pivot_id = row.get("id")
+            return f"id == {pivot_id}"
+
+        # 必须包含 id (如果有)
+        id_field = next((f for f in valid_fields if f["name"] == "id"), None)
+        other_fields = [f for f in valid_fields if f["name"] != "id"]
+        
+        chosen = []
+        if id_field:
+            chosen.append(id_field)
+            
+        # 随机补足
+        if other_fields:
+            # 如果 n 个太多，就少取点
+            count = min(n - len(chosen), len(other_fields))
+            if count > 0:
+                chosen.extend(random.sample(other_fields, count))
+        
+        exprs = []
+        for f in chosen:
+            fname = f["name"]
+            ftype = f["type"]
+            val = row[fname]
+            if hasattr(val, "item"): val = val.item() # numpy scalar to python
+
+            try:
+                if ftype == DataType.BOOL:
+                    exprs.append(f"{fname} == {str(bool(val)).lower()}")
+                elif ftype == DataType.INT64:
+                    exprs.append(f"{fname} == {int(val)}")
+                elif ftype == DataType.DOUBLE:
+                    eps = 0.0001
+                    exprs.append(f"({fname} > {val - eps} and {fname} < {val + eps})")
+                elif ftype == DataType.VARCHAR:
+                    safe_val = str(val).replace('"', '\\"')
+                    exprs.append(f'{fname} == "{safe_val}"')
+            except:
+                pass # 忽略转换错误
+        
+        if not exprs:
+             pivot_id = row.get("id")
+             return f"id == {pivot_id}"
+             
+        return " and ".join(exprs)
+
     def gen_pqs_expr(self, pivot_row, depth):
+        """基于pivot行生成必真的复合表达式"""
+        # 获取pivot_id用于兜底
+        pivot_id = pivot_row.get("id") if hasattr(pivot_row, "get") else pivot_row["id"]
+        # fallback = f"id == {pivot_id}"
+        # 【修改】使用多字段复杂兜底
+        fallback = self.gen_multi_field_true_expr(pivot_row)
+        
         force_recursion = False
         if depth > 3:
             force_recursion = True
 
         # 递归终止
         if depth <= 0 or (not force_recursion and random.random() < 0.3):
-            # gen_true_atomic_expr 已经修复为永不返回 None，这里安全了
-            return self.gen_true_atomic_expr(pivot_row)
+            result = self.gen_true_atomic_expr(pivot_row)
+            # 确保返回非空表达式
+            if not result or not result.strip():
+                return fallback
+            return result
 
         op = random.choice(["and", "or", "nested_not"])
 
         if op == "nested_not":
             inner = self.gen_pqs_expr(pivot_row, depth)
-            # 【双重保险】万一 inner 还是 None (防御性编程)
-            if not inner: inner = "id > -1"
+            if not inner or not inner.strip(): inner = fallback
             return f"(not (not ({inner})))"
 
         elif op == "and":
             expr_l = self.gen_pqs_expr(pivot_row, depth - 1)
             expr_r = self.gen_pqs_expr(pivot_row, depth - 1)
-            # 【双重保险】
-            if not expr_l: expr_l = "id > -1"
-            if not expr_r: expr_r = "id > -1"
+            if not expr_l or not expr_l.strip(): expr_l = fallback
+            if not expr_r or not expr_r.strip(): expr_r = fallback
             return f"({expr_l} and {expr_r})"
 
         else: # OR
             expr_l = self.gen_pqs_expr(pivot_row, depth - 1)
             noise_depth = depth + random.randint(0, 3)
-            expr_r = self.gen_complex_noise(noise_depth)
+            expr_r = self.gen_complex_noise(noise_depth, pivot_id)
 
-            # 【双重保险】
-            if not expr_l: expr_l = "id > -1"
-            if not expr_r: expr_r = "id > -1" # complex_noise 也可能返回 None
+            if not expr_l or not expr_l.strip(): expr_l = fallback
+            if not expr_r or not expr_r.strip(): expr_r = fallback
 
             if random.random() < 0.5:
                 return f"({expr_l} or {expr_r})"
@@ -1587,6 +1918,23 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
             if strategies:
                 return random.choice(strategies)
+            return f"{fname} is not null"
+
+        # 【关键修复】兜底：对于未覆盖的类型或高级方法返回None的情况
+        # 使用基于当前行数据的简单表达式
+        pivot_id = row.get("id")
+        if pivot_id is not None:
+            return f"id == {pivot_id}"
+        
+        # 最终兜底：使用当前字段的简单比较
+        if ftype == DataType.INT64:
+            return f"{fname} == {int(val)}"
+        elif ftype == DataType.DOUBLE:
+            return f"{fname} >= {float(val) - 0.001}"
+        elif ftype == DataType.VARCHAR:
+            safe_val = str(val).replace('"', '\\"')
+            return f'{fname} == "{safe_val}"'
+        else:
             return f"{fname} is not null"
 
 
@@ -1691,23 +2039,25 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return random.choice(strategies)
 
 
-    def gen_complex_noise(self, depth):
+    def gen_complex_noise(self, depth, pivot_id=None):
+        """生成复杂噪声表达式，pivot_id用于兜底"""
+        # 基于pivot_id的兜底表达式
+        fallback = f"id == {pivot_id}" if pivot_id is not None else "id >= 0"
+        
         if depth <= 0:
             if random.random() < 0.8:
                 res = self.gen_atomic_expr()
                 # gen_atomic_expr 返回 (expr, mask)，可能为 None
-                # 【关键修复】确保返回值是字符串
-                if res and res[0]:
+                if res and res[0] and res[0].strip():
                     return res[0]
-                return "id > -1"
-            return "id > -1"
+                return fallback
+            return fallback
 
         op_type = random.choice(["and", "or", "not", "nested"])
 
         # 递归调用
-        sub_1 = self.gen_complex_noise(depth - 1)
-        # 【关键修复】防止递归返回 None
-        if not sub_1: sub_1 = "id > -1"
+        sub_1 = self.gen_complex_noise(depth - 1, pivot_id)
+        if not sub_1 or not sub_1.strip(): sub_1 = fallback
 
         if op_type == "not":
             return f"(not ({sub_1}))"
@@ -1716,12 +2066,12 @@ class PQSQueryGenerator(OracleQueryGenerator):
             return f"({sub_1})"
 
         elif op_type == "and" or op_type == "or":
-            sub_2 = self.gen_complex_noise(depth - 1)
-            if not sub_2: sub_2 = "id > -1"
+            sub_2 = self.gen_complex_noise(depth - 1, pivot_id)
+            if not sub_2 or not sub_2.strip(): sub_2 = fallback
 
             return f"({sub_1} {op_type} {sub_2})"
 
-        return "id > -1"
+        return fallback
 
     def _gen_deep_json_path(self, fname, json_obj):
         """
@@ -1739,7 +2089,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         path_str = ""
 
         # --- 1. 深度优先下钻 ---
-        max_depth = random.randint(3, 12)
+        max_depth = random.randint(1, 12)
         depth = 0
 
         while depth < max_depth:
@@ -2058,6 +2408,84 @@ def run_pqs_mode(rounds=100, seed=None):
         file_log("=" * 80)
 
         for i in range(rounds):
+            # --- 【动态数据变动】每轮有 20% 概率触发 ---
+            if i > 0 and random.random() < 0.2:
+                op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
+                batch_count = random.randint(1, 5)
+
+                if op == "insert":
+                    new_rows = []
+                    rows_with_vec = []
+                    for _ in range(batch_count):
+                        row = dm.generate_single_row()
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        new_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+                    try:
+                        mm.col.insert(rows_with_vec)
+                        mm.col.flush()
+                        dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                        dm.vectors = np.vstack([dm.vectors, np.array([r["vector"] for r in rows_with_vec])])
+                        file_log(f"[Dynamic] Inserted {len(new_rows)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Insert failed: {e}")
+
+                elif op == "delete" and len(dm.df) > 100:
+                    del_count = min(batch_count, len(dm.df) - 100)
+                    del_ids = random.sample(dm.df["id"].tolist(), del_count)
+                    try:
+                        expr = f"id in {del_ids}"
+                        mm.col.delete(expr)
+                        mm.col.flush()
+                        idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
+                        dm.df = dm.df.drop(idx).reset_index(drop=True)
+                        dm.vectors = np.delete(dm.vectors, idx, axis=0)
+                        file_log(f"[Dynamic] Deleted {len(del_ids)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Delete failed: {e}")
+
+                else:  # upsert
+                    upsert_rows = []
+                    rows_with_vec = []
+                    updated_ids = []
+                    new_rows_list = []
+                    new_vectors = []
+                    for _ in range(batch_count):
+                        use_existing = (not dm.df.empty) and (random.random() < 0.7)
+                        if use_existing:
+                            target_id = random.choice(dm.df["id"].tolist())
+                            updated_ids.append(target_id)
+                        else:
+                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+                        row = dm.generate_single_row(id_override=target_id)
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        upsert_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+                    try:
+                        mm.col.upsert(rows_with_vec)
+                        mm.col.flush()
+                        for row, row_with_vec in zip(upsert_rows, rows_with_vec):
+                            rid = row["id"]
+                            match_idx = dm.df.index[dm.df["id"] == rid].tolist()
+                            if match_idx:
+                                idx = match_idx[0]
+                                for k, v in row.items():
+                                    dm.df.at[idx, k] = v
+                                dm.vectors[idx] = row_with_vec["vector"]
+                            else:
+                                new_rows_list.append(row)
+                                new_vectors.append(row_with_vec["vector"])
+                        if new_rows_list:
+                            dm.df = pd.concat([dm.df, pd.DataFrame(new_rows_list)], ignore_index=True)
+                            dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
+                        file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Upsert failed: {e}")
+
             random_idx = random.randint(0, len(dm.df) - 1)
             pivot_row = dm.df.iloc[random_idx]
             pivot_id = pivot_row["id"]
@@ -2065,11 +2493,13 @@ def run_pqs_mode(rounds=100, seed=None):
             expr = ""
             for _ in range(5):
                 try:
-                    expr = pqs_gen.gen_pqs_expr(pivot_row, depth=random.randint(5, 13))
-                    if expr: break
+                    expr = pqs_gen.gen_pqs_expr(pivot_row, depth=random.randint(1, 13))
+                    if expr and expr.strip(): break
                 except: pass
-
-            if not expr: continue
+            # 兜底：如果表达式为空或全空格，使用多字段兜底表达式
+            if not expr or not expr.strip():
+                expr = pqs_gen.gen_multi_field_true_expr(pivot_row)
+                file_log(f"[Round {i}] Used fallback expr (complex): {expr}")
 
             print(f"\r🔍 [Round {i+1}/{rounds}] Check ID: {pivot_id}...", end="", flush=True)
 
@@ -2079,7 +2509,7 @@ def run_pqs_mode(rounds=100, seed=None):
 
             try:
                 start_t = time.time()
-                res = mm.col.query(expr, output_fields=["id"])
+                res = mm.col.query(expr, output_fields=["id"], limit=10000)
                 cost = (time.time() - start_t) * 1000
                 found_ids = set([r["id"] for r in res])
 
@@ -2184,6 +2614,81 @@ def run_groupby_test(rounds=50, seed=None):
         for i in range(rounds):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
 
+            # --- 【动态数据变动】每轮有 20% 概率触发 ---
+            if i > 0 and random.random() < 0.2:
+                op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
+                batch_count = random.randint(1, 5)
+                if op == "insert":
+                    new_rows = []
+                    rows_with_vec = []
+                    for _ in range(batch_count):
+                        row = dm.generate_single_row()
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        new_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+                    try:
+                        mm.col.insert(rows_with_vec)
+                        mm.col.flush()
+                        dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                        dm.vectors = np.vstack([dm.vectors, np.array([r["vector"] for r in rows_with_vec])])
+                        file_log(f"[Dynamic] Inserted {len(new_rows)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Insert failed: {e}")
+                elif op == "delete" and len(dm.df) > 100:
+                    del_count = min(batch_count, len(dm.df) - 100)
+                    del_ids = random.sample(dm.df["id"].tolist(), del_count)
+                    try:
+                        expr = f"id in {del_ids}"
+                        mm.col.delete(expr)
+                        mm.col.flush()
+                        idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
+                        dm.df = dm.df.drop(idx).reset_index(drop=True)
+                        dm.vectors = np.delete(dm.vectors, idx, axis=0)
+                        file_log(f"[Dynamic] Deleted {len(del_ids)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Delete failed: {e}")
+                else:  # upsert
+                    upsert_rows = []
+                    rows_with_vec = []
+                    updated_ids = []
+                    new_rows_list = []
+                    new_vectors = []
+                    for _ in range(batch_count):
+                        use_existing = (not dm.df.empty) and (random.random() < 0.7)
+                        if use_existing:
+                            target_id = random.choice(dm.df["id"].tolist())
+                            updated_ids.append(target_id)
+                        else:
+                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+                        row = dm.generate_single_row(id_override=target_id)
+                        vec = dm.generate_single_vector()
+                        row_with_vec = row.copy()
+                        row_with_vec["vector"] = vec
+                        upsert_rows.append(row)
+                        rows_with_vec.append(row_with_vec)
+                    try:
+                        mm.col.upsert(rows_with_vec)
+                        mm.col.flush()
+                        for row, row_with_vec in zip(upsert_rows, rows_with_vec):
+                            rid = row["id"]
+                            match_idx = dm.df.index[dm.df["id"] == rid].tolist()
+                            if match_idx:
+                                idx = match_idx[0]
+                                for k, v in row.items():
+                                    dm.df.at[idx, k] = v
+                                dm.vectors[idx] = row_with_vec["vector"]
+                            else:
+                                new_rows_list.append(row)
+                                new_vectors.append(row_with_vec["vector"])
+                        if new_rows_list:
+                            dm.df = pd.concat([dm.df, pd.DataFrame(new_rows_list)], ignore_index=True)
+                            dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
+                        file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows")
+                    except Exception as e:
+                        file_log(f"[Dynamic] Upsert failed: {e}")
+
             # --- 1. 构造测试参数 ---
             group_field = random.choice(potential_group_fields)
             group_size = random.randint(1, 5)
@@ -2204,10 +2709,25 @@ def run_groupby_test(rounds=50, seed=None):
                 output_fields.append(group_field)
 
             # --- 2. 执行 Milvus Search ---
+            current_metric_type = "L2"
+            try:
+                for idx in mm.col.indexes:
+                    if idx.field_name == "vector":
+                        current_metric_type = idx.params.get("metric_type", "L2")
+                        break
+            except:
+                pass
+
+            idx_params_dict = {}
+            if INDEX_TYPE == "HNSW":
+                idx_params_dict = {"ef": 64}
+            elif INDEX_TYPE.startswith("IVF"):
+                idx_params_dict = {"nprobe": 10}
+            
             search_params = {
                 "data": [q_vec],
                 "anns_field": "vector",
-                "param": {"metric_type": "L2", "params": {"nprobe": 10}},
+                "param": {"metric_type": current_metric_type, "params": idx_params_dict},
                 "limit": limit_groups, 
                 "group_by_field": group_field,
                 "group_size": group_size,
@@ -2360,7 +2880,7 @@ if __name__ == "__main__":
     print("=" * 80)
 
     run(rounds=rounds, seed=seed)
-    # run_pqs_mode(rounds=pqs_rounds, seed=seed)
+    run_pqs_mode(rounds=pqs_rounds, seed=seed)
     # run_groupby_test(rounds=rounds, seed=seed)
 
 
