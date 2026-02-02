@@ -31,15 +31,16 @@ FLUSH_INTERVAL = 500     # 每 500 条刷盘
 ALL_INDEX_TYPES = [
     "FLAT", "HNSW", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"
 ]
-INDEX_TYPE = random.choice(ALL_INDEX_TYPES)  # 【随机化】每次运行选择不同的索引类型
+# 注意：INDEX_TYPE 等随机变量移到 run() 内部，在种子设置后初始化，保证可重复性
+INDEX_TYPE = None  # 延迟初始化
 
 # 全局度量类型（L2 欧氏距离）
 METRIC_TYPE = "L2"
 
 # 记录当前索引类型（用于索引重建时避免重复）
-CURRENT_INDEX_TYPE = INDEX_TYPE
-VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)  # 【随机化】20-80% 概率做向量+标量联合校验
-VECTOR_TOPK = random.randint(50, 200)          # 【随机化】TopK 在 50-200 之间随机
+CURRENT_INDEX_TYPE = None  # 延迟初始化
+VECTOR_CHECK_RATIO = None  # 延迟初始化
+VECTOR_TOPK = None         # 延迟初始化
 
 # 混淆开关（默认关闭）。当 >0 时，在 JSON 下钻策略中按该概率触发类型混淆
 CHAOS_RATE = 0.0
@@ -63,13 +64,30 @@ def get_type_name(dtype):
     }
     return type_map.get(dtype, str(dtype))
 
+# 全局 ID 计数器（避免使用 time.time() 导致不可重复）
+_GLOBAL_ID_COUNTER = 0
+
+def generate_unique_id():
+    """生成唯一 ID（基于计数器 + 随机数，保证可重复性）"""
+    global _GLOBAL_ID_COUNTER
+    _GLOBAL_ID_COUNTER += 1
+    return 10000000 + _GLOBAL_ID_COUNTER * 1000 + random.randint(1, 999)
+
 class DataManager:
+    # 用于动态生成唯一 ID 的计数器（避免使用 time.time() 导致不可重复）
+    _id_counter = 0
+    
     def generate_single_row(self, id_override=None):
         """生成一行与schema一致的新数据（含唯一id），与generate_data逻辑保持一致"""
-        rng = np.random.default_rng()
+        # 使用 np.random 的全局状态（已被 np.random.seed() 设置），保证可重复
+        rng = np.random.default_rng(np.random.randint(0, 2**31))
         row = {}
-        # 生成唯一id
-        row["id"] = int(id_override) if id_override is not None else int(time.time() * 1000000) + random.randint(1, 1000000)
+        # 生成唯一id（使用计数器 + 随机数，避免 time.time() 导致不可重复）
+        if id_override is not None:
+            row["id"] = int(id_override)
+        else:
+            DataManager._id_counter += 1
+            row["id"] = 10000000 + DataManager._id_counter * 1000 + random.randint(1, 999)
         
         for field in self.schema_config:
             fname = field["name"]
@@ -444,13 +462,13 @@ class OracleQueryGenerator:
             low = random.randint(100, 500); high = low + random.randint(50, 200)
             expr = f'({name}["price"] > {low} and {name}["price"] < {high})'
 
-            def check_range(x):
+            # 【修复】使用默认参数绑定，避免闭包捕获问题
+            def check_range(x, _low=low, _high=high):
                 try:
-                    # 🔔 必须硬编码路径，不能用 path_keys
                     v = self._get_json_val(x, ["price"])
                     if v is None: return False
                     if isinstance(v, bool): return False
-                    return (isinstance(v, (int, float)) and v > low and v < high)
+                    return (isinstance(v, (int, float)) and v > _low and v < _high)
                 except: return False
 
             return (expr, series.apply(check_range))
@@ -460,13 +478,13 @@ class OracleQueryGenerator:
             val = random.randint(1, 9)
             expr = f'{name}["config"]["version"] == {val}'
 
-            def check_nested(x):
+            # 【修复】使用默认参数绑定
+            def check_nested(x, _val=val):
                 try:
-                    # 🔔 硬编码路径
                     v = self._get_json_val(x, ["config", "version"])
                     if v is None: return False
                     if isinstance(v, bool): return False
-                    return v == val
+                    return v == _val
                 except: return False
 
             return (expr, series.apply(check_nested))
@@ -476,13 +494,13 @@ class OracleQueryGenerator:
             idx = 0; val = random.randint(20, 80)
             expr = f'{name}["history"][{idx}] > {val}'
 
-            def check_index(x):
+            # 【修复】使用默认参数绑定
+            def check_index(x, _idx=idx, _val=val):
                 try:
-                    # 🔔 硬编码路径
-                    v = self._get_json_val(x, ["history", idx])
+                    v = self._get_json_val(x, ["history", _idx])
                     if v is None: return False
                     if isinstance(v, bool): return False
-                    return (isinstance(v, (int, float)) and v > val)
+                    return (isinstance(v, (int, float)) and v > _val)
                 except: return False
 
             return (expr, series.apply(check_index))
@@ -492,13 +510,13 @@ class OracleQueryGenerator:
             color = random.choice(["Red", "Blue"])
             expr = f'({name}["active"] == true and {name}["color"] == "{color}")'
 
-            def check_multi(x):
+            # 【修复】使用默认参数绑定
+            def check_multi(x, _color=color):
                 try:
-                    # 🔔 硬编码路径
                     active = self._get_json_val(x, ["active"])
                     col_val = self._get_json_val(x, ["color"])
                     if active is not True: return False
-                    return col_val == color
+                    return col_val == _color
                 except: return False
 
             return (expr, series.apply(check_multi))
@@ -638,10 +656,11 @@ class OracleQueryGenerator:
             if random.random() < 0.2:
                 tk = "price" if random.random() < 0.5 else "non_exist"
                 expr = f'exists({name}["{tk}"])'
-                def check_exists(x):
+                # 【修复】使用默认参数绑定
+                def check_exists(x, _tk=tk):
                     if not isinstance(x, dict): return False
                     # 探测结果 V1: exists 排除了显式 Null 值
-                    return tk in x and x[tk] is not None
+                    return _tk in x and x[_tk] is not None
                 mask = series.apply(check_exists)
 
             # --- 策略 B: json_contains 查询 ---
@@ -656,10 +675,11 @@ class OracleQueryGenerator:
                         if isinstance(target_item, bool):
                             item_str = item_str.lower()
                         expr = f'json_contains({name}["{k}"], {item_str})'
-                        def check_list_contains(x):
+                        # 【修复】使用默认参数绑定
+                        def check_list_contains(x, _k=k, _target_item=target_item):
                             if not isinstance(x, dict): return False
-                            if k not in x or not isinstance(x[k], list): return False
-                            return target_item in x[k]
+                            if _k not in x or not isinstance(x[_k], list): return False
+                            return _target_item in x[_k]
                         mask = series.apply(check_list_contains)
                     else: return (f"{name} is not null", series.notnull())
                 else: return (f"{name} is not null", series.notnull())
@@ -703,39 +723,40 @@ class OracleQueryGenerator:
                     expr = f'{name}{path_str} {op} {val_str}'
 
                     # --- 🛡️ JSON 安全比较 ---
-                    def safe_check_json(x):
+                    # 【关键修复】使用默认参数绑定，避免闭包捕获问题
+                    def safe_check_json(x, _path_keys=path_keys, _op=op, _query_val=query_val):
                         try:
-                            v = self._get_json_val(x, path_keys)
+                            v = self._get_json_val(x, _path_keys)
 
                             # (A) 基础判空
                             # 探测结果 V1: Missing/Null != Value -> True
                             # 探测结果 V2: Missing/Null > Value -> False
                             if v is None:
-                                if op == "!=": return True
+                                if _op == "!=": return True
                                 return False
 
                             is_v_num = isinstance(v, (int, float)) and not isinstance(v, bool)
-                            is_q_num = isinstance(query_val, (int, float)) and not isinstance(query_val, bool)
+                            is_q_num = isinstance(_query_val, (int, float)) and not isinstance(_query_val, bool)
 
                             if is_v_num and is_q_num:
-                                if op == "==": return v == query_val
-                                if op == "!=": return v != query_val
-                                if op == ">": return v > query_val
-                                if op == "<": return v < query_val
-                                if op == ">=": return v >= query_val
-                                if op == "<=": return v <= query_val
+                                if _op == "==": return v == _query_val
+                                if _op == "!=": return v != _query_val
+                                if _op == ">": return v > _query_val
+                                if _op == "<": return v < _query_val
+                                if _op == ">=": return v >= _query_val
+                                if _op == "<=": return v <= _query_val
                                 return False
 
-                            if type(v) != type(query_val):
-                                if op == "!=": return True
+                            if type(v) != type(_query_val):
+                                if _op == "!=": return True
                                 return False
 
-                            if op == "==": return v == query_val
-                            if op == "!=": return v != query_val
-                            if op == ">": return v > query_val
-                            if op == "<": return v < query_val
-                            if op == ">=": return v >= query_val
-                            if op == "<=": return v <= query_val
+                            if _op == "==": return v == _query_val
+                            if _op == "!=": return v != _query_val
+                            if _op == ">": return v > _query_val
+                            if _op == "<": return v < _query_val
+                            if _op == ">=": return v >= _query_val
+                            if _op == "<=": return v <= _query_val
                             return False
                         except:
                             return False
@@ -1018,6 +1039,8 @@ def run_equivalence_mode(rounds=100, seed=None):
     """
     运行等价性模糊测试
     """
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
+    
     if seed is not None:
         print(f"\n🔒 Equivalence 模式使用固定种子 {seed}")
         random.seed(seed)
@@ -1026,6 +1049,16 @@ def run_equivalence_mode(rounds=100, seed=None):
         seed = random.randint(0, 1000000)
         random.seed(seed)
         np.random.seed(seed)
+
+    # 【关键】重置 ID 计数器，保证完全可重复
+    _GLOBAL_ID_COUNTER = 0
+    DataManager._id_counter = 0
+
+    # 【关键】在种子设置之后初始化随机变量，保证可重复性
+    INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
+    CURRENT_INDEX_TYPE = INDEX_TYPE
+    VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
+    VECTOR_TOPK = random.randint(50, 200)
 
     # --- 日志设置 ---
     timestamp = int(time.time())
@@ -1108,7 +1141,7 @@ def run_equivalence_mode(rounds=100, seed=None):
                         if use_existing:
                             target_id = random.choice(dm.df["id"].tolist())
                         else:
-                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+                            target_id = generate_unique_id()
                         row = dm.generate_single_row(id_override=target_id)
                         vec = dm.generate_single_vector()
                         row_with_vec = row.copy()
@@ -1260,6 +1293,8 @@ def run(rounds = 100, seed=None):
     seed=None: 随机数据，每次不同（默认行为）
     seed=<数字>: 固定种子，完全复现之前的测试
     """
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
+    
     # 记录当前使用的种子（如果有的话），方便后续复现
     current_seed = seed
     if current_seed is None:
@@ -1272,6 +1307,17 @@ def run(rounds = 100, seed=None):
         print(f"🔒 使用固定种子 {current_seed} - 可复现的数据")
         random.seed(seed)
         np.random.seed(seed)
+
+    # 【关键】重置 ID 计数器，保证完全可重复
+    _GLOBAL_ID_COUNTER = 0
+    DataManager._id_counter = 0
+
+    # 【关键】在种子设置之后初始化随机变量，保证可重复性
+    INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
+    CURRENT_INDEX_TYPE = INDEX_TYPE
+    VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
+    VECTOR_TOPK = random.randint(50, 200)
+    print(f"   索引类型: {INDEX_TYPE}, 向量校验比例: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}")
 
     # 1. 初始化
     dm = DataManager()
@@ -1326,7 +1372,6 @@ def run(rounds = 100, seed=None):
 
             # --- 随机触发索引重建 ---
             if i > 0 and i % 40 == 0:
-                global CURRENT_INDEX_TYPE
                 try:
                     # 选择一个不同于当前的索引类型
                     candidates = [t for t in ALL_INDEX_TYPES if t != CURRENT_INDEX_TYPE]
@@ -1430,6 +1475,17 @@ def run(rounds = 100, seed=None):
                             dm.df = dm.df.drop(idx).reset_index(drop=True)
                             dm.vectors = np.delete(dm.vectors, idx, axis=0)
                             file_log(f"[Dynamic] Deleted {len(del_ids)} rows: ids={del_ids}")
+                            
+                            # 验证删除是否生效
+                            for did in del_ids:
+                                verify_res = mm.col.query(
+                                    f"id == {did}",
+                                    output_fields=["id"],
+                                    consistency_level="Strong"
+                                )
+                                if verify_res:
+                                    file_log(f"[DELETE_WARN] ID {did} still exists in Milvus after delete!")
+                                    
                         except Exception as e:
                             file_log(f"[Dynamic] Delete failed: {e}")
 
@@ -1447,7 +1503,7 @@ def run(rounds = 100, seed=None):
                             target_id = random.choice(dm.df["id"].tolist())
                             updated_ids.append(target_id)
                         else:
-                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+                            target_id = generate_unique_id()
 
                         row = dm.generate_single_row(id_override=target_id)
                         vec = dm.generate_single_vector()
@@ -1476,9 +1532,40 @@ def run(rounds = 100, seed=None):
                             dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
                             dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
 
+                        # 增强日志：记录 upsert 的具体 ID 和关键数据
+                        upsert_ids = [r["id"] for r in upsert_rows]
+                        upsert_details = [{
+                            "id": r["id"],
+                            "history": r.get("meta_json", {}).get("history"),
+                            "c19": r.get("c19"),
+                            "price": r.get("meta_json", {}).get("price")
+                        } for r in upsert_rows]
+                        
                         file_log(
-                            f"[Dynamic] Upserted {len(upsert_rows)} rows: updated={len(updated_ids)} inserted={len(new_rows)}"
+                            f"[Dynamic] Upserted {len(upsert_rows)} rows: ids={upsert_ids}, updated_ids={updated_ids}, new_ids={[r['id'] for r in new_rows]}"
                         )
+                        file_log(f"[Dynamic] Upsert details: {upsert_details}")
+                        
+                        # 验证 upsert 数据同步
+                        for row in upsert_rows:
+                            rid = row["id"]
+                            # 检查 Milvus 数据
+                            try:
+                                milvus_res = mm.col.query(
+                                    f"id == {rid}",
+                                    output_fields=["id", "c19", "meta_json"],
+                                    consistency_level="Strong"
+                                )
+                                if milvus_res:
+                                    milvus_history = milvus_res[0].get("meta_json", {}).get("history")
+                                    pandas_row = dm.df[dm.df["id"] == rid]
+                                    if not pandas_row.empty:
+                                        pandas_history = pandas_row.iloc[0]["meta_json"].get("history")
+                                        if milvus_history != pandas_history:
+                                            file_log(f"[SYNC_WARN] ID {rid} history mismatch after upsert: Milvus={milvus_history} vs Pandas={pandas_history}")
+                            except Exception as ve:
+                                file_log(f"[SYNC_WARN] ID {rid} verification error: {ve}")
+                                
                     except Exception as e:
                         file_log(f"[Dynamic] Upsert failed: {e}")
 
@@ -2349,10 +2436,28 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return f"{fname} is not null"
 
 def run_pqs_mode(rounds=100, seed=None):
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
+    
     if seed is not None:
         print(f"\n🔒 PQS模式使用固定种子 {seed}")
         random.seed(seed)
         np.random.seed(seed)
+    else:
+        # PQS 模式也需要生成种子用于可重复性
+        seed = random.randint(0, 2**31 - 1)
+        random.seed(seed)
+        np.random.seed(seed)
+        print(f"\n🎲 PQS模式随机生成种子: {seed}")
+
+    # 【关键】重置 ID 计数器，保证完全可重复
+    _GLOBAL_ID_COUNTER = 0
+    DataManager._id_counter = 0
+
+    # 【关键】在种子设置之后初始化随机变量，保证可重复性
+    INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
+    CURRENT_INDEX_TYPE = INDEX_TYPE
+    VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
+    VECTOR_TOPK = random.randint(50, 200)
 
     # --- 日志设置 ---
     timestamp = int(time.time())
@@ -2458,7 +2563,7 @@ def run_pqs_mode(rounds=100, seed=None):
                             target_id = random.choice(dm.df["id"].tolist())
                             updated_ids.append(target_id)
                         else:
-                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+                            target_id = generate_unique_id()
                         row = dm.generate_single_row(id_override=target_id)
                         vec = dm.generate_single_vector()
                         row_with_vec = row.copy()
@@ -2661,7 +2766,7 @@ def run_groupby_test(rounds=50, seed=None):
                             target_id = random.choice(dm.df["id"].tolist())
                             updated_ids.append(target_id)
                         else:
-                            target_id = int(time.time() * 1000000) + random.randint(1, 1000000)
+                            target_id = generate_unique_id()
                         row = dm.generate_single_row(id_override=target_id)
                         vec = dm.generate_single_vector()
                         row_with_vec = row.copy()
@@ -2845,6 +2950,7 @@ if __name__ == "__main__":
     seed = None
     rounds = 1000
     pqs_rounds = 1000
+    collection_name = COLLECTION_NAME
 
     # 解析命令行参数
     if len(sys.argv) > 1:
@@ -2855,6 +2961,8 @@ if __name__ == "__main__":
                 rounds = int(sys.argv[i+2])
             elif arg == "--pqs-rounds" and i+1 < len(sys.argv)-1:
                 pqs_rounds = int(sys.argv[i+2])
+            elif arg == "--collection" and i+1 < len(sys.argv)-1:
+                collection_name = sys.argv[i+2]
             elif arg == "--chaos":
                 # 开启与历史一致的默认混淆概率 10%
                 CHAOS_RATE = 0.1
@@ -2869,6 +2977,9 @@ if __name__ == "__main__":
                 run_equivalence_mode(rounds=rounds, seed=seed)
             elif arg == "--groupby-test":
                 run_groupby_test(rounds=rounds, seed=seed)
+
+    if collection_name:
+        COLLECTION_NAME = collection_name
             
 
     print("=" * 80)
@@ -2877,6 +2988,7 @@ if __name__ == "__main__":
     print(f"   PQS测试轮数: {pqs_rounds}")
     print(f"   随机种子: {seed if seed else '(随机)'}")
     print(f"   混淆概率: {CHAOS_RATE}")
+    print(f"   集合名: {COLLECTION_NAME}")
     print("=" * 80)
 
     run(rounds=rounds, seed=seed)
