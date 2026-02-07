@@ -134,7 +134,7 @@ class DataManager:
         self.df = None
         self.vectors = None
         self.schema_config = []
-        self.null_ratio = 0 # random.uniform(0.05, 0.15)
+        self.null_ratio = random.uniform(0.05, 0.15)
         self.array_capacity = random.randint(5, 50)
         self.json_max_depth = random.randint(1, 5)
         self.int_range = random.randint(5000, 100000)
@@ -1035,7 +1035,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                     })
         return mutations
 
-def run_equivalence_mode(rounds=100, seed=None):
+def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     """
     运行等价性模糊测试
     """
@@ -1094,7 +1094,7 @@ def run_equivalence_mode(rounds=100, seed=None):
             print(f"\r⚖️  Test {i+1}/{rounds}...", end="", flush=True)
             
             # --- 【动态数据变动】每轮有 20% 概率触发 ---
-            if i > 0 and random.random() < 0.2:
+            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
 
@@ -1288,7 +1288,7 @@ def run_equivalence_mode(rounds=100, seed=None):
 
 # --- 4. Main Execution ---
 
-def run(rounds = 100, seed=None):
+def run(rounds = 100, seed=None, enable_dynamic_ops=True):
     """
     seed=None: 随机数据，每次不同（默认行为）
     seed=<数字>: 固定种子，完全复现之前的测试
@@ -1438,7 +1438,7 @@ def run(rounds = 100, seed=None):
                         file_log(f"[Maintenance] Recovery failed at round {i}: {e2}")
 
             # --- 动态插入/删除/Upsert ---
-            if i > 0 and i % 10 == 0:
+            if enable_dynamic_ops and i > 0 and i % 10 == 0:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
 
@@ -2435,7 +2435,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         # 兜底
         return f"{fname} is not null"
 
-def run_pqs_mode(rounds=100, seed=None):
+def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
     
     if seed is not None:
@@ -2514,7 +2514,7 @@ def run_pqs_mode(rounds=100, seed=None):
 
         for i in range(rounds):
             # --- 【动态数据变动】每轮有 20% 概率触发 ---
-            if i > 0 and random.random() < 0.2:
+            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
 
@@ -2663,7 +2663,7 @@ def run_pqs_mode(rounds=100, seed=None):
         print(f"🚫 PQS 测试完成。发现 {len(errors)} 个潜在 Bug！")
         print(f"📄 详细数据已记录至日志: {log_filename}")
 
-def run_groupby_test(rounds=50, seed=None):
+def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     """
     专门用于检测GroupBy Key分裂和 strict_group_size 失效的问题
     """
@@ -2720,7 +2720,7 @@ def run_groupby_test(rounds=50, seed=None):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
 
             # --- 【动态数据变动】每轮有 20% 概率触发 ---
-            if i > 0 and random.random() < 0.2:
+            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
                 if op == "insert":
@@ -2951,6 +2951,7 @@ if __name__ == "__main__":
     rounds = 1000
     pqs_rounds = 1000
     collection_name = COLLECTION_NAME
+    enable_dynamic_ops = True
 
     # 解析命令行参数
     if len(sys.argv) > 1:
@@ -2972,11 +2973,13 @@ if __name__ == "__main__":
                     CHAOS_RATE = float(sys.argv[i+2])
                 except Exception:
                     pass
+            elif arg == "--no-dynamic-ops":
+                enable_dynamic_ops = False
             
             elif "--equiv" in sys.argv:
-                run_equivalence_mode(rounds=rounds, seed=seed)
+                run_equivalence_mode(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
             elif arg == "--groupby-test":
-                run_groupby_test(rounds=rounds, seed=seed)
+                run_groupby_test(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
 
     if collection_name:
         COLLECTION_NAME = collection_name
@@ -2991,8 +2994,8 @@ if __name__ == "__main__":
     print(f"   集合名: {COLLECTION_NAME}")
     print("=" * 80)
 
-    run(rounds=rounds, seed=seed)
-    run_pqs_mode(rounds=pqs_rounds, seed=seed)
+    run(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
+    run_pqs_mode(rounds=pqs_rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
     # run_groupby_test(rounds=rounds, seed=seed)
 
 
