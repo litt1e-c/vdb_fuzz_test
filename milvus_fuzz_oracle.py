@@ -16,6 +16,7 @@ from pymilvus import (
     connections, utility, FieldSchema, CollectionSchema, DataType, Collection
 )
 import sys
+import argparse
 
 # --- Configuration (User Specified) ---
 HOST = "127.0.0.1"
@@ -34,8 +35,10 @@ ALL_INDEX_TYPES = [
 # 注意：INDEX_TYPE 等随机变量移到 run() 内部，在种子设置后初始化，保证可重复性
 INDEX_TYPE = None  # 延迟初始化
 
-# 全局度量类型（L2 欧氏距离）
-METRIC_TYPE = "L2"
+# 全局度量类型列表（浮点向量支持的全部 metric）
+# L2: 欧氏距离 (越小越相似), IP: 内积 (越大越相似), COSINE: 余弦相似度 (越大越相似)
+ALL_METRIC_TYPES = ["L2", "IP", "COSINE"]
+METRIC_TYPE = None  # 延迟初始化（在 run() 内种子设置后随机选取）
 
 # 记录当前索引类型（用于索引重建时避免重复）
 CURRENT_INDEX_TYPE = None  # 延迟初始化
@@ -359,7 +362,7 @@ class MilvusManager:
         if INDEX_TYPE == "FLAT":
             print("🔨 Building FLAT Index (Exact Search)...")
             index_params = {
-                "metric_type": "L2",
+                "metric_type": METRIC_TYPE,
                 "index_type": "FLAT",
                 "params": {}
             }
@@ -367,7 +370,7 @@ class MilvusManager:
         elif INDEX_TYPE == "HNSW":
             print("🔨 Building HNSW Index (Graph Based)...")
             index_params = {
-                "metric_type": "L2",
+                "metric_type": METRIC_TYPE,
                 "index_type": "HNSW",
                 "params": {
                     "M": 32,              # 图的最大连接数
@@ -378,7 +381,7 @@ class MilvusManager:
         elif INDEX_TYPE == "IVF_FLAT":
             print("🔨 Building IVF_FLAT Index...")
             index_params = {
-                "metric_type": "L2",
+                "metric_type": METRIC_TYPE,
                 "index_type": "IVF_FLAT",
                 "params": {"nlist": 128}
             }
@@ -386,7 +389,7 @@ class MilvusManager:
         elif INDEX_TYPE == "IVF_SQ8":
             print("🔨 Building IVF_SQ8 Index...")
             index_params = {
-                "metric_type": "L2",
+                "metric_type": METRIC_TYPE,
                 "index_type": "IVF_SQ8",
                 "params": {"nlist": 128}
             }
@@ -394,7 +397,7 @@ class MilvusManager:
         elif INDEX_TYPE == "IVF_PQ":
             print("🔨 Building IVF_PQ Index...")
             index_params = {
-                "metric_type": "L2",
+                "metric_type": METRIC_TYPE,
                 "index_type": "IVF_PQ",
                 "params": {"nlist": 128, "m": 8, "nbits": 8}
             }
@@ -809,6 +812,245 @@ class OracleQueryGenerator:
             expr = "null is not null"
             return (expr, false_mask)
 
+    def _apply_not_mask(self, mask, expr_str):
+        """
+        三值逻辑 NOT 核心方法。
+        
+        SQL/Milvus 三值逻辑规则：
+        - NOT(True)  = False
+        - NOT(False) = True  
+        - NOT(NULL)  = NULL → 在布尔上下文中视为 False
+
+        因此: not(col > 5) 当 col=NULL → NOT(NULL) → NULL → False (不返回该行)
+        这意味着: not(A) 的结果 ≠ ~A，而是 ~A & (所有涉及字段非NULL)
+        
+        特殊情况:
+        - "is null" / "is not null" 表达式: 结果已经是纯布尔(不含NULL)，可以直接 ~mask
+        - JSON 字段的 != : JSON 中 NULL != val → True，但 NOT(NULL != val) → False
+        """
+        import re
+
+        # 特殊情况 1: 纯 NULL 检查表达式 (is null / is not null)
+        # 这些表达式的结果是纯布尔，不存在 NULL 中间态
+        # "col is null" → True/False (没有 NULL)，所以 NOT 直接取反
+        stripped = expr_str.strip()
+        if re.match(r'^\w+\s+is\s+(not\s+)?null$', stripped, re.IGNORECASE):
+            return ~mask
+
+        # 特殊情况 2: 常量表达式 (null is null / null is not null)
+        if stripped.lower().startswith('null '):
+            return ~mask
+
+        # 一般情况: 需要识别表达式中涉及的字段，排除 NULL 行
+        # 提取表达式中出现的 schema 字段名
+        involved_fields = []
+        for f in self.schema:
+            fname = f["name"]
+            # 检查字段名是否出现在表达式中（作为独立的 token）
+            # 使用 word boundary 避免 "c1" 匹配 "c10"
+            if re.search(r'\b' + re.escape(fname) + r'\b', expr_str):
+                involved_fields.append(f)
+
+        if not involved_fields:
+            # 无法识别字段，保守处理：直接取反
+            return ~mask
+
+        # 构建 "所有涉及字段均非NULL" 的 mask
+        notnull_mask = pd.Series(True, index=self.df.index)
+        for f in involved_fields:
+            fname = f["name"]
+            ftype = f["type"]
+            series = self.df[fname]
+
+            if ftype == DataType.JSON:
+                # JSON 字段: 字段本身非 NULL 即可
+                # (JSON 内部的 key missing 已经在原始 mask 中处理过了)
+                notnull_mask = notnull_mask & series.notnull()
+            else:
+                # 标量字段: 必须非 NULL
+                notnull_mask = notnull_mask & series.notnull()
+
+        # NOT(A) = ~A & all_fields_notnull
+        # 解释: 只有当所有涉及字段都有值时，NOT 才会把 False 翻转为 True
+        #        如果任何字段是 NULL，NOT(NULL) = NULL → False
+        return ~mask & notnull_mask
+
+    def gen_not_atomic_expr(self):
+        """
+        生成专门针对 NOT 的原子表达式。
+        返回 (expr_str, pandas_mask)
+        
+        这些表达式专门设计来触发 Milvus 的 NOT + NULL 交互路径，
+        是发现三值逻辑 Bug 的高效手段。
+        """
+        f = random.choice(self.schema)
+        name, ftype = f["name"], f["type"]
+        series = self.df[name]
+
+        strategy = random.choice([
+            "not_compare",       # not (col > X)
+            "not_eq",            # not (col == X)
+            "not_is_null",       # not (col is null) ↔ col is not null
+            "not_is_not_null",   # not (col is not null) ↔ col is null
+            "not_and",           # not (col > X and col < Y)
+            "not_or",            # not (col == X or col == Y)
+        ])
+
+        # --- 策略 1: NOT + 比较运算 ---
+        if strategy == "not_compare":
+            if ftype in [DataType.INT64, DataType.DOUBLE]:
+                val = self.get_value_for_query(name, ftype)
+                if val is None:
+                    return (f"not ({name} is null)", series.notnull())
+                op = random.choice([">", "<", ">=", "<="])
+                inner_expr = f"{name} {op} {val}"
+                expr = f"not ({inner_expr})"
+                
+                # Oracle: 计算内部表达式的 mask
+                def safe_cmp(x, _op=op, _val=val):
+                    if x is None: return False
+                    if isinstance(x, float) and np.isnan(x): return False
+                    try:
+                        if _op == ">": return x > _val
+                        if _op == "<": return x < _val
+                        if _op == ">=": return x >= _val
+                        if _op == "<=": return x <= _val
+                        return False
+                    except: return False
+                inner_mask = series.apply(safe_cmp)
+                # 3VL NOT: ~inner & notnull
+                mask = ~inner_mask & series.notnull()
+                return (expr, mask)
+            
+            elif ftype == DataType.VARCHAR:
+                val = self.get_value_for_query(name, ftype)
+                if val is None:
+                    return (f"not ({name} is null)", series.notnull())
+                inner_expr = f'{name} == "{val}"'
+                expr = f"not ({inner_expr})"
+                def safe_eq(x, _val=val):
+                    if x is None: return False
+                    if isinstance(x, float) and np.isnan(x): return False
+                    try: return x == _val
+                    except: return False
+                inner_mask = series.apply(safe_eq)
+                mask = ~inner_mask & series.notnull()
+                return (expr, mask)
+
+            elif ftype == DataType.BOOL:
+                val_bool = random.choice([True, False])
+                inner_expr = f"{name} == {str(val_bool).lower()}"
+                expr = f"not ({inner_expr})"
+                def safe_eq_bool(x, _val=val_bool):
+                    if x is None: return False
+                    if isinstance(x, float) and np.isnan(x): return False
+                    try: return x == _val
+                    except: return False
+                inner_mask = series.apply(safe_eq_bool)
+                mask = ~inner_mask & series.notnull()
+                return (expr, mask)
+
+            elif ftype == DataType.JSON:
+                # NOT + JSON 下钻比较
+                val = random.randint(100, 500)
+                inner_expr = f'{name}["price"] > {val}'
+                expr = f"not ({inner_expr})"
+                def check_json_gt(x, _val=val):
+                    try:
+                        v = self._get_json_val(x, ["price"])
+                        if v is None: return False
+                        if isinstance(v, bool): return False
+                        return isinstance(v, (int, float)) and v > _val
+                    except: return False
+                inner_mask = series.apply(check_json_gt)
+                # JSON NOT: ~inner，但 JSON 字段本身为 NULL 的行返回 False
+                mask = ~inner_mask & series.notnull()
+                return (expr, mask)
+
+            # 兜底
+            return (f"not ({name} is null)", series.notnull())
+
+        # --- 策略 2: NOT + 等值 ---
+        elif strategy == "not_eq":
+            if ftype == DataType.INT64:
+                val = self.get_value_for_query(name, ftype)
+                if val is None:
+                    return (f"not ({name} is null)", series.notnull())
+                val_int = int(val)
+                expr = f"not ({name} == {val_int})"
+                def safe_eq_int(x, _val=val_int):
+                    if x is None: return False
+                    if isinstance(x, float) and np.isnan(x): return False
+                    try: return x == _val
+                    except: return False
+                inner_mask = series.apply(safe_eq_int)
+                mask = ~inner_mask & series.notnull()
+                return (expr, mask)
+            # 其他类型 fallthrough
+            return (f"not ({name} is null)", series.notnull())
+
+        # --- 策略 3: NOT (is null) ↔ is not null ---
+        elif strategy == "not_is_null":
+            expr = f"not ({name} is null)"
+            mask = series.notnull()
+            return (expr, mask)
+
+        # --- 策略 4: NOT (is not null) ↔ is null ---
+        elif strategy == "not_is_not_null":
+            expr = f"not ({name} is not null)"
+            mask = series.isnull()
+            return (expr, mask)
+
+        # --- 策略 5: NOT + AND (德摩根定律测试核心) ---
+        elif strategy == "not_and":
+            if ftype == DataType.INT64:
+                val = self.get_value_for_query(name, ftype)
+                if val is None:
+                    return (f"not ({name} is null)", series.notnull())
+                val_int = int(val)
+                low = val_int - random.randint(10, 100)
+                high = val_int + random.randint(10, 100)
+                inner_expr = f"({name} > {low} and {name} < {high})"
+                expr = f"not {inner_expr}"
+                # Oracle: not (col > low and col < high)
+                # 3VL: NULL 行 → inner = False (因为 NULL>low = False)
+                #       所以 NOT(False) = True? 不！
+                #       实际上 NULL>low = NULL, NULL<high = NULL
+                #       NULL AND NULL = NULL, NOT(NULL) = NULL → False
+                def check_range(x, _low=low, _high=high):
+                    if x is None: return False
+                    if isinstance(x, float) and np.isnan(x): return False
+                    try: return x > _low and x < _high
+                    except: return False
+                inner_mask = series.apply(check_range)
+                mask = ~inner_mask & series.notnull()
+                return (expr, mask)
+            return (f"not ({name} is null)", series.notnull())
+
+        # --- 策略 6: NOT + OR ---
+        elif strategy == "not_or":
+            if ftype == DataType.INT64:
+                val1 = self.get_value_for_query(name, ftype)
+                val2 = self.get_value_for_query(name, ftype)
+                if val1 is None or val2 is None:
+                    return (f"not ({name} is null)", series.notnull())
+                val1_int, val2_int = int(val1), int(val2)
+                inner_expr = f"({name} == {val1_int} or {name} == {val2_int})"
+                expr = f"not {inner_expr}"
+                def check_or(x, _v1=val1_int, _v2=val2_int):
+                    if x is None: return False
+                    if isinstance(x, float) and np.isnan(x): return False
+                    try: return x == _v1 or x == _v2
+                    except: return False
+                inner_mask = series.apply(check_or)
+                mask = ~inner_mask & series.notnull()
+                return (expr, mask)
+            return (f"not ({name} is null)", series.notnull())
+
+        # 终极兜底
+        return (f"not ({name} is null)", series.notnull())
+
+
     def gen_complex_expr(self, depth):
         """递归生成：同时返回 Milvus 字符串 和 Pandas Mask"""
         # 递归终止
@@ -837,9 +1079,23 @@ class OracleQueryGenerator:
         if not expr_l: return expr_r, mask_r
         if not expr_r: return expr_l, mask_l
 
-        op = random.choice(["and", "or"])
+        op = random.choices(["and", "or", "not"], weights=[0.4, 0.4, 0.2], k=1)[0]
 
-        if op == "and":
+        if op == "not":
+            # --- NOT 分支 (三值逻辑) ---
+            # 只使用左子表达式，对其取反
+            # 20% 概率使用专门的 NOT 原子表达式（更精准打击 Bug）
+            if random.random() < 0.2:
+                not_res = self.gen_not_atomic_expr()
+                if not_res and not_res[0]:
+                    return not_res
+
+            # 否则对普通子表达式取反
+            expr_not = f"not ({expr_l})"
+            mask_not = self._apply_not_mask(mask_l, expr_l)
+            return expr_not, mask_not
+
+        elif op == "and":
             # Milvus: (A and B)
             # Pandas: A & B
             return f"({expr_l} and {expr_r})", (mask_l & mask_r)
@@ -847,8 +1103,6 @@ class OracleQueryGenerator:
             # Milvus: (A or B)
             # Pandas: A | B
             return f"({expr_l} or {expr_r})", (mask_l | mask_r)
-
-        # 注：为了简化逻辑，暂时减少 NOT 的生成，因为 NOT Null 的处理在两边差异很大
 
 
 class EquivalenceQueryGenerator(OracleQueryGenerator):
@@ -1039,7 +1293,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     """
     运行等价性模糊测试
     """
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE
     
     if seed is not None:
         print(f"\n🔒 Equivalence 模式使用固定种子 {seed}")
@@ -1057,8 +1311,10 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     # 【关键】在种子设置之后初始化随机变量，保证可重复性
     INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
     CURRENT_INDEX_TYPE = INDEX_TYPE
+    METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
+    print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
 
     # --- 日志设置 ---
     timestamp = int(time.time())
@@ -1293,7 +1549,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
     seed=None: 随机数据，每次不同（默认行为）
     seed=<数字>: 固定种子，完全复现之前的测试
     """
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE
     
     # 记录当前使用的种子（如果有的话），方便后续复现
     current_seed = seed
@@ -1315,9 +1571,10 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
     # 【关键】在种子设置之后初始化随机变量，保证可重复性
     INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
     CURRENT_INDEX_TYPE = INDEX_TYPE
+    METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
-    print(f"   索引类型: {INDEX_TYPE}, 向量校验比例: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}")
+    print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}, 向量校验比例: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}")
 
     # 1. 初始化
     dm = DataManager()
@@ -1795,12 +2052,14 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         return False
 
-    def gen_multi_field_true_expr(self, row, n=None):
+    def gen_multi_field_true_expr(self, row, n=None, min_fields=2, prefer_non_id=True):
         """
         基于pivot_row自动拼接n个字段的必真表达式，优先包含id字段。
         """
         if n is None:
             n = random.randint(2, 4)
+        if min_fields < 1:
+            min_fields = 1
         
         valid_fields = []
         # schema 是 list of dict, e.g. [{'name': 'id', 'type': <DataType.INT64: 5>}, ...]
@@ -1826,17 +2085,22 @@ class PQSQueryGenerator(OracleQueryGenerator):
         # 必须包含 id (如果有)
         id_field = next((f for f in valid_fields if f["name"] == "id"), None)
         other_fields = [f for f in valid_fields if f["name"] != "id"]
-        
+
         chosen = []
-        if id_field:
-            chosen.append(id_field)
-            
-        # 随机补足
+
+        # 优先选择非 id 字段，确保表达式不止于 id
+        target_count = max(min_fields, n)
         if other_fields:
-            # 如果 n 个太多，就少取点
-            count = min(n - len(chosen), len(other_fields))
-            if count > 0:
-                chosen.extend(random.sample(other_fields, count))
+            count = min(target_count, len(other_fields))
+            chosen.extend(random.sample(other_fields, count))
+
+        # 如果字段不够，再补充 id
+        if id_field and len(chosen) < target_count:
+            if (not prefer_non_id) or not other_fields:
+                chosen.append(id_field)
+            else:
+                # 有其他字段但数量不够时，仍允许补 id 保证最小字段数
+                chosen.append(id_field)
         
         exprs = []
         for f in chosen:
@@ -1849,19 +2113,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 if ftype == DataType.BOOL:
                     exprs.append(f"{fname} == {str(bool(val)).lower()}")
                 elif ftype == DataType.INT64:
-                    exprs.append(f"{fname} == {int(val)}")
+                    exprs.append(self._gen_boundary_int(fname, val))
                 elif ftype == DataType.DOUBLE:
-                    eps = 0.0001
-                    exprs.append(f"({fname} > {val - eps} and {fname} < {val + eps})")
+                    exprs.append(self._gen_boundary_float(fname, val))
                 elif ftype == DataType.VARCHAR:
-                    safe_val = str(val).replace('"', '\\"')
-                    exprs.append(f'{fname} == "{safe_val}"')
+                    exprs.append(self._gen_boundary_str(fname, val))
             except:
                 pass # 忽略转换错误
         
         if not exprs:
-             pivot_id = row.get("id")
-             return f"id == {pivot_id}"
+            pivot_id = row.get("id")
+            return f"id == {pivot_id}"
              
         return " and ".join(exprs)
 
@@ -1871,7 +2133,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         pivot_id = pivot_row.get("id") if hasattr(pivot_row, "get") else pivot_row["id"]
         # fallback = f"id == {pivot_id}"
         # 【修改】使用多字段复杂兜底
-        fallback = self.gen_multi_field_true_expr(pivot_row)
+        fallback = self.gen_multi_field_true_expr(pivot_row, min_fields=2)
         
         force_recursion = False
         if depth > 3:
@@ -1943,15 +2205,26 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if ftype == DataType.BOOL:
             return f"{fname} == {str(bool(val)).lower()}"
 
-        elif ftype in [DataType.INT64, DataType.DOUBLE] and random.random() < 0.3:
-            # 30% 概率生成算术表达式
-            res = self.gen_arithmetic_expr(fname, val)
-            if res: return res
+        elif ftype == DataType.INT64:
+            # 30% 概率生成算术表达式，否则使用边界表达式
+            if random.random() < 0.3:
+                res = self.gen_arithmetic_expr(fname, val)
+                if res: return res
+            return self._gen_boundary_int(fname, val)
+
+        elif ftype == DataType.DOUBLE:
+            # 30% 概率生成算术表达式，否则使用边界表达式
+            if random.random() < 0.3:
+                res = self.gen_arithmetic_expr(fname, val)
+                if res: return res
+            return self._gen_boundary_float(fname, val)
 
         # --- 集成高级 LIKE 测试 ---
-        elif ftype == DataType.VARCHAR and random.random() < 0.3:
-            res = self.gen_advanced_like(fname, val)
-            if res: return res
+        elif ftype == DataType.VARCHAR:
+            if random.random() < 0.3:
+                res = self.gen_advanced_like(fname, val)
+                if res: return res
+            return self._gen_boundary_str(fname, val)
 
         elif ftype == DataType.JSON:
             # 【增强】使用深层 JSON 下钻 (50% 概率)
@@ -2011,7 +2284,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         # 使用基于当前行数据的简单表达式
         pivot_id = row.get("id")
         if pivot_id is not None:
-            return f"id == {pivot_id}"
+            return self.gen_multi_field_true_expr(row, min_fields=2)
         
         # 最终兜底：使用当前字段的简单比较
         if ftype == DataType.INT64:
@@ -2436,7 +2709,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return f"{fname} is not null"
 
 def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE
     
     if seed is not None:
         print(f"\n🔒 PQS模式使用固定种子 {seed}")
@@ -2456,8 +2729,10 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     # 【关键】在种子设置之后初始化随机变量，保证可重复性
     INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
     CURRENT_INDEX_TYPE = INDEX_TYPE
+    METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
+    print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
 
     # --- 日志设置 ---
     timestamp = int(time.time())
@@ -2603,7 +2878,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                 except: pass
             # 兜底：如果表达式为空或全空格，使用多字段兜底表达式
             if not expr or not expr.strip():
-                expr = pqs_gen.gen_multi_field_true_expr(pivot_row)
+                expr = pqs_gen.gen_multi_field_true_expr(pivot_row, min_fields=2)
                 file_log(f"[Round {i}] Used fallback expr (complex): {expr}")
 
             print(f"\r🔍 [Round {i+1}/{rounds}] Check ID: {pivot_id}...", end="", flush=True)
@@ -2667,10 +2942,19 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     """
     专门用于检测GroupBy Key分裂和 strict_group_size 失效的问题
     """
+    global METRIC_TYPE, INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
     if seed is not None:
         print(f"\n🔒 GroupBy 模式使用固定种子 {seed}")
         random.seed(seed)
         np.random.seed(seed)
+    
+    # 【关键】初始化随机变量
+    _GLOBAL_ID_COUNTER = 0
+    DataManager._id_counter = 0
+    INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
+    CURRENT_INDEX_TYPE = INDEX_TYPE
+    METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
+    print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
     
     timestamp = int(time.time())
     log_filename = f"groupby_test_{timestamp}.log"
@@ -2814,11 +3098,11 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                 output_fields.append(group_field)
 
             # --- 2. 执行 Milvus Search ---
-            current_metric_type = "L2"
+            current_metric_type = METRIC_TYPE
             try:
                 for idx in mm.col.indexes:
                     if idx.field_name == "vector":
-                        current_metric_type = idx.params.get("metric_type", "L2")
+                        current_metric_type = idx.params.get("metric_type", METRIC_TYPE)
                         break
             except:
                 pass
@@ -2942,72 +3226,74 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
 
 # 如果你想直接运行这个模式，可以在下面调用
 if __name__ == "__main__":
-    # 支持命令行参数
-    # python milvus_fuzz_oracle.py                # 随机数据运行
-    # python milvus_fuzz_oracle.py --seed 12345   # 用种子12345复现数据
-    # python milvus_fuzz_oracle.py --seed 12345 --rounds 100  # 指定轮数和种子
+    parser = argparse.ArgumentParser(description="Milvus Fuzz Oracle")
+    
+    # Common arguments
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--rounds", type=int, default=1000, help="Number of rounds for main/test modes")
+    parser.add_argument("--collection", type=str, default="fuzz_stable_v3", help="Milvus collection name")
+    parser.add_argument("--no-dynamic-ops", action="store_true", help="Disable dynamic operations (insert/delete/upsert)")
+    
+    # Chaos engineering
+    parser.add_argument("--chaos", action="store_true", help="Enable default chaos rate (0.1)")
+    parser.add_argument("--chaos-rate", type=float, default=0.0, help="Set custom chaos rate (0.0 - 1.0)")
+    parser.add_argument("--metric", type=str, choices=["L2", "IP", "COSINE"], default=None,
+                        help="Force a specific metric type (default: random from L2/IP/COSINE)")
 
-    seed = None
-    rounds = 1000
-    pqs_rounds = 1000
-    collection_name = COLLECTION_NAME
-    enable_dynamic_ops = True
+    # Execution Modes (Mutually Exclusive)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--pqs", action="store_true", help="Run PQS (Predicate Query Search) Mode")
+    group.add_argument("--equiv", action="store_true", help="Run Equivalence Mode")
+    group.add_argument("--groupby-test", action="store_true", help="Run GroupBy Test Mode")
 
-    # 解析命令行参数
-    if len(sys.argv) > 1:
-        for i, arg in enumerate(sys.argv[1:]):
-            if arg == "--seed" and i+1 < len(sys.argv)-1:
-                seed = int(sys.argv[i+2])
-            elif arg == "--rounds" and i+1 < len(sys.argv)-1:
-                rounds = int(sys.argv[i+2])
-            elif arg == "--pqs-rounds" and i+1 < len(sys.argv)-1:
-                pqs_rounds = int(sys.argv[i+2])
-            elif arg == "--collection" and i+1 < len(sys.argv)-1:
-                collection_name = sys.argv[i+2]
-            elif arg == "--chaos":
-                # 开启与历史一致的默认混淆概率 10%
-                CHAOS_RATE = 0.1
-            elif arg == "--chaos-rate" and i+1 < len(sys.argv)-1:
-                # 自定义混淆概率（0.0 ~ 1.0）
-                try:
-                    CHAOS_RATE = float(sys.argv[i+2])
-                except Exception:
-                    pass
-            elif arg == "--no-dynamic-ops":
-                enable_dynamic_ops = False
-            
-            elif "--equiv" in sys.argv:
-                run_equivalence_mode(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
-            elif arg == "--groupby-test":
-                run_groupby_test(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
+    parser.add_argument("--pqs-rounds", type=int, default=1000, help="Rounds for PQS mode (implies --pqs if set explicitly, but better to use --pqs)")
 
-    if collection_name:
-        COLLECTION_NAME = collection_name
-            
+    args = parser.parse_args()
 
+    # 1. Apply Configuration
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+    
+    COLLECTION_NAME = args.collection
+    enable_dynamic_ops = not args.no_dynamic_ops
+
+    if args.chaos:
+        CHAOS_RATE = 0.1
+    if args.chaos_rate > 0:
+        CHAOS_RATE = args.chaos_rate
+
+    # 2. Determine Mode and Execute
     print("=" * 80)
-    print(f"🚀 Milvus Fuzz Oracle 启动")
-    print(f"   主测试轮数: {rounds}")
-    print(f"   PQS测试轮数: {pqs_rounds}")
-    print(f"   随机种子: {seed if seed else '(随机)'}")
-    print(f"   混淆概率: {CHAOS_RATE}")
-    print(f"   集合名: {COLLECTION_NAME}")
-    print("=" * 80)
+    print(f"🚀 Milvus Fuzz Oracle Startup")
+    print(f"   Collection: {COLLECTION_NAME}")
+    print(f"   Seed: {args.seed if args.seed is not None else '(Random)'}")
+    print(f"   Metric: {args.metric if args.metric else '(Random from L2/IP/COSINE)'}")
+    print(f"   Dynamic Ops: {enable_dynamic_ops}")
+    print(f"   Chaos Rate: {CHAOS_RATE}")
 
-    run(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
-    run_pqs_mode(rounds=pqs_rounds, seed=seed, enable_dynamic_ops=enable_dynamic_ops)
-    # run_groupby_test(rounds=rounds, seed=seed)
+    if args.pqs or (args.pqs_rounds != 1000 and not args.equiv and not args.groupby_test):
+        # Implicitly enable PQS if pqs_rounds is modified from default, or explicit --pqs
+        # Note: The logic 'args.pqs_rounds != 1000' is a heuristic for backward compat if the user just set --pqs-rounds
+        print(f"   Mode: PQS (Predicate Query Search)")
+        print(f"   Rounds: {args.pqs_rounds}")
+        print("=" * 80)
+        run_pqs_mode(rounds=args.pqs_rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
+    
+    elif args.equiv:
+        print(f"   Mode: Equivalence Test")
+        print(f"   Rounds: {args.rounds}")
+        print("=" * 80)
+        run_equivalence_mode(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
 
+    elif args.groupby_test:
+        print(f"   Mode: GroupBy Test")
+        print(f"   Rounds: {args.rounds}")
+        print("=" * 80)
+        run_groupby_test(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
 
-
-
-    """
-    目前的局限性，目前字段的值是完全按照类型来赋值，
-    没有考虑隐式类型转换，如果插入的值和查询条件的值类型不一致，
-    可能会导致Milvus和Pandas的结果不一致。
-    例如，插入时字段是字符串类型，但查询时使用了数字类型的条件，
-    这种情况下Milvus可能会返回结果，而Pandas则不会匹配到任何记录。
-    这种时候Milvus的表现也是不确定的，可能会报错，也可能会返回空结果
-
-    此外还可以看看针对插入，构造随机的数据插入的情况
-    """
+    else:
+        print(f"   Mode: Standard Fuzzing")
+        print(f"   Rounds: {args.rounds}")
+        print("=" * 80)
+        run(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
