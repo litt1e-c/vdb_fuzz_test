@@ -22,6 +22,7 @@ import argparse
 HOST = "127.0.0.1"
 PORT = "19531"           # 你的自定义端口
 COLLECTION_NAME = "fuzz_stable_v3"
+VECTOR_INDEX_NAME = "vector_idx"  # 显式命名向量索引，避免多索引时 AmbiguousIndexName
 N = 5000                 # 数据量（磁盘满了，先用 1000 测试功能）
 DIM = 128                # 维度 128
 BATCH_SIZE = 200         # 批次大小（内存模式可以大一些）
@@ -44,6 +45,20 @@ METRIC_TYPE = None  # 延迟初始化（在 run() 内种子设置后随机选取
 CURRENT_INDEX_TYPE = None  # 延迟初始化
 VECTOR_CHECK_RATIO = None  # 延迟初始化
 VECTOR_TOPK = None         # 延迟初始化
+
+# 标量字段索引类型映射 (根据 Milvus 文档)
+# 每种标量字段类型对应可用的索引类型列表
+SCALAR_INDEX_TYPES = {
+    DataType.INT64:   ["INVERTED", "STL_SORT"],
+    DataType.DOUBLE:  ["INVERTED"],
+    DataType.BOOL:    ["BITMAP", "INVERTED"],
+    DataType.VARCHAR: ["INVERTED", "BITMAP", "TRIE"],
+    # JSON 索引需要 json_cast_type + json_path 参数，配置复杂，暂不支持随机 fuzzing
+    # DataType.JSON:  ["INVERTED"],
+    DataType.ARRAY:   ["BITMAP", "INVERTED"],
+}
+# 标量索引创建概率（每个字段有多大概率被创建索引，延迟初始化）
+SCALAR_INDEX_PROBABILITY = None
 
 # 混淆开关（默认关闭）。当 >0 时，在 JSON 下钻策略中按该概率触发类型混淆
 CHAOS_RATE = 0.0
@@ -265,6 +280,7 @@ class DataManager:
 class MilvusManager:
     def __init__(self):
         self.col = None
+        self.scalar_indexes = {}  # 记录当前标量索引: {field_name: index_type}
 
     def connect(self):
         print(f"🔌 Connecting to Milvus at {HOST}:{PORT}...")
@@ -403,8 +419,11 @@ class MilvusManager:
             }
 
         try:
-            # 创建索引
-            self.col.create_index("vector", index_params)
+            # 创建向量索引
+            self.col.create_index("vector", index_params, index_name=VECTOR_INDEX_NAME)
+
+            # 创建标量字段索引
+            self.create_scalar_indexes(dm.schema_config)
 
             # 加载数据 (必须在建索引后)
             print("📥 Loading collection into memory...")
@@ -413,6 +432,97 @@ class MilvusManager:
         except Exception as e:
             print(f"❌ Index build failed (Likely OOM or Config Error): {e}")
             exit(1)
+
+    def create_scalar_indexes(self, schema_config):
+        """
+        为标量字段随机创建索引。
+        根据 SCALAR_INDEX_PROBABILITY 概率决定每个字段是否建索引，
+        从 SCALAR_INDEX_TYPES 映射表中随机选择索引类型。
+        """
+        print("🏗️  Creating Scalar Field Indexes...")
+        self.scalar_indexes = {}
+
+        for field in schema_config:
+            fname = field["name"]
+            ftype = field["type"]
+
+            # 检查该类型是否支持标量索引
+            if ftype not in SCALAR_INDEX_TYPES:
+                continue
+
+            # 按概率决定是否为该字段创建索引
+            if random.random() > SCALAR_INDEX_PROBABILITY:
+                continue
+
+            # 从适用的索引类型中随机选一个
+            applicable_types = SCALAR_INDEX_TYPES[ftype]
+            chosen_type = random.choice(applicable_types)
+
+            try:
+                index_params = {"index_type": chosen_type}
+                # 使用显式 index_name 避免 drop_index 时的 AmbiguousIndexName
+                idx_name = f"idx_{fname}"
+                self.col.create_index(field_name=fname, index_params=index_params, index_name=idx_name)
+                self.scalar_indexes[fname] = chosen_type
+                print(f"   ✅ {fname} ({get_type_name(ftype)}) -> {chosen_type}")
+            except Exception as e:
+                print(f"   ⚠️ {fname} ({get_type_name(ftype)}) -> {chosen_type} FAILED: {e}")
+
+        if self.scalar_indexes:
+            print(f"   -> Created {len(self.scalar_indexes)} scalar indexes: {self.scalar_indexes}")
+        else:
+            print(f"   -> No scalar indexes created (probabilistic skip)")
+
+    def rebuild_scalar_indexes(self, schema_config):
+        """
+        随机重建标量字段索引（必须在 collection release 之后调用）。
+        策略：
+        1. 移除所有旧的标量索引
+        2. 重新按随机概率和类型创建索引
+        3. 尽量选择与旧索引不同的类型，最大化状态空间覆盖
+        """
+        old_indexes = dict(self.scalar_indexes)
+        self.scalar_indexes = {}
+
+        # 1. 根据 Python 字典记录删除旧索引（避免访问 col.indexes 触发 AmbiguousIndexName）
+        for field_name in old_indexes:
+            try:
+                # 使用显式 index_name 删除索引
+                idx_name = f"idx_{field_name}"
+                self.col.drop_index(index_name=idx_name)
+            except Exception:
+                pass  # 索引可能已不存在
+
+        # 2. 重新随机创建
+        for field in schema_config:
+            fname = field["name"]
+            ftype = field["type"]
+
+            if ftype not in SCALAR_INDEX_TYPES:
+                continue
+
+            # 重建时使用随机概率（可能与初始不同，增加变异性）
+            rebuild_prob = random.uniform(0.3, 0.9)
+            if random.random() > rebuild_prob:
+                continue
+
+            applicable_types = SCALAR_INDEX_TYPES[ftype]
+            # 尝试选择一个不同于之前的索引类型（最大化覆盖）
+            old_type = old_indexes.get(fname)
+            candidates = [t for t in applicable_types if t != old_type]
+            if not candidates:
+                candidates = applicable_types
+            chosen_type = random.choice(candidates)
+
+            try:
+                index_params = {"index_type": chosen_type}
+                idx_name = f"idx_{fname}"
+                self.col.create_index(field_name=fname, index_params=index_params, index_name=idx_name)
+                self.scalar_indexes[fname] = chosen_type
+            except Exception:
+                pass  # 某些组合可能不兼容当前 Milvus 版本
+
+        return old_indexes, dict(self.scalar_indexes)
 
 # --- 3. Robust Query Generator ---
 
@@ -474,7 +584,7 @@ class OracleQueryGenerator:
                     return (isinstance(v, (int, float)) and v > _low and v < _high)
                 except: return False
 
-            return (expr, series.apply(check_range))
+            return (expr, series.apply(check_range).astype("boolean"))
 
         # --- 策略 2: Nested ---
         elif strategy == "nested":
@@ -490,7 +600,7 @@ class OracleQueryGenerator:
                     return v == _val
                 except: return False
 
-            return (expr, series.apply(check_nested))
+            return (expr, series.apply(check_nested).astype("boolean"))
 
         # --- 策略 3: Index ---
         elif strategy == "index":
@@ -506,7 +616,7 @@ class OracleQueryGenerator:
                     return (isinstance(v, (int, float)) and v > _val)
                 except: return False
 
-            return (expr, series.apply(check_index))
+            return (expr, series.apply(check_index).astype("boolean"))
 
         # --- 策略 4: Multi-key ---
         elif strategy == "multi_key":
@@ -518,11 +628,11 @@ class OracleQueryGenerator:
                 try:
                     active = self._get_json_val(x, ["active"])
                     col_val = self._get_json_val(x, ["color"])
-                    if active is not True: return False
+                    if active is not True: return False # Active must be True
                     return col_val == _color
                 except: return False
 
-            return (expr, series.apply(check_multi))
+            return (expr, series.apply(check_multi).astype("boolean"))
 
         # 兜底表达式，永远为真
         return ("id > 0", None)
@@ -592,14 +702,17 @@ class OracleQueryGenerator:
 
         # 1. Null Check (保持不变 - 这是绝对安全的)
         if random.random() < 0.15:
-            if random.random() < 0.5: return (f"{name} is null", series.isnull())
-            else: return (f"{name} is not null", series.notnull())
+            if random.random() < 0.5:
+                return (f"{name} is null", series.isnull().astype("boolean"))
+            else:
+                return (f"{name} is not null", series.notnull().astype("boolean"))
 
         # 获取查询值
         val = self.get_value_for_query(name, ftype)
         if val is None:
             # 兜底表达式，永远为真
-            return ("id > 0", series.notnull())
+            id_mask = self.df["id"] > 0
+            return ("id > 0", id_mask.astype("boolean"))
 
         mask = None
         expr = ""
@@ -608,9 +721,10 @@ class OracleQueryGenerator:
         def safe_compare_scalar(op, target_val):
             def comp(x):
                 # 探测结果证明：Scalar Null 永远不等于/不大于/不小于 任何值
-                if x is None: return False
+                # 【修改】返回 None 而非 False，以支持 3VL
+                if x is None: return None
                 # Pandas 的 Float Series 可能包含 NaN
-                if isinstance(x, float) and np.isnan(x): return False
+                if isinstance(x, float) and np.isnan(x): return None
                 try:
                     if op == "==": return x == target_val
                     if op == "!=": return x != target_val
@@ -627,20 +741,20 @@ class OracleQueryGenerator:
         if ftype == DataType.BOOL:
             val_bool = bool(val)
             expr = f"{name} == {str(val_bool).lower()}"
-            mask = series.apply(safe_compare_scalar("==", val_bool))
+            mask = series.apply(safe_compare_scalar("==", val_bool)).astype("boolean")
 
         elif ftype == DataType.INT64:
             val_int = int(val)
             op = random.choice([">", "<", "==", "!=", ">=", "<="])
             expr = f"{name} {op} {val_int}"
-            mask = series.apply(safe_compare_scalar(op, val_int))
+            mask = series.apply(safe_compare_scalar(op, val_int)).astype("boolean")
 
         elif ftype == DataType.DOUBLE:
             val_float = float(val)
             # 🚨 关键回退：移除 "==", "!=" 以避免 IEEE 754 精度误报
             op = random.choice([">", "<", ">=", "<="])
             expr = f"{name} {op} {val_float}"
-            mask = series.apply(safe_compare_scalar(op, val_float))
+            mask = series.apply(safe_compare_scalar(op, val_float)).astype("boolean")
 
         elif ftype == DataType.VARCHAR:
             op = random.choice(["==", "!=", ">", "<", "like"])
@@ -648,10 +762,11 @@ class OracleQueryGenerator:
                 raw_p = val[0] if val else 'a'
                 p = 'a' if raw_p in ['%', '_'] else raw_p
                 expr = f'{name} like "{p}%"'
-                mask = series.notnull() & series.astype(str).str.startswith(p)
+                base_mask = series.astype(str).str.startswith(p)
+                mask = base_mask.astype("boolean").where(series.notnull(), pd.NA)
             else:
                 expr = f'{name} {op} "{val}"'
-                mask = series.apply(safe_compare_scalar(op, val))
+                mask = series.apply(safe_compare_scalar(op, val)).astype("boolean")
 
         elif ftype == DataType.JSON:
 
@@ -661,10 +776,11 @@ class OracleQueryGenerator:
                 expr = f'exists({name}["{tk}"])'
                 # 【修复】使用默认参数绑定
                 def check_exists(x, _tk=tk):
+                    if x is None: return False
                     if not isinstance(x, dict): return False
                     # 探测结果 V1: exists 排除了显式 Null 值
                     return _tk in x and x[_tk] is not None
-                mask = series.apply(check_exists)
+                mask = series.apply(check_exists).astype("boolean")
 
             # --- 策略 B: json_contains 查询 ---
             elif random.random() < 0.2 and isinstance(val, dict):
@@ -680,12 +796,13 @@ class OracleQueryGenerator:
                         expr = f'json_contains({name}["{k}"], {item_str})'
                         # 【修复】使用默认参数绑定
                         def check_list_contains(x, _k=k, _target_item=target_item):
+                            if x is None: return False
                             if not isinstance(x, dict): return False
                             if _k not in x or not isinstance(x[_k], list): return False
                             return _target_item in x[_k]
-                        mask = series.apply(check_list_contains)
-                    else: return (f"{name} is not null", series.notnull())
-                else: return (f"{name} is not null", series.notnull())
+                        mask = series.apply(check_list_contains).astype("boolean")
+                    else: return (f"{name} is not null", series.notnull().astype("boolean"))
+                else: return (f"{name} is not null", series.notnull().astype("boolean"))
 
             # --- 策略 C: 下钻 (Drill-down) ---
             else:
@@ -764,9 +881,9 @@ class OracleQueryGenerator:
                         except:
                             return False
 
-                    mask = series.apply(safe_check_json)
+                    mask = series.apply(safe_check_json).astype("boolean")
                 else:
-                    return (f"{name} is not null", series.notnull())
+                    return (f"{name} is not null", series.notnull().astype("boolean"))
 
         if mask is not None:
             # 🚨 最终返回规则：
@@ -775,7 +892,7 @@ class OracleQueryGenerator:
                 return (expr, mask)
 
             # 2. 标量类型：必须做 notnull 过滤
-            return (expr, mask & series.notnull())
+            return (expr, mask)
 
         return ("", None)
 
@@ -797,9 +914,9 @@ class OracleQueryGenerator:
 
         因此本函数仅生成 NULL 相关的常数表达式。
         """
-        # 创建全 True/False 的 mask
-        true_mask = pd.Series(True, index=self.df.index)
-        false_mask = pd.Series(False, index=self.df.index)
+        # 创建全 True/False 的 mask (使用 nullable boolean 兼容 3VL)
+        true_mask = pd.Series(True, index=self.df.index, dtype="boolean")
+        false_mask = pd.Series(False, index=self.df.index, dtype="boolean")
 
         strategy = random.choice(["null_is_null", "null_is_not_null"])
 
@@ -813,67 +930,14 @@ class OracleQueryGenerator:
             return (expr, false_mask)
 
     def _apply_not_mask(self, mask, expr_str):
-        """
-        三值逻辑 NOT 核心方法。
-        
-        SQL/Milvus 三值逻辑规则：
-        - NOT(True)  = False
-        - NOT(False) = True  
-        - NOT(NULL)  = NULL → 在布尔上下文中视为 False
-
-        因此: not(col > 5) 当 col=NULL → NOT(NULL) → NULL → False (不返回该行)
-        这意味着: not(A) 的结果 ≠ ~A，而是 ~A & (所有涉及字段非NULL)
-        
-        特殊情况:
-        - "is null" / "is not null" 表达式: 结果已经是纯布尔(不含NULL)，可以直接 ~mask
-        - JSON 字段的 != : JSON 中 NULL != val → True，但 NOT(NULL != val) → False
-        """
-        import re
-
-        # 特殊情况 1: 纯 NULL 检查表达式 (is null / is not null)
-        # 这些表达式的结果是纯布尔，不存在 NULL 中间态
-        # "col is null" → True/False (没有 NULL)，所以 NOT 直接取反
-        stripped = expr_str.strip()
-        if re.match(r'^\w+\s+is\s+(not\s+)?null$', stripped, re.IGNORECASE):
-            return ~mask
-
-        # 特殊情况 2: 常量表达式 (null is null / null is not null)
-        if stripped.lower().startswith('null '):
-            return ~mask
-
-        # 一般情况: 需要识别表达式中涉及的字段，排除 NULL 行
-        # 提取表达式中出现的 schema 字段名
-        involved_fields = []
-        for f in self.schema:
-            fname = f["name"]
-            # 检查字段名是否出现在表达式中（作为独立的 token）
-            # 使用 word boundary 避免 "c1" 匹配 "c10"
-            if re.search(r'\b' + re.escape(fname) + r'\b', expr_str):
-                involved_fields.append(f)
-
-        if not involved_fields:
-            # 无法识别字段，保守处理：直接取反
-            return ~mask
-
-        # 构建 "所有涉及字段均非NULL" 的 mask
-        notnull_mask = pd.Series(True, index=self.df.index)
-        for f in involved_fields:
-            fname = f["name"]
-            ftype = f["type"]
-            series = self.df[fname]
-
-            if ftype == DataType.JSON:
-                # JSON 字段: 字段本身非 NULL 即可
-                # (JSON 内部的 key missing 已经在原始 mask 中处理过了)
-                notnull_mask = notnull_mask & series.notnull()
-            else:
-                # 标量字段: 必须非 NULL
-                notnull_mask = notnull_mask & series.notnull()
-
-        # NOT(A) = ~A & all_fields_notnull
-        # 解释: 只有当所有涉及字段都有值时，NOT 才会把 False 翻转为 True
-        #        如果任何字段是 NULL，NOT(NULL) = NULL → False
-        return ~mask & notnull_mask
+        # 3VL 逻辑核心:
+        # Pandas 的 nullable boolean 类型 (dtype="boolean") 支持 <NA> (即 Null)
+        # ~<NA> -> <NA>
+        # True & <NA> -> <NA>
+        # False & <NA> -> False
+        # 这完全符合 SQL 三值逻辑。
+        # 因此，只要保证 mask 本身是 nullable boolean 类型，直接取反即可。
+        return ~mask.astype("boolean")
 
     def gen_not_atomic_expr(self):
         """
@@ -901,15 +965,15 @@ class OracleQueryGenerator:
             if ftype in [DataType.INT64, DataType.DOUBLE]:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull())
+                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
                 op = random.choice([">", "<", ">=", "<="])
                 inner_expr = f"{name} {op} {val}"
                 expr = f"not ({inner_expr})"
                 
                 # Oracle: 计算内部表达式的 mask
                 def safe_cmp(x, _op=op, _val=val):
-                    if x is None: return False
-                    if isinstance(x, float) and np.isnan(x): return False
+                    if x is None: return None
+                    if isinstance(x, float) and np.isnan(x): return None
                     try:
                         if _op == ">": return x > _val
                         if _op == "<": return x < _val
@@ -917,24 +981,24 @@ class OracleQueryGenerator:
                         if _op == "<=": return x <= _val
                         return False
                     except: return False
-                inner_mask = series.apply(safe_cmp)
-                # 3VL NOT: ~inner & notnull
-                mask = ~inner_mask & series.notnull()
+                inner_mask = series.apply(safe_cmp).astype("boolean")
+                # 3VL NOT: ~inner
+                mask = ~inner_mask
                 return (expr, mask)
             
             elif ftype == DataType.VARCHAR:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull())
+                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
                 inner_expr = f'{name} == "{val}"'
                 expr = f"not ({inner_expr})"
                 def safe_eq(x, _val=val):
-                    if x is None: return False
-                    if isinstance(x, float) and np.isnan(x): return False
+                    if x is None: return None
+                    if isinstance(x, float) and np.isnan(x): return None
                     try: return x == _val
                     except: return False
-                inner_mask = series.apply(safe_eq)
-                mask = ~inner_mask & series.notnull()
+                inner_mask = series.apply(safe_eq).astype("boolean")
+                mask = ~inner_mask
                 return (expr, mask)
 
             elif ftype == DataType.BOOL:
@@ -942,12 +1006,12 @@ class OracleQueryGenerator:
                 inner_expr = f"{name} == {str(val_bool).lower()}"
                 expr = f"not ({inner_expr})"
                 def safe_eq_bool(x, _val=val_bool):
-                    if x is None: return False
-                    if isinstance(x, float) and np.isnan(x): return False
+                    if x is None: return None
+                    if isinstance(x, float) and np.isnan(x): return None
                     try: return x == _val
                     except: return False
-                inner_mask = series.apply(safe_eq_bool)
-                mask = ~inner_mask & series.notnull()
+                inner_mask = series.apply(safe_eq_bool).astype("boolean")
+                mask = ~inner_mask
                 return (expr, mask)
 
             elif ftype == DataType.JSON:
@@ -962,43 +1026,43 @@ class OracleQueryGenerator:
                         if isinstance(v, bool): return False
                         return isinstance(v, (int, float)) and v > _val
                     except: return False
-                inner_mask = series.apply(check_json_gt)
-                # JSON NOT: ~inner，但 JSON 字段本身为 NULL 的行返回 False
-                mask = ~inner_mask & series.notnull()
+                inner_mask = series.apply(check_json_gt).astype("boolean")
+                # JSON NOT: ~inner
+                mask = ~inner_mask
                 return (expr, mask)
 
             # 兜底
-            return (f"not ({name} is null)", series.notnull())
+            return (f"not ({name} is null)", series.notnull().astype("boolean"))
 
         # --- 策略 2: NOT + 等值 ---
         elif strategy == "not_eq":
             if ftype == DataType.INT64:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull())
+                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
                 val_int = int(val)
                 expr = f"not ({name} == {val_int})"
                 def safe_eq_int(x, _val=val_int):
-                    if x is None: return False
-                    if isinstance(x, float) and np.isnan(x): return False
+                    if x is None: return None
+                    if isinstance(x, float) and np.isnan(x): return None
                     try: return x == _val
                     except: return False
-                inner_mask = series.apply(safe_eq_int)
-                mask = ~inner_mask & series.notnull()
+                inner_mask = series.apply(safe_eq_int).astype("boolean")
+                mask = ~inner_mask
                 return (expr, mask)
             # 其他类型 fallthrough
-            return (f"not ({name} is null)", series.notnull())
+            return (f"not ({name} is null)", series.notnull().astype("boolean"))
 
         # --- 策略 3: NOT (is null) ↔ is not null ---
         elif strategy == "not_is_null":
             expr = f"not ({name} is null)"
-            mask = series.notnull()
+            mask = series.notnull().astype("boolean")
             return (expr, mask)
 
         # --- 策略 4: NOT (is not null) ↔ is null ---
         elif strategy == "not_is_not_null":
             expr = f"not ({name} is not null)"
-            mask = series.isnull()
+            mask = series.isnull().astype("boolean")
             return (expr, mask)
 
         # --- 策略 5: NOT + AND (德摩根定律测试核心) ---
@@ -1006,7 +1070,7 @@ class OracleQueryGenerator:
             if ftype == DataType.INT64:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull())
+                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
                 val_int = int(val)
                 low = val_int - random.randint(10, 100)
                 high = val_int + random.randint(10, 100)
@@ -1018,14 +1082,14 @@ class OracleQueryGenerator:
                 #       实际上 NULL>low = NULL, NULL<high = NULL
                 #       NULL AND NULL = NULL, NOT(NULL) = NULL → False
                 def check_range(x, _low=low, _high=high):
-                    if x is None: return False
-                    if isinstance(x, float) and np.isnan(x): return False
+                    if x is None: return None
+                    if isinstance(x, float) and np.isnan(x): return None
                     try: return x > _low and x < _high
                     except: return False
-                inner_mask = series.apply(check_range)
-                mask = ~inner_mask & series.notnull()
+                inner_mask = series.apply(check_range).astype("boolean")
+                mask = ~inner_mask
                 return (expr, mask)
-            return (f"not ({name} is null)", series.notnull())
+            return (f"not ({name} is null)", series.notnull().astype("boolean"))
 
         # --- 策略 6: NOT + OR ---
         elif strategy == "not_or":
@@ -1033,22 +1097,22 @@ class OracleQueryGenerator:
                 val1 = self.get_value_for_query(name, ftype)
                 val2 = self.get_value_for_query(name, ftype)
                 if val1 is None or val2 is None:
-                    return (f"not ({name} is null)", series.notnull())
+                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
                 val1_int, val2_int = int(val1), int(val2)
                 inner_expr = f"({name} == {val1_int} or {name} == {val2_int})"
                 expr = f"not {inner_expr}"
                 def check_or(x, _v1=val1_int, _v2=val2_int):
-                    if x is None: return False
-                    if isinstance(x, float) and np.isnan(x): return False
+                    if x is None: return None
+                    if isinstance(x, float) and np.isnan(x): return None
                     try: return x == _v1 or x == _v2
                     except: return False
-                inner_mask = series.apply(check_or)
-                mask = ~inner_mask & series.notnull()
+                inner_mask = series.apply(check_or).astype("boolean")
+                mask = ~inner_mask
                 return (expr, mask)
-            return (f"not ({name} is null)", series.notnull())
+            return (f"not ({name} is null)", series.notnull().astype("boolean"))
 
         # 终极兜底
-        return (f"not ({name} is null)", series.notnull())
+        return (f"not ({name} is null)", series.notnull().astype("boolean"))
 
 
     def gen_complex_expr(self, depth):
@@ -1293,7 +1357,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     """
     运行等价性模糊测试
     """
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY
     
     if seed is not None:
         print(f"\n🔒 Equivalence 模式使用固定种子 {seed}")
@@ -1314,7 +1378,9 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
+    SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
+    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
 
     # --- 日志设置 ---
     timestamp = int(time.time())
@@ -1424,6 +1490,22 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                         file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows")
                     except Exception as e:
                         file_log(f"[Dynamic] Upsert failed: {e}")
+
+            # --- 随机触发标量索引重建 ---
+            if i > 0 and i % 50 == 0:
+                try:
+                    mm.col.release()
+                    file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
+                    old_idx, new_idx = mm.rebuild_scalar_indexes(dm.schema_config)
+                    file_log(f"[Maintenance] Scalar index rebuild at round {i}: {old_idx} -> {new_idx}")
+                    mm.col.load()
+                    file_log(f"[Maintenance] Reloaded after scalar index rebuild at round {i}")
+                except Exception as e:
+                    file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
+                    try:
+                        mm.col.load()
+                    except:
+                        pass
 
             # 1. 生成一个基础查询 (Base Query)
             # 使用较小的深度，方便人类阅读 debug
@@ -1549,7 +1631,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
     seed=None: 随机数据，每次不同（默认行为）
     seed=<数字>: 固定种子，完全复现之前的测试
     """
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY
     
     # 记录当前使用的种子（如果有的话），方便后续复现
     current_seed = seed
@@ -1574,7 +1656,9 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
     METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
+    SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}, 向量校验比例: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}")
+    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
 
     # 1. 初始化
     dm = DataManager()
@@ -1670,16 +1754,16 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                     mm.col.release()
                     file_log(f"[Maintenance] Released collection before drop index at round {i}")
                     
-                    # drop_index() 不需要 field_name 参数，直接删除默认索引
-                    mm.col.drop_index()
+                    # 使用显式 index_name 避免 AmbiguousIndexName
+                    mm.col.drop_index(index_name=VECTOR_INDEX_NAME)
                     file_log(f"[Maintenance] Dropped vector index (was {old_index_type}) at round {i}")
                     
                     mm.col.create_index(
                         field_name="vector",
-                        index_params=create_params
+                        index_params=create_params,
+                        index_name=VECTOR_INDEX_NAME
                     )
-                    # 等待索引构建完成
-                    utility.wait_for_index_building_complete(COLLECTION_NAME)
+                    utility.wait_for_index_building_complete(COLLECTION_NAME, index_name=VECTOR_INDEX_NAME)
                     file_log(f"[Maintenance] Rebuilt index to {new_index_type} at round {i}")
                     CURRENT_INDEX_TYPE = new_index_type
                     mm.col.load()
@@ -1693,6 +1777,25 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                         file_log(f"[Maintenance] Recovery successful - collection reloaded at round {i}")
                     except Exception as e2:
                         file_log(f"[Maintenance] Recovery failed at round {i}: {e2}")
+
+            # --- 随机触发标量索引重建 ---
+            if i > 0 and i % 35 == 0:
+                try:
+                    mm.col.release()
+                    file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
+
+                    old_idx, new_idx = mm.rebuild_scalar_indexes(dm.schema_config)
+                    file_log(f"[Maintenance] Scalar index rebuild at round {i}: {old_idx} -> {new_idx}")
+
+                    mm.col.load()
+                    file_log(f"[Maintenance] Reloaded collection after scalar index rebuild at round {i}")
+                except Exception as e:
+                    file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
+                    try:
+                        mm.col.load()
+                        file_log(f"[Maintenance] Recovery after scalar rebuild - collection reloaded at round {i}")
+                    except Exception as e2:
+                        file_log(f"[Maintenance] Scalar rebuild recovery failed at round {i}: {e2}")
 
             # --- 动态插入/删除/Upsert ---
             if enable_dynamic_ops and i > 0 and i % 10 == 0:
@@ -1942,15 +2045,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
 
                         search_k = min(VECTOR_TOPK, len(dm.df))
                         
-                        # 从当前索引动态获取 metric type
+                        # 使用全局 METRIC_TYPE（避免 col.indexes 触发 AmbiguousIndexName）
                         current_metric_type = METRIC_TYPE
-                        try:
-                            for idx in mm.col.indexes:
-                                if idx.field_name == "vector":
-                                    current_metric_type = idx.params.get("metric_type", METRIC_TYPE)
-                                    break
-                        except:
-                            pass
                         
                         # 根据当前索引类型动态设置搜索参数
                         if CURRENT_INDEX_TYPE == "HNSW":
@@ -2709,7 +2805,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return f"{fname} is not null"
 
 def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY
     
     if seed is not None:
         print(f"\n🔒 PQS模式使用固定种子 {seed}")
@@ -2732,7 +2828,9 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
+    SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
+    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
 
     # --- 日志设置 ---
     timestamp = int(time.time())
@@ -2866,6 +2964,22 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                     except Exception as e:
                         file_log(f"[Dynamic] Upsert failed: {e}")
 
+            # --- 随机触发标量索引重建 ---
+            if i > 0 and i % 50 == 0:
+                try:
+                    mm.col.release()
+                    file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
+                    old_idx, new_idx = mm.rebuild_scalar_indexes(dm.schema_config)
+                    file_log(f"[Maintenance] Scalar index rebuild at round {i}: {old_idx} -> {new_idx}")
+                    mm.col.load()
+                    file_log(f"[Maintenance] Reloaded after scalar index rebuild at round {i}")
+                except Exception as e:
+                    file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
+                    try:
+                        mm.col.load()
+                    except:
+                        pass
+
             random_idx = random.randint(0, len(dm.df) - 1)
             pivot_row = dm.df.iloc[random_idx]
             pivot_id = pivot_row["id"]
@@ -2942,7 +3056,7 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     """
     专门用于检测GroupBy Key分裂和 strict_group_size 失效的问题
     """
-    global METRIC_TYPE, INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER
+    global METRIC_TYPE, INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, SCALAR_INDEX_PROBABILITY
     if seed is not None:
         print(f"\n🔒 GroupBy 模式使用固定种子 {seed}")
         random.seed(seed)
@@ -2954,7 +3068,9 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     INDEX_TYPE = random.choice(ALL_INDEX_TYPES)
     CURRENT_INDEX_TYPE = INDEX_TYPE
     METRIC_TYPE = random.choice(ALL_METRIC_TYPES)
+    SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
+    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
     
     timestamp = int(time.time())
     log_filename = f"groupby_test_{timestamp}.log"
@@ -3078,6 +3194,22 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                     except Exception as e:
                         file_log(f"[Dynamic] Upsert failed: {e}")
 
+            # --- 随机触发标量索引重建 ---
+            if i > 0 and i % 25 == 0:
+                try:
+                    mm.col.release()
+                    file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
+                    old_idx, new_idx = mm.rebuild_scalar_indexes(dm.schema_config)
+                    file_log(f"[Maintenance] Scalar index rebuild at round {i}: {old_idx} -> {new_idx}")
+                    mm.col.load()
+                    file_log(f"[Maintenance] Reloaded after scalar index rebuild at round {i}")
+                except Exception as e:
+                    file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
+                    try:
+                        mm.col.load()
+                    except:
+                        pass
+
             # --- 1. 构造测试参数 ---
             group_field = random.choice(potential_group_fields)
             group_size = random.randint(1, 5)
@@ -3098,14 +3230,8 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                 output_fields.append(group_field)
 
             # --- 2. 执行 Milvus Search ---
+            # 使用全局 METRIC_TYPE（避免 col.indexes 触发 AmbiguousIndexName）
             current_metric_type = METRIC_TYPE
-            try:
-                for idx in mm.col.indexes:
-                    if idx.field_name == "vector":
-                        current_metric_type = idx.params.get("metric_type", METRIC_TYPE)
-                        break
-            except:
-                pass
 
             idx_params_dict = {}
             if INDEX_TYPE == "HNSW":
@@ -3262,6 +3388,8 @@ if __name__ == "__main__":
         CHAOS_RATE = 0.1
     if args.chaos_rate > 0:
         CHAOS_RATE = args.chaos_rate
+    if args.metric:
+        ALL_METRIC_TYPES = [args.metric]
 
     # 2. Determine Mode and Execute
     print("=" * 80)
