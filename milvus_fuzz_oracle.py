@@ -167,10 +167,8 @@ class DataManager:
             if r < 0.2: return int(rng.integers(-100000, 100000))
             elif r < 0.4: return float(rng.random() * 1000)
             elif r < 0.6: return self._random_string(0, 8)
-            # changed delete null generation
-            #elif r < 0.8: return bool(rng.choice([True, False]))
-            #else: return None
-            else: return bool(rng.choice([True, False]))
+            elif r < 0.8: return bool(rng.choice([True, False]))
+            else: return None
 
         if rng.random() < 0.2:
             length = rng.integers(1, 5)
@@ -191,7 +189,7 @@ class DataManager:
     def generate_schema(self):
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
-        num_fields = random.randint(3, 20)
+        num_fields = random.randint(3, 25)
         types_pool = [DataType.INT64, DataType.DOUBLE, DataType.BOOL, DataType.VARCHAR]
 
         for i in range(num_fields):
@@ -244,9 +242,8 @@ class DataManager:
                         "color": rng.choice(["Red", "Blue", "Green"]),
                         "active": bool(rng.choice([True, False])),
                     }
-                    ### changed delete null generation
-                    # if rng.random() < 0.1:
-                    #     base_obj["price"] = None
+                    if rng.random() < 0.1:
+                        base_obj["price"] = None
                     if rng.random() < 0.8:
                         base_obj["config"] = {"version": int(rng.integers(1, 10))}
                     if rng.random() < 0.8:
@@ -266,11 +263,10 @@ class DataManager:
                     arr_list.append(list(rng.integers(0, 100, size=length)))
                 data[fname] = arr_list
 
-            ### changed delete null generation
-            #mask = rng.random(N) < self.null_ratio
-            #temp_arr = np.array(data[fname], dtype=object)
-            #temp_arr[mask] = None
-            #data[fname] = temp_arr
+            mask = rng.random(N) < self.null_ratio
+            temp_arr = np.array(data[fname], dtype=object)
+            temp_arr[mask] = None
+            data[fname] = temp_arr
 
         self.df = pd.DataFrame(data)
         print("✅ Data Generation Complete.")
@@ -568,6 +564,11 @@ class OracleQueryGenerator:
             # 兜底表达式，永远为真
             return ("id > 0", None)
         field = random.choice(json_fields); name = field["name"]; series = self.df[name]
+        # [WORKAROUND: Milvus NOT(UNKNOWN) Bug]
+        # Milvus 对 NULL JSON 字段执行 NOT(UNKNOWN) 时可能错误返回 TRUE
+        # 原始代码: 不使用 notnull_mask, 直接 return (expr, mask)
+        # 现在: 所有 JSON 表达式包裹 (name is not null and (expr)), mask & notnull_mask
+        notnull_mask = series.notnull().astype("boolean")
         strategy = random.choice(["range", "nested", "index", "multi_key"])
 
         # --- 策略 1: Range ---
@@ -578,13 +579,16 @@ class OracleQueryGenerator:
             # 【修复】使用默认参数绑定，避免闭包捕获问题
             def check_range(x, _low=low, _high=high):
                 try:
+                    if x is None: return None   # 整个JSON字段为NULL → UNKNOWN (3VL)
                     v = self._get_json_val(x, ["price"])
-                    if v is None: return False
+                    if v is None: return False  # 键不存在于非空JSON → FALSE (2VL)
                     if isinstance(v, bool): return False
                     return (isinstance(v, (int, float)) and v > _low and v < _high)
                 except: return False
 
-            return (expr, series.apply(check_range).astype("boolean"))
+            raw_mask = series.apply(check_range).astype("boolean")
+            # [WORKAROUND: NOT(UNKNOWN)] 原始: return (expr, raw_mask)
+            return (f"({name} is not null and ({expr}))", raw_mask & notnull_mask)
 
         # --- 策略 2: Nested ---
         elif strategy == "nested":
@@ -594,13 +598,16 @@ class OracleQueryGenerator:
             # 【修复】使用默认参数绑定
             def check_nested(x, _val=val):
                 try:
+                    if x is None: return None   # 整个JSON字段为NULL → UNKNOWN (3VL)
                     v = self._get_json_val(x, ["config", "version"])
-                    if v is None: return False
+                    if v is None: return False  # 键不存在于非空JSON → FALSE (2VL)
                     if isinstance(v, bool): return False
                     return v == _val
                 except: return False
 
-            return (expr, series.apply(check_nested).astype("boolean"))
+            raw_mask = series.apply(check_nested).astype("boolean")
+            # [WORKAROUND: NOT(UNKNOWN)] 原始: return (expr, raw_mask)
+            return (f"({name} is not null and ({expr}))", raw_mask & notnull_mask)
 
         # --- 策略 3: Index ---
         elif strategy == "index":
@@ -610,13 +617,16 @@ class OracleQueryGenerator:
             # 【修复】使用默认参数绑定
             def check_index(x, _idx=idx, _val=val):
                 try:
+                    if x is None: return None   # 整个JSON字段为NULL → UNKNOWN (3VL)
                     v = self._get_json_val(x, ["history", _idx])
-                    if v is None: return False
+                    if v is None: return False  # 键不存在于非空JSON → FALSE (2VL)
                     if isinstance(v, bool): return False
                     return (isinstance(v, (int, float)) and v > _val)
                 except: return False
 
-            return (expr, series.apply(check_index).astype("boolean"))
+            raw_mask = series.apply(check_index).astype("boolean")
+            # [WORKAROUND: NOT(UNKNOWN)] 原始: return (expr, raw_mask)
+            return (f"({name} is not null and ({expr}))", raw_mask & notnull_mask)
 
         # --- 策略 4: Multi-key ---
         elif strategy == "multi_key":
@@ -626,13 +636,18 @@ class OracleQueryGenerator:
             # 【修复】使用默认参数绑定
             def check_multi(x, _color=color):
                 try:
+                    if x is None: return None   # 整个JSON字段为NULL → UNKNOWN (3VL)
                     active = self._get_json_val(x, ["active"])
                     col_val = self._get_json_val(x, ["color"])
+                    if active is None or col_val is None:
+                        return False  # 键不存在于非空JSON → FALSE (2VL)
                     if active is not True: return False # Active must be True
                     return col_val == _color
                 except: return False
 
-            return (expr, series.apply(check_multi).astype("boolean"))
+            raw_mask = series.apply(check_multi).astype("boolean")
+            # [WORKAROUND: NOT(UNKNOWN)] 原始: return (expr, raw_mask)
+            return (f"({name} is not null and ({expr}))", raw_mask & notnull_mask)
 
         # 兜底表达式，永远为真
         return ("id > 0", None)
@@ -717,15 +732,29 @@ class OracleQueryGenerator:
         mask = None
         expr = ""
 
-        # --- 🛡️ 标量安全比较 (SQL 标准：Null 比较永远为 False) ---
+        # --- 🛡️ 标量安全比较 (SQL 3VL) ---
         def safe_compare_scalar(op, target_val):
+            # Normalize target container for membership tests
+            if op in {"in", "not in"}:
+                try:
+                    target_set = set(
+                        (x.item() if hasattr(x, "item") else x)
+                        for x in (target_val or [])
+                    )
+                except Exception:
+                    target_set = set()
+            else:
+                target_set = None
             def comp(x):
-                # 探测结果证明：Scalar Null 永远不等于/不大于/不小于 任何值
-                # 【修改】返回 None 而非 False，以支持 3VL
+                # 3VL: NULL 比较返回 Unknown
                 if x is None: return None
                 # Pandas 的 Float Series 可能包含 NaN
                 if isinstance(x, float) and np.isnan(x): return None
                 try:
+                    if op == "in":
+                        return x in target_set
+                    if op == "not in":
+                        return x not in target_set
                     if op == "==": return x == target_val
                     if op == "!=": return x != target_val
                     if op == ">": return x > target_val
@@ -737,17 +766,65 @@ class OracleQueryGenerator:
                     return False
             return comp
 
+        def _normalize_scalar(v):
+            return v.item() if hasattr(v, "item") else v
+
+        def _sample_in_list(max_items=5):
+            valid_series = series.dropna()
+            if valid_series.empty:
+                return []
+            values = [_normalize_scalar(v) for v in valid_series.values]
+            # 去重但尽量保持顺序稳定
+            seen = set()
+            uniq = []
+            for v in values:
+                if v in seen:
+                    continue
+                seen.add(v)
+                uniq.append(v)
+            k = random.randint(1, min(max_items, len(uniq)))
+            return random.sample(uniq, k)
+
         # 2. Value Comparison (分流处理)
         if ftype == DataType.BOOL:
-            val_bool = bool(val)
-            expr = f"{name} == {str(val_bool).lower()}"
-            mask = series.apply(safe_compare_scalar("==", val_bool)).astype("boolean")
+            # 加入 in / not in 覆盖（等价于多值枚举）
+            if random.random() < 0.25:
+                candidates = [True, False]
+                chosen = [random.choice(candidates)]
+                expr_in = f"{name} in [{str(chosen[0]).lower()}]"
+                if random.random() < 0.5:
+                    expr = expr_in
+                    mask = series.apply(safe_compare_scalar("in", chosen)).astype("boolean")
+                else:
+                    expr = f"not ({expr_in})"
+                    mask = ~series.apply(safe_compare_scalar("in", chosen)).astype("boolean")
+            else:
+                val_bool = bool(val)
+                expr = f"{name} == {str(val_bool).lower()}"
+                mask = series.apply(safe_compare_scalar("==", val_bool)).astype("boolean")
 
         elif ftype == DataType.INT64:
-            val_int = int(val)
-            op = random.choice([">", "<", "==", "!=", ">=", "<="])
-            expr = f"{name} {op} {val_int}"
-            mask = series.apply(safe_compare_scalar(op, val_int)).astype("boolean")
+            # 加入 in / not in 覆盖
+            if random.random() < 0.25:
+                items = _sample_in_list(max_items=5)
+                # 兜底：确保至少有一个值
+                if not items:
+                    items = [int(val)]
+                items = [int(_normalize_scalar(x)) for x in items]
+                in_list_str = ", ".join(str(x) for x in items)
+                expr_in = f"{name} in [{in_list_str}]"
+                if random.random() < 0.5:
+                    expr = expr_in
+                    mask = series.apply(safe_compare_scalar("in", items)).astype("boolean")
+                else:
+                    # 用 not (x in [...]) 表达 not in，兼容性更好
+                    expr = f"not ({expr_in})"
+                    mask = ~series.apply(safe_compare_scalar("in", items)).astype("boolean")
+            else:
+                val_int = int(val)
+                op = random.choice([">", "<", "==", "!=", ">=", "<="])
+                expr = f"{name} {op} {val_int}"
+                mask = series.apply(safe_compare_scalar(op, val_int)).astype("boolean")
 
         elif ftype == DataType.DOUBLE:
             val_float = float(val)
@@ -757,13 +834,31 @@ class OracleQueryGenerator:
             mask = series.apply(safe_compare_scalar(op, val_float)).astype("boolean")
 
         elif ftype == DataType.VARCHAR:
-            op = random.choice(["==", "!=", ">", "<", "like"])
+            op = random.choice(["==", "!=", ">", "<", "like", "in", "not in"])
             if op == "like":
                 raw_p = val[0] if val else 'a'
                 p = 'a' if raw_p in ['%', '_'] else raw_p
                 expr = f'{name} like "{p}%"'
                 base_mask = series.astype(str).str.startswith(p)
                 mask = base_mask.astype("boolean").where(series.notnull(), pd.NA)
+            elif op in {"in", "not in"}:
+                items = _sample_in_list(max_items=5)
+                if not items:
+                    items = [str(val)]
+
+                def esc(s: str) -> str:
+                    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+                raw_items = [str(_normalize_scalar(x)) for x in items]
+                escaped_items = [esc(s) for s in raw_items]
+                in_list_str = ", ".join(f'"{s}"' for s in escaped_items)
+                expr_in = f'{name} in [{in_list_str}]'
+                if op == "in":
+                    expr = expr_in
+                    mask = series.apply(safe_compare_scalar("in", raw_items)).astype("boolean")
+                else:
+                    expr = f"not ({expr_in})"
+                    mask = ~series.apply(safe_compare_scalar("in", raw_items)).astype("boolean")
             else:
                 expr = f'{name} {op} "{val}"'
                 mask = series.apply(safe_compare_scalar(op, val)).astype("boolean")
@@ -831,10 +926,17 @@ class OracleQueryGenerator:
                 if isinstance(query_val, (int, float, str, bool)):
                     path_str = "".join([f'["{p}"]' if isinstance(p, str) else f'[{p}]' for p in path_keys])
 
+                    # [WORKAROUND: Milvus JSON != Bug]
+                    # Milvus 已确认 Bug: JSON 键缺失/值为 null 时 != 返回 TRUE (应为 FALSE/UNKNOWN)
+                    # 原始代码:
+                    #   if isinstance(query_val, bool):
+                    #       op = random.choice(["==", "!="])
+                    #   else:
+                    #       op = random.choice(["==", "!=", ">", "<", ">=", "<="])
                     if isinstance(query_val, bool):
-                        op = random.choice(["==", "!="])
+                        op = "=="
                     else:
-                        op = random.choice(["==", "!=", ">", "<", ">=", "<="])
+                        op = random.choice(["==", ">", "<", ">=", "<="])
 
                     if isinstance(query_val, bool): val_str = str(query_val).lower()
                     elif isinstance(query_val, str): val_str = f'"{query_val}"'
@@ -846,13 +948,11 @@ class OracleQueryGenerator:
                     # 【关键修复】使用默认参数绑定，避免闭包捕获问题
                     def safe_check_json(x, _path_keys=path_keys, _op=op, _query_val=query_val):
                         try:
+                            if x is None: return None  # 整个JSON字段为NULL → UNKNOWN (3VL)
                             v = self._get_json_val(x, _path_keys)
 
-                            # (A) 基础判空
-                            # 探测结果 V1: Missing/Null != Value -> True
-                            # 探测结果 V2: Missing/Null > Value -> False
+                            # (A) 基础判空 — 键不存在于非空JSON → Milvus返回FALSE(2VL)
                             if v is None:
-                                if _op == "!=": return True
                                 return False
 
                             is_v_num = isinstance(v, (int, float)) and not isinstance(v, bool)
@@ -868,8 +968,7 @@ class OracleQueryGenerator:
                                 return False
 
                             if type(v) != type(_query_val):
-                                if _op == "!=": return True
-                                return False
+                                return False  # 类型不匹配 → Milvus返回FALSE
 
                             if _op == "==": return v == _query_val
                             if _op == "!=": return v != _query_val
@@ -879,19 +978,28 @@ class OracleQueryGenerator:
                             if _op == "<=": return v <= _query_val
                             return False
                         except:
-                            return False
+                            return False  # JSON访问异常 → Milvus返回FALSE
 
                     mask = series.apply(safe_check_json).astype("boolean")
                 else:
                     return (f"{name} is not null", series.notnull().astype("boolean"))
 
         if mask is not None:
-            # 🚨 最终返回规则：
-            # 1. JSON 类型：不做 notnull 过滤 (因为 != 包含 None)
+            # 对原子比较统一加非空护栏，规避 Milvus 的 NULL 比较歧义
+            if ftype in [DataType.BOOL, DataType.INT64, DataType.DOUBLE, DataType.VARCHAR]:
+                notnull_mask = series.notnull().astype("boolean")
+                guarded_mask = mask.astype("boolean") & notnull_mask
+                guarded_expr = f"({name} is not null and ({expr}))"
+                return (guarded_expr, guarded_mask)
+
             if ftype == DataType.JSON:
+                if expr and not expr.startswith("exists(") and not expr.startswith("json_contains("):
+                    notnull_mask = series.notnull().astype("boolean")
+                    guarded_mask = mask.astype("boolean") & notnull_mask
+                    guarded_expr = f"({name} is not null and ({expr}))"
+                    return (guarded_expr, guarded_mask)
                 return (expr, mask)
 
-            # 2. 标量类型：必须做 notnull 过滤
             return (expr, mask)
 
         return ("", None)
@@ -1018,17 +1126,24 @@ class OracleQueryGenerator:
                 # NOT + JSON 下钻比较
                 val = random.randint(100, 500)
                 inner_expr = f'{name}["price"] > {val}'
-                expr = f"not ({inner_expr})"
+                # [WORKAROUND: Milvus NOT(UNKNOWN) Bug]
+                # Milvus 对 NULL JSON 字段 NOT(UNKNOWN) 可能错误返回 TRUE
+                # 原始代码: expr = f"not ({inner_expr})"
+                inner_guarded = f'({name} is not null and ({inner_expr}))'
+                expr = f"not ({inner_guarded})"
                 def check_json_gt(x, _val=val):
                     try:
+                        if x is None: return None   # 整个JSON字段为NULL → UNKNOWN (3VL)
                         v = self._get_json_val(x, ["price"])
-                        if v is None: return False
+                        if v is None: return False  # 键不存在于非空JSON → FALSE (2VL)
                         if isinstance(v, bool): return False
                         return isinstance(v, (int, float)) and v > _val
-                    except: return False
+                    except: return False  # JSON访问异常 → Milvus返回FALSE
                 inner_mask = series.apply(check_json_gt).astype("boolean")
-                # JSON NOT: ~inner
-                mask = ~inner_mask
+                # [WORKAROUND: NOT(UNKNOWN)] 原始: mask = ~inner_mask; return (expr, mask)
+                notnull_mask = series.notnull().astype("boolean")
+                inner_mask_guarded = inner_mask & notnull_mask
+                mask = ~inner_mask_guarded
                 return (expr, mask)
 
             # 兜底
@@ -1767,7 +1882,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                     file_log(f"[Maintenance] Rebuilt index to {new_index_type} at round {i}")
                     CURRENT_INDEX_TYPE = new_index_type
                     mm.col.load()
-                    file_log(f"[Maintenance] Reloaded collection after index rebuild at round {i}")
+                    file_log(f"[Maintenance] Reloaded collection after index rebuild at round {i} (waited 3s)")
                 except Exception as e:
                     file_log(f"[Maintenance] Index rebuild failed at round {i}: {e}")
                     # 尝试恢复：重新 load collection
@@ -1788,7 +1903,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                     file_log(f"[Maintenance] Scalar index rebuild at round {i}: {old_idx} -> {new_idx}")
 
                     mm.col.load()
-                    file_log(f"[Maintenance] Reloaded collection after scalar index rebuild at round {i}")
+                    file_log(f"[Maintenance] Reloaded collection after scalar index rebuild at round {i} (waited 3s)")
                 except Exception as e:
                     file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
                     try:
@@ -2406,14 +2521,28 @@ class PQSQueryGenerator(OracleQueryGenerator):
         strategies.append(f"{fname} >= {val}")
         strategies.append(f"{fname} <= {val}")
         # 1.1 逻辑否定（与 >=/<= 等价），增强操作符多样性
-        strategies.append(f"not ({fname} < {val})")
-        strategies.append(f"not ({fname} > {val})")
+        # [WORKAROUND: Milvus NOT(UNKNOWN) Bug]
+        # 原始代码:
+        #   strategies.append(f"not ({fname} < {val})")
+        #   strategies.append(f"not ({fname} > {val})")
+        if '"' in fname:
+            base_field = fname.split('[')[0]
+            strategies.append(f"not ({base_field} is not null and ({fname} < {val}))")
+            strategies.append(f"not ({base_field} is not null and ({fname} > {val}))")
+        else:
+            strategies.append(f"not ({fname} < {val})")
+            strategies.append(f"not ({fname} > {val})")
 
         # 2. 0 的特殊处理
         if val == 0:
             strategies.append(f"{fname} == 0")
         else:
-            strategies.append(f"{fname} != 0") # 非 0 值肯定不等于 0
+            # [WORKAROUND: Milvus JSON != Bug]
+            # 原始代码: strategies.append(f"{fname} != 0")
+            if '"' not in fname:
+                strategies.append(f"{fname} != 0")
+            else:
+                strategies.append(f"{fname} > {val - 1}")
 
         # 3. 符号处理
         if val > 0:
@@ -2427,7 +2556,12 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         # 5. 排除法
         fake = val + random.choice([-100, 100])
-        strategies.append(f"{fname} != {fake}")
+        # [WORKAROUND: Milvus JSON != Bug]
+        # 原始代码: strategies.append(f"{fname} != {fake}")
+        if '"' not in fname:
+            strategies.append(f"{fname} != {fake}")
+        else:
+            strategies.append(f"({fname} > {val - 1} and {fname} < {val + 1})")
 
         return random.choice(strategies)
 
@@ -2445,7 +2579,12 @@ class PQSQueryGenerator(OracleQueryGenerator):
         strategies.append(f"{fname} <= {val + epsilon}")
 
         # 3. 排除明显错误的值
-        strategies.append(f"{fname} != {val + 1.0}")
+        # [WORKAROUND: Milvus JSON != Bug]
+        # 原始代码: strategies.append(f"{fname} != {val + 1.0}")
+        if '"' not in fname:
+            strategies.append(f"{fname} != {val + 1.0}")
+        else:
+            strategies.append(f"{fname} < {val + 1.0}")
 
         # 4. 绝对值/符号逻辑
         if val > 0:
@@ -2454,8 +2593,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
             strategies.append(f"{fname} < 0.0001")
 
         # 5. 逻辑否定（与 >=/<= 等价），增强操作符多样性
-        strategies.append(f"not ({fname} > {val})")
-        strategies.append(f"not ({fname} < {val})")
+        # [WORKAROUND: Milvus NOT(UNKNOWN) Bug]
+        # 原始代码:
+        #   strategies.append(f"not ({fname} > {val})")
+        #   strategies.append(f"not ({fname} < {val})")
+        if '"' in fname:
+            base_field = fname.split('[')[0]
+            strategies.append(f"not ({base_field} is not null and ({fname} > {val}))")
+            strategies.append(f"not ({base_field} is not null and ({fname} < {val}))")
+        else:
+            strategies.append(f"not ({fname} > {val})")
+            strategies.append(f"not ({fname} < {val})")
 
         return random.choice(strategies)
 
@@ -2473,7 +2621,12 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if len(val) > 0:
             strategies.append(f'{fname} >= "{val}"')
             strategies.append(f'{fname} <= "{val}"')
-            strategies.append(f'{fname} != "{val}_fake"')
+            # [WORKAROUND: Milvus JSON != Bug]
+            # 原始代码: strategies.append(f'{fname} != "{val}_fake"')
+            if '"' not in str(fname)[:5]:
+                strategies.append(f'{fname} != "{val}_fake"')
+            else:
+                strategies.append(f'{fname} >= "{val}"')
 
             # Like 前缀
             prefix = val[:random.randint(1, len(val))]
@@ -2603,10 +2756,12 @@ class PQSQueryGenerator(OracleQueryGenerator):
         # Case 3: 标量值 (Scalar) -> 调用高强度边界测试
         if isinstance(current, bool):
             val_str = str(current).lower()
-            if random.random() < 0.5:
-                return f"{full_field} == {val_str}"
-            else:
-                return f"{full_field} != {str(not current).lower()}"
+            # [WORKAROUND: Milvus JSON != Bug]
+            # 原始代码:
+            #   op = random.choice(["==", "!="])
+            #   if op == "!=": return f"{full_field} != {str(not current).lower()}"
+            #   else: return f"{full_field} == {val_str}"
+            return f"{full_field} == {val_str}"
 
         elif isinstance(current, int):
             return self._gen_boundary_int(full_field, current)
