@@ -41,6 +41,19 @@ INDEX_TYPE = None  # 延迟初始化
 ALL_METRIC_TYPES = ["L2", "IP", "COSINE"]
 METRIC_TYPE = None  # 延迟初始化（在 run() 内种子设置后随机选取）
 
+# 数值类型分组常量
+ALL_INT_TYPES = [DataType.INT8, DataType.INT16, DataType.INT32, DataType.INT64]
+ALL_FLOAT_TYPES = [DataType.FLOAT, DataType.DOUBLE]
+ALL_NUMERIC_TYPES = ALL_INT_TYPES + ALL_FLOAT_TYPES
+
+# 整数类型的值范围 (用于数据生成和值采样的 clamp)
+INT_RANGES = {
+    DataType.INT8:  (-128, 127),
+    DataType.INT16: (-32768, 32767),
+    DataType.INT32: (-2147483648, 2147483647),
+    DataType.INT64: (-2**63, 2**63 - 1),
+}
+
 # 记录当前索引类型（用于索引重建时避免重复）
 CURRENT_INDEX_TYPE = None  # 延迟初始化
 VECTOR_CHECK_RATIO = None  # 延迟初始化
@@ -49,7 +62,11 @@ VECTOR_TOPK = None         # 延迟初始化
 # 标量字段索引类型映射 (根据 Milvus 文档)
 # 每种标量字段类型对应可用的索引类型列表
 SCALAR_INDEX_TYPES = {
+    DataType.INT8:    ["INVERTED", "STL_SORT"],
+    DataType.INT16:   ["INVERTED", "STL_SORT"],
+    DataType.INT32:   ["INVERTED", "STL_SORT"],
     DataType.INT64:   ["INVERTED", "STL_SORT"],
+    DataType.FLOAT:   ["INVERTED"],
     DataType.DOUBLE:  ["INVERTED"],
     DataType.BOOL:    ["BITMAP", "INVERTED"],
     DataType.VARCHAR: ["INVERTED", "BITMAP", "TRIE"],
@@ -111,10 +128,17 @@ class DataManager:
             fname = field["name"]
             ftype = field["type"]
             
-            if ftype == DataType.INT64:
-                row[fname] = int(rng.integers(-self.int_range, self.int_range))
-            elif ftype == DataType.DOUBLE:
-                row[fname] = float(rng.random() * self.double_scale)
+            if ftype in ALL_INT_TYPES:
+                lo, hi = INT_RANGES[ftype]
+                # 使用较小的范围避免数据过于稀疏
+                effective_lo = max(lo, -self.int_range)
+                effective_hi = min(hi, self.int_range)
+                row[fname] = int(rng.integers(effective_lo, effective_hi))
+            elif ftype in ALL_FLOAT_TYPES:
+                val = float(rng.random() * self.double_scale)
+                if ftype == DataType.FLOAT:
+                    val = float(np.float32(val))  # clamp 到 float32 精度
+                row[fname] = val
             elif ftype == DataType.BOOL:
                 row[fname] = bool(rng.choice([True, False]))
             elif ftype == DataType.VARCHAR:
@@ -190,7 +214,7 @@ class DataManager:
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
         num_fields = random.randint(3, 25)
-        types_pool = [DataType.INT64, DataType.DOUBLE, DataType.BOOL, DataType.VARCHAR]
+        types_pool = ALL_INT_TYPES + ALL_FLOAT_TYPES + [DataType.BOOL, DataType.VARCHAR]
 
         for i in range(num_fields):
             ftype = random.choice(types_pool)
@@ -226,10 +250,16 @@ class DataManager:
             fname = field["name"]
             ftype = field["type"]
 
-            if ftype == DataType.INT64:
-                data[fname] = rng.integers(-self.int_range, self.int_range, size=N)
-            elif ftype == DataType.DOUBLE:
-                data[fname] = rng.random(N) * self.double_scale
+            if ftype in ALL_INT_TYPES:
+                lo, hi = INT_RANGES[ftype]
+                effective_lo = max(lo, -self.int_range)
+                effective_hi = min(hi, self.int_range)
+                data[fname] = rng.integers(effective_lo, effective_hi, size=N)
+            elif ftype in ALL_FLOAT_TYPES:
+                vals = rng.random(N) * self.double_scale
+                if ftype == DataType.FLOAT:
+                    vals = vals.astype(np.float32).astype(np.float64)  # clamp 精度
+                data[fname] = vals
             elif ftype == DataType.BOOL:
                 data[fname] = rng.choice([True, False], size=N)
             elif ftype == DataType.VARCHAR:
@@ -668,15 +698,23 @@ class OracleQueryGenerator:
         # Milvus 没有查询值的 API，所以我们只能通过生成远离现有值的方式
         # 确保这个值在现有数据中极大概率不存在
 
-        if ftype == DataType.INT64:
+        if ftype in ALL_INT_TYPES:
             # 采样一个现有值的范围，然后生成一个超出范围的值
+            lo, hi = INT_RANGES[ftype]
             if not valid_series.empty:
                 min_val, max_val = int(valid_series.min()), int(valid_series.max())
-                # 生成一个比最大值大很多，或者比最小值小很多的值
-                return random.choice([max_val + 100000, min_val - 100000])
-            return random.randint(-200000, 200000) # 极端值
+                # 生成一个比最大值大很多，或者比最小值小很多的值，但 clamp 到类型范围
+                candidates = []
+                upper = min(max_val + 100000, hi)
+                lower = max(min_val - 100000, lo)
+                if upper > max_val: candidates.append(upper)
+                if lower < min_val: candidates.append(lower)
+                if candidates:
+                    return random.choice(candidates)
+                return int(np.clip(random.randint(lo, hi), lo, hi))
+            return int(np.clip(random.randint(-200000, 200000), lo, hi))
 
-        elif ftype == DataType.DOUBLE:
+        elif ftype in ALL_FLOAT_TYPES:
             if not valid_series.empty:
                 min_val, max_val = float(valid_series.min()), float(valid_series.max())
                 val = random.choice([max_val + 100000.0, min_val - 100000.0])
@@ -803,11 +841,11 @@ class OracleQueryGenerator:
                 expr = f"{name} == {str(val_bool).lower()}"
                 mask = series.apply(safe_compare_scalar("==", val_bool)).astype("boolean")
 
-        elif ftype == DataType.INT64:
+        elif ftype in ALL_INT_TYPES:
             # 加入 in / not in 覆盖
             if random.random() < 0.25:
                 items = _sample_in_list(max_items=5)
-                # 兜底：确保至少有一个值
+                # 兆底：确保至少有一个值
                 if not items:
                     items = [int(val)]
                 items = [int(_normalize_scalar(x)) for x in items]
@@ -826,7 +864,7 @@ class OracleQueryGenerator:
                 expr = f"{name} {op} {val_int}"
                 mask = series.apply(safe_compare_scalar(op, val_int)).astype("boolean")
 
-        elif ftype == DataType.DOUBLE:
+        elif ftype in ALL_FLOAT_TYPES:
             val_float = float(val)
             # 🚨 关键回退：移除 "==", "!=" 以避免 IEEE 754 精度误报
             op = random.choice([">", "<", ">=", "<="])
@@ -986,7 +1024,7 @@ class OracleQueryGenerator:
 
         if mask is not None:
             # 对原子比较统一加非空护栏，规避 Milvus 的 NULL 比较歧义
-            if ftype in [DataType.BOOL, DataType.INT64, DataType.DOUBLE, DataType.VARCHAR]:
+            if ftype in [DataType.BOOL] + ALL_INT_TYPES + ALL_FLOAT_TYPES + [DataType.VARCHAR]:
                 notnull_mask = series.notnull().astype("boolean")
                 guarded_mask = mask.astype("boolean") & notnull_mask
                 guarded_expr = f"({name} is not null and ({expr}))"
@@ -1070,7 +1108,7 @@ class OracleQueryGenerator:
 
         # --- 策略 1: NOT + 比较运算 ---
         if strategy == "not_compare":
-            if ftype in [DataType.INT64, DataType.DOUBLE]:
+            if ftype in ALL_INT_TYPES + ALL_FLOAT_TYPES:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
                     return (f"not ({name} is null)", series.notnull().astype("boolean"))
@@ -1151,7 +1189,7 @@ class OracleQueryGenerator:
 
         # --- 策略 2: NOT + 等值 ---
         elif strategy == "not_eq":
-            if ftype == DataType.INT64:
+            if ftype in ALL_INT_TYPES:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
                     return (f"not ({name} is null)", series.notnull().astype("boolean"))
@@ -1182,7 +1220,7 @@ class OracleQueryGenerator:
 
         # --- 策略 5: NOT + AND (德摩根定律测试核心) ---
         elif strategy == "not_and":
-            if ftype == DataType.INT64:
+            if ftype in ALL_INT_TYPES:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
                     return (f"not ({name} is null)", series.notnull().astype("boolean"))
@@ -1208,7 +1246,7 @@ class OracleQueryGenerator:
 
         # --- 策略 6: NOT + OR ---
         elif strategy == "not_or":
-            if ftype == DataType.INT64:
+            if ftype in ALL_INT_TYPES:
                 val1 = self.get_value_for_query(name, ftype)
                 val2 = self.get_value_for_query(name, ftype)
                 if val1 is None or val2 is None:
@@ -2328,7 +2366,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             if isinstance(val, float) and np.isnan(val): continue
             
             # 目前只处理标量，简单起见
-            if ftype in [DataType.INT64, DataType.VARCHAR, DataType.BOOL, DataType.DOUBLE]:
+            if ftype in ALL_INT_TYPES + ALL_FLOAT_TYPES + [DataType.VARCHAR, DataType.BOOL]:
                  valid_fields.append(f)
 
         if not valid_fields:
@@ -2365,9 +2403,9 @@ class PQSQueryGenerator(OracleQueryGenerator):
             try:
                 if ftype == DataType.BOOL:
                     exprs.append(f"{fname} == {str(bool(val)).lower()}")
-                elif ftype == DataType.INT64:
+                elif ftype in ALL_INT_TYPES:
                     exprs.append(self._gen_boundary_int(fname, val))
-                elif ftype == DataType.DOUBLE:
+                elif ftype in ALL_FLOAT_TYPES:
                     exprs.append(self._gen_boundary_float(fname, val))
                 elif ftype == DataType.VARCHAR:
                     exprs.append(self._gen_boundary_str(fname, val))
@@ -2458,14 +2496,14 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if ftype == DataType.BOOL:
             return f"{fname} == {str(bool(val)).lower()}"
 
-        elif ftype == DataType.INT64:
+        elif ftype in ALL_INT_TYPES:
             # 30% 概率生成算术表达式，否则使用边界表达式
             if random.random() < 0.3:
                 res = self.gen_arithmetic_expr(fname, val)
                 if res: return res
             return self._gen_boundary_int(fname, val)
 
-        elif ftype == DataType.DOUBLE:
+        elif ftype in ALL_FLOAT_TYPES:
             # 30% 概率生成算术表达式，否则使用边界表达式
             if random.random() < 0.3:
                 res = self.gen_arithmetic_expr(fname, val)
@@ -2540,9 +2578,9 @@ class PQSQueryGenerator(OracleQueryGenerator):
             return self.gen_multi_field_true_expr(row, min_fields=2)
         
         # 最终兜底：使用当前字段的简单比较
-        if ftype == DataType.INT64:
+        if ftype in ALL_INT_TYPES:
             return f"{fname} == {int(val)}"
-        elif ftype == DataType.DOUBLE:
+        elif ftype in ALL_FLOAT_TYPES:
             return f"{fname} >= {float(val) - 0.001}"
         elif ftype == DataType.VARCHAR:
             safe_val = str(val).replace('"', '\\"')
@@ -3293,7 +3331,7 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     
     # A. 标量字段
     for f in dm.schema_config:
-        if f["type"] in [DataType.INT64, DataType.VARCHAR, DataType.BOOL]:
+        if f["type"] in ALL_INT_TYPES + [DataType.VARCHAR, DataType.BOOL]:
             potential_group_fields.append(f["name"])
     
     # B. JSON 字段 (硬编码 DataManager 中生成的 Key)
