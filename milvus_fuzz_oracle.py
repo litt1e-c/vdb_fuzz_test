@@ -1468,7 +1468,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                     })
         return mutations
 
-def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
+def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
     """
     运行等价性模糊测试
     """
@@ -1494,6 +1494,21 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
     SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
+
+    # 一致性等级: 固定或随机 (独立 RNG, 不消耗主 PRNG 序列)
+    ALL_CONSISTENCY_LEVELS = ["Strong", "Bounded", "Eventually", "Session"]
+    if consistency:
+        consistency_rng = None  # 不需要 RNG, 使用固定值
+        print(f"   一致性等级: {consistency} (固定)")
+    else:
+        consistency_rng = random.Random(seed ^ 0xC0A51573)
+        print(f"   一致性等级: 随机 {ALL_CONSISTENCY_LEVELS}")
+
+    def pick_consistency():
+        if consistency:
+            return consistency
+        return consistency_rng.choice(ALL_CONSISTENCY_LEVELS)
+
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
     print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
 
@@ -1634,14 +1649,15 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
 
             # 3. 执行 Base Query
             try:
-                base_res = mm.col.query(base_expr, output_fields=["id"], consistency_level="Strong")
+                cl_mut = pick_consistency()
+                base_res = mm.col.query(base_expr, output_fields=["id"], consistency_level=cl_mut)
                 base_ids = set([x["id"] for x in base_res])
             except Exception as e:
                 # 基础查询挂了，可能是语法问题，跳过
                 file_log(f"[Test {i}] Base Query Failed: {e}")
                 continue
 
-            log_header = f"[Test {i}] Base: {base_expr} (Hits: {len(base_ids)})"
+            log_header = f"[Test {i}] Base: {base_expr} (Hits: {len(base_ids)}) [CL={cl_mut}]"
             file_log(f"\n{log_header}")
 
             # 4. 执行并对比所有变体
@@ -1650,7 +1666,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                 m_expr = m["expr"]
                 
                 try:
-                    mut_res = mm.col.query(m_expr, output_fields=["id"], consistency_level="Strong")
+                    mut_res = mm.col.query(m_expr, output_fields=["id"], consistency_level=cl_mut)
                     mut_ids = set([x["id"] for x in mut_res])
 
                     if base_ids == mut_ids:
@@ -1741,7 +1757,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True):
 
 # --- 4. Main Execution ---
 
-def run(rounds = 100, seed=None, enable_dynamic_ops=True):
+def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
     """
     seed=None: 随机数据，每次不同（默认行为）
     seed=<数字>: 固定种子，完全复现之前的测试
@@ -1772,6 +1788,21 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
     SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
+
+    # 一致性等级: 固定或随机 (独立 RNG, 不消耗主 PRNG 序列, 不影响表达式/数据生成)
+    ALL_CONSISTENCY_LEVELS = ["Strong", "Bounded", "Eventually", "Session"]
+    if consistency:
+        consistency_rng = None
+        print(f"   一致性等级: {consistency} (固定)")
+    else:
+        consistency_rng = random.Random(current_seed ^ 0xC0A51573)
+        print(f"   一致性等级: 随机 {ALL_CONSISTENCY_LEVELS}")
+
+    def pick_consistency():
+        if consistency:
+            return consistency
+        return consistency_rng.choice(ALL_CONSISTENCY_LEVELS)
+
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}, 向量校验比例: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}")
     print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
 
@@ -1816,7 +1847,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
         file_log("=" * 50)
 
         for i in range(total_test):
-            print(f"\r⏳ Running Test {i+1}/{total_test}...", end="", flush=True)
+            cl = pick_consistency()
+            print(f"\r⏳ Running Test {i+1}/{total_test} [CL={cl}]...          ", end="", flush=True)
 
             # --- 随机触发 compaction ---
             if i > 0 and i % 25 == 0:
@@ -1882,7 +1914,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                     file_log(f"[Maintenance] Rebuilt index to {new_index_type} at round {i}")
                     CURRENT_INDEX_TYPE = new_index_type
                     mm.col.load()
-                    file_log(f"[Maintenance] Reloaded collection after index rebuild at round {i} (waited 3s)")
+                    file_log(f"[Maintenance] Reloaded collection after index rebuild at round {i}")
                 except Exception as e:
                     file_log(f"[Maintenance] Index rebuild failed at round {i}: {e}")
                     # 尝试恢复：重新 load collection
@@ -1903,7 +1935,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                     file_log(f"[Maintenance] Scalar index rebuild at round {i}: {old_idx} -> {new_idx}")
 
                     mm.col.load()
-                    file_log(f"[Maintenance] Reloaded collection after scalar index rebuild at round {i} (waited 3s)")
+                    file_log(f"[Maintenance] Reloaded collection after scalar index rebuild at round {i}")
                 except Exception as e:
                     file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
                     try:
@@ -2052,6 +2084,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
 
             log_header = f"[Test {i}]"
             file_log(f"\n{log_header} Expr: {expr_str}")
+            file_log(f"  ConsistencyLevel: {cl}")
 
             # Pandas 计算
             expected_ids = set(dm.df[pandas_mask.fillna(False)]["id"].values.tolist())
@@ -2063,7 +2096,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                     batch_size=10000,
                     expr=expr_str,
                     output_fields=["id"],
-                    consistency_level="Strong"
+                    consistency_level=cl
                 )
 
                 actual_ids = set()
@@ -2082,11 +2115,6 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                 if expected_ids == actual_ids:
                     file_log("  -> MATCH")
                 else:
-                    # --- 发现错误！控制台打印！---
-                    print(f"\n❌ [Test {i}] MISMATCH!")
-                    print(f"   Expr: {expr_str}")
-                    print(f"   Expected: {len(expected_ids)} vs Actual: {len(actual_ids)}")
-
                     # 计算差异
                     missing = expected_ids - actual_ids
                     extra = actual_ids - expected_ids
@@ -2094,62 +2122,76 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True):
                     if missing: diff_msg += f"Missing IDs: {list(missing)} "
                     if extra: diff_msg += f"Extra IDs: {list(extra)}"
 
-                    print(f"   Diff: {diff_msg}")
-                    print(f"   🔑 复现此bug: python milvus_fuzz_oracle.py --seed {current_seed}\n")
+                    # 非 Strong 一致性允许暂时不一致, 降级为警告
+                    if cl != "Strong":
+                        file_log(f"  -> WARN (non-Strong CL={cl}): {diff_msg}")
+                        print(f"\n⚠️  [Test {i}] WARN (CL={cl}): Expected {len(expected_ids)} vs Actual {len(actual_ids)}")
+                    else:
+                        # --- Strong 级别: 真正的 MISMATCH ---
+                        print(f"\n❌ [Test {i}] MISMATCH!")
+                        print(f"   Expr: {expr_str}")
+                        print(f"   Expected: {len(expected_ids)} vs Actual: {len(actual_ids)}")
+                        print(f"   Diff: {diff_msg}")
+                        print(f"   🔑 复现此bug: python milvus_fuzz_oracle.py --seed {current_seed}\n")
 
-                    file_log(f"  -> MISMATCH! {diff_msg}")
-                    file_log(f"  -> REPRODUCTION SEED: {current_seed}")
+                        file_log(f"  -> MISMATCH! {diff_msg}")
+                        file_log(f"  -> REPRODUCTION SEED: {current_seed}")
 
                     # 记录与展示具体数据行，便于一眼确认异常
-                    if missing:
-                        missing_rows = sample_rows(missing)
-                        file_log(f"  Missing rows sample ({len(missing_rows)}/{len(missing)}): {missing_rows}")
-                        print("   Missing rows (sample):")
-                        for r in missing_rows:
-                            print(f"     {r}")
-                    if extra:
-                        extra_rows = sample_rows(extra)
-                        file_log(f"  Extra rows sample ({len(extra_rows)}/{len(extra)}): {extra_rows}")
-                        print("   Extra rows (sample):")
-                        for r in extra_rows:
-                            print(f"     {r}")
+                    if cl != "Strong":
+                        # 非 Strong: 只记日志, 不深入验证, 不计入 failed_cases
+                        pass
+                    else:
+                        # Strong: 完整的错误分析
+                        if missing:
+                            missing_rows = sample_rows(missing)
+                            file_log(f"  Missing rows sample ({len(missing_rows)}/{len(missing)}): {missing_rows}")
+                            print("   Missing rows (sample):")
+                            for r in missing_rows:
+                                print(f"     {r}")
+                        if extra:
+                            extra_rows = sample_rows(extra)
+                            file_log(f"  Extra rows sample ({len(extra_rows)}/{len(extra)}): {extra_rows}")
+                            print("   Extra rows (sample):")
+                            for r in extra_rows:
+                                print(f"     {r}")
 
-                        # 【验证】单独查询 Extra IDs，确认它们是否真的被 Milvus 返回
-                        print("\n   🔍 Verifying Extra IDs individually:")
-                        for eid in list(extra)[:5]:  # 只验证前5个，避免过多输出
-                            try:
-                                verify_res = mm.col.query(
-                                    f"id == {eid}",
-                                    output_fields=["id"],
-                                    limit=1,
-                                    consistency_level="Strong"
-                                )
-                                exists_in_db = len(verify_res) > 0
+                            # 【验证】单独查询 Extra IDs，确认它们是否真的被 Milvus 返回
+                            print("\n   🔍 Verifying Extra IDs individually:")
+                            for eid in list(extra)[:5]:
+                                try:
+                                    verify_res = mm.col.query(
+                                        f"id == {eid}",
+                                        output_fields=["id"],
+                                        limit=1,
+                                        consistency_level="Strong"
+                                    )
+                                    exists_in_db = len(verify_res) > 0
 
-                                # 再用原始表达式 + id 过滤，看是否返回
-                                combined_expr = f"({expr_str}) and (id == {eid})"
-                                match_res = mm.col.query(
-                                    combined_expr,
-                                    output_fields=["id"],
-                                    limit=1,
-                                    consistency_level="Strong"
-                                )
-                                matches_expr = len(match_res) > 0
+                                    combined_expr = f"({expr_str}) and (id == {eid})"
+                                    match_res = mm.col.query(
+                                        combined_expr,
+                                        output_fields=["id"],
+                                        limit=1,
+                                        consistency_level="Strong"
+                                    )
+                                    matches_expr = len(match_res) > 0
 
-                                print(f"     ID {eid}: exists={exists_in_db}, matches_original_expr={matches_expr}")
-                                file_log(f"  Extra ID {eid} verification: exists={exists_in_db}, matches={matches_expr}")
+                                    print(f"     ID {eid}: exists={exists_in_db}, matches_original_expr={matches_expr}")
+                                    file_log(f"  Extra ID {eid} verification: exists={exists_in_db}, matches={matches_expr}")
 
-                            except Exception as ve:
-                                print(f"     ID {eid}: verification failed - {ve}")
-                                file_log(f"  Extra ID {eid} verification error: {ve}")
+                                except Exception as ve:
+                                    print(f"     ID {eid}: verification failed - {ve}")
+                                    file_log(f"  Extra ID {eid} verification error: {ve}")
 
-                    # 加入错误列表
-                    failed_cases.append({
-                        "id": i,
-                        "expr": expr_str,
-                        "detail": f"Exp: {len(expected_ids)} vs Act: {len(actual_ids)}. {diff_msg}",
-                        "seed": current_seed
-                    })
+                        # 加入错误列表 (仅 Strong 级别)
+                        failed_cases.append({
+                            "id": i,
+                            "expr": expr_str,
+                            "detail": f"Exp: {len(expected_ids)} vs Act: {len(actual_ids)}. {diff_msg}",
+                            "seed": current_seed,
+                            "consistency_level": cl
+                        })
                 # --- 向量 + 标量联合校验（HNSW/IVF/FLAT 均可），可选执行 ---
                 # 仅当存在满足标量条件的数据时才做检查，且按比例抽样，避免对公用服务器造成额外压力。
                 if expected_ids and random.random() < VECTOR_CHECK_RATIO:
@@ -3520,6 +3562,8 @@ if __name__ == "__main__":
     parser.add_argument("--chaos-rate", type=float, default=0.0, help="Set custom chaos rate (0.0 - 1.0)")
     parser.add_argument("--metric", type=str, choices=["L2", "IP", "COSINE"], default=None,
                         help="Force a specific metric type (default: random from L2/IP/COSINE)")
+    parser.add_argument("--consistency", type=str, choices=["Strong", "Bounded", "Eventually", "Session"],
+                        default=None, help="Force a specific consistency level (default: random)")
 
     # Execution Modes (Mutually Exclusive)
     group = parser.add_mutually_exclusive_group()
@@ -3554,6 +3598,7 @@ if __name__ == "__main__":
     print(f"   Metric: {args.metric if args.metric else '(Random from L2/IP/COSINE)'}")
     print(f"   Dynamic Ops: {enable_dynamic_ops}")
     print(f"   Chaos Rate: {CHAOS_RATE}")
+    print(f"   Consistency: {args.consistency if args.consistency else '(Random)'}")
 
     if args.pqs or (args.pqs_rounds != 1000 and not args.equiv and not args.groupby_test):
         # Implicitly enable PQS if pqs_rounds is modified from default, or explicit --pqs
@@ -3567,7 +3612,7 @@ if __name__ == "__main__":
         print(f"   Mode: Equivalence Test")
         print(f"   Rounds: {args.rounds}")
         print("=" * 80)
-        run_equivalence_mode(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
+        run_equivalence_mode(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops, consistency=args.consistency)
 
     elif args.groupby_test:
         print(f"   Mode: GroupBy Test")
@@ -3579,4 +3624,4 @@ if __name__ == "__main__":
         print(f"   Mode: Standard Fuzzing")
         print(f"   Rounds: {args.rounds}")
         print("=" * 80)
-        run(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
+        run(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops, consistency=args.consistency)
