@@ -1115,6 +1115,166 @@ class OracleQueryGenerator:
 
         return filter_obj, mask, expr_str
 
+    def gen_not_atomic_expr(self):
+        """
+        专项 NOT 原子表达式生成器（6种策略）。
+        专门设计来触发 Qdrant 的 must_not + NULL 交互路径。
+        返回 (filter_obj, pandas_mask, expr_str)
+        """
+        f = random.choice(self.schema)
+        name, ftype = f["name"], f["type"]
+        series = self.df[name]
+
+        strategy = random.choice([
+            "not_compare",     # NOT (col > X)
+            "not_eq",          # NOT (col == X)
+            "not_is_null",     # NOT (is null) ↔ is not null
+            "not_is_not_null", # NOT (is not null) ↔ is null
+            "not_and",         # NOT (col > X AND col < Y)
+            "not_or",          # NOT (col == X OR col == Y)
+        ])
+
+        # --- 策略 1: NOT + 比较 ---
+        if strategy == "not_compare":
+            if ftype in [FieldType.INT, FieldType.FLOAT, FieldType.DATETIME]:
+                valid = series.dropna()
+                if valid.empty:
+                    # fallback: NOT (is null)
+                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                val = self._convert_to_native(random.choice(valid.values))
+                if ftype == FieldType.INT or ftype == FieldType.DATETIME:
+                    val = int(val)
+                else:
+                    val = float(val)
+                op = random.choice(["gt", "lt", "gte", "lte"])
+                inner_cond = FieldCondition(key=name, range=Range(**{op: val}))
+                f_obj = Filter(must_not=[inner_cond])
+                # Oracle: Qdrant must_not 对 null → 不匹配 → 保留
+                def _mask_fn(x, _op=op, _val=val):
+                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                        return True  # null → must_not 不命中 → 保留
+                    try:
+                        xv = float(x)
+                        if _op == "gt": return not (xv > _val)
+                        if _op == "lt": return not (xv < _val)
+                        if _op == "gte": return not (xv >= _val)
+                        if _op == "lte": return not (xv <= _val)
+                    except: return True
+                    return True
+                mask = series.apply(_mask_fn)
+                op_sym = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[op]
+                return f_obj, mask, f"NOT ({name} {op_sym} {val})"
+
+            elif ftype == FieldType.STRING:
+                valid = series.dropna()
+                if valid.empty:
+                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                val = str(random.choice(valid.values))
+                inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
+                f_obj = Filter(must_not=[inner_cond])
+                mask = series.apply(lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val)
+                return f_obj, mask, f'NOT ({name} == "{val}")'
+
+            elif ftype == FieldType.BOOL:
+                val_bool = random.choice([True, False])
+                inner_cond = FieldCondition(key=name, match=MatchValue(value=val_bool))
+                f_obj = Filter(must_not=[inner_cond])
+                mask = series.apply(lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val_bool)
+                return f_obj, mask, f"NOT ({name} == {val_bool})"
+
+            # fallback
+            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+            return f_obj, series.notna(), f"NOT ({name} is null)"
+
+        # --- 策略 2: NOT + 等值 ---
+        elif strategy == "not_eq":
+            if ftype == FieldType.INT:
+                valid = series.dropna()
+                if valid.empty:
+                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                val = int(self._convert_to_native(random.choice(valid.values)))
+                inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
+                f_obj = Filter(must_not=[inner_cond])
+                mask = series.apply(lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else int(x) != val)
+                return f_obj, mask, f"NOT ({name} == {val})"
+            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+            return f_obj, series.notna(), f"NOT ({name} is null)"
+
+        # --- 策略 3: NOT (is null) → 非空行 ---
+        elif strategy == "not_is_null":
+            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+            mask = series.notna()
+            return f_obj, mask, f"NOT ({name} is null)"
+
+        # --- 策略 4: NOT (is not null) → 空行 ---
+        elif strategy == "not_is_not_null":
+            # is not null = must_not[IsNull], 再取 NOT → 双重否定 → IsNull
+            inner = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+            f_obj = Filter(must_not=[inner])
+            mask = series.isna()
+            return f_obj, mask, f"NOT (NOT ({name} is null))"
+
+        # --- 策略 5: NOT + AND (德摩根定律) ---
+        elif strategy == "not_and":
+            if ftype in [FieldType.INT, FieldType.DATETIME]:
+                valid = series.dropna()
+                if valid.empty:
+                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                val = int(self._convert_to_native(random.choice(valid.values)))
+                low = val - random.randint(10, 100)
+                high = val + random.randint(10, 100)
+                inner = Filter(must=[
+                    FieldCondition(key=name, range=Range(gt=low)),
+                    FieldCondition(key=name, range=Range(lt=high))
+                ])
+                f_obj = Filter(must_not=[inner])
+                # Qdrant must_not: null → 不匹配 inner → 保留
+                def _and_mask(x, _low=low, _high=high):
+                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                        return True
+                    try:
+                        xv = float(x)
+                        return not (xv > _low and xv < _high)
+                    except: return True
+                mask = series.apply(_and_mask)
+                return f_obj, mask, f"NOT ({name} > {low} AND {name} < {high})"
+            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+            return f_obj, series.notna(), f"NOT ({name} is null)"
+
+        # --- 策略 6: NOT + OR (德摩根延伸) ---
+        elif strategy == "not_or":
+            if ftype == FieldType.INT:
+                valid = series.dropna()
+                if len(valid) < 2:
+                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                vals = [int(self._convert_to_native(v)) for v in random.sample(list(valid.values), min(2, len(valid)))]
+                v1, v2 = vals[0], vals[-1]
+                inner = Filter(should=[
+                    Filter(must=[FieldCondition(key=name, match=MatchValue(value=v1))]),
+                    Filter(must=[FieldCondition(key=name, match=MatchValue(value=v2))])
+                ])
+                f_obj = Filter(must_not=[inner])
+                def _or_mask(x, _v1=v1, _v2=v2):
+                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                        return True
+                    try:
+                        xv = int(x)
+                        return not (xv == _v1 or xv == _v2)
+                    except: return True
+                mask = series.apply(_or_mask)
+                return f_obj, mask, f"NOT ({name} == {v1} OR {name} == {v2})"
+            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+            return f_obj, series.notna(), f"NOT ({name} is null)"
+
+        # 终极兜底
+        f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+        return f_obj, series.notna(), f"NOT ({name} is null)"
+
     def gen_constant_expr(self):
         """生成常量表达式（Qdrant 支持有限）"""
         # Qdrant 中 id 是点 ID，不能用于 FieldCondition 过滤
@@ -1170,6 +1330,15 @@ class OracleQueryGenerator:
                 res = self.gen_has_id_expr()
                 if res[0]:
                     return res
+
+            # 15% 概率生成专项 NOT 表达式
+            if random.random() < 0.15:
+                res = self.gen_not_atomic_expr()
+                if res and res[0]:
+                    f_obj = res[0]
+                    if isinstance(f_obj, FieldCondition):
+                        f_obj = Filter(must=[f_obj])
+                    return f_obj, res[1], res[2]
 
             if random.random() < 0.3:
                 # 尝试生成 JSON 表达式
@@ -1462,6 +1631,9 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
         # 对 INT 字段：gt=N <=> gte=N+1, lt=N <=> lte=N-1
         self._add_int_range_shift_mutations(base_filter, base_expr, mutations)
 
+        # 9. InExpandToOr: MatchAny([a,b,c]) → should[MatchValue(a), MatchValue(b), MatchValue(c)]
+        self._add_in_expand_to_or_mutations(base_filter, base_expr, mutations)
+
         return mutations
 
     def _add_int_range_shift_mutations(self, base_filter, base_expr, mutations):
@@ -1544,6 +1716,62 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 break
 
         return mutations
+
+    def _add_in_expand_to_or_mutations(self, base_filter, base_expr, mutations):
+        """
+        InExpandToOr: 将 MatchAny([a,b,c]) 展开为 should[MatchValue(a), MatchValue(b), MatchValue(c)]
+        递归搜索 filter 树，找到第一个 MatchAny 条件并展开。
+        """
+        if not isinstance(base_filter, Filter):
+            return
+
+        # 递归搜索所有 must/must_not/should 中的 FieldCondition
+        def _find_and_replace(filter_obj):
+            """递归查找含 MatchAny 的 FieldCondition，返回替换后的新 Filter 或 None"""
+            if isinstance(filter_obj, FieldCondition):
+                if filter_obj.match and isinstance(filter_obj.match, MatchAny):
+                    any_vals = filter_obj.match.any
+                    if any_vals and 1 < len(any_vals) <= 10:
+                        fname = filter_obj.key
+                        should_list = [Filter(must=[FieldCondition(key=fname, match=MatchValue(value=v))]) for v in any_vals]
+                        return Filter(should=should_list)
+                return None
+            if not isinstance(filter_obj, Filter):
+                return None
+
+            # 遍历 must
+            if filter_obj.must:
+                for i, cond in enumerate(filter_obj.must):
+                    replacement = _find_and_replace(cond)
+                    if replacement is not None:
+                        new_must = list(filter_obj.must)
+                        new_must[i] = replacement
+                        return Filter(must=new_must, must_not=filter_obj.must_not, should=filter_obj.should)
+            # 遍历 should
+            if filter_obj.should:
+                for i, cond in enumerate(filter_obj.should):
+                    replacement = _find_and_replace(cond)
+                    if replacement is not None:
+                        new_should = list(filter_obj.should)
+                        new_should[i] = replacement
+                        return Filter(must=filter_obj.must, must_not=filter_obj.must_not, should=new_should)
+            # 遍历 must_not
+            if filter_obj.must_not:
+                for i, cond in enumerate(filter_obj.must_not):
+                    replacement = _find_and_replace(cond)
+                    if replacement is not None:
+                        new_must_not = list(filter_obj.must_not)
+                        new_must_not[i] = replacement
+                        return Filter(must=filter_obj.must, must_not=new_must_not, should=filter_obj.should)
+            return None
+
+        result = _find_and_replace(base_filter)
+        if result is not None:
+            mutations.append({
+                "type": "InExpandToOr",
+                "filter": result,
+                "expr": f"{base_expr} [MatchAny→should+MatchValue]"
+            })
 
 
 # --- 5. PQS Query Generator ---
@@ -1630,11 +1858,72 @@ class PQSQueryGenerator(OracleQueryGenerator):
             return any(self._has_valid_content(v) for v in obj)
         return False
 
+    def gen_multi_field_true_filter(self, pivot_row, n=3, min_fields=2):
+        """
+        多字段合取必真条件：从 pivot_row 中选 2-4 个非空标量字段，
+        组合成 AND 条件。比纯 HasId 更有攻击性的 fallback。
+        """
+        valid_fields = []
+        for f in self.schema:
+            fname = f["name"]
+            ftype = f["type"]
+            val = pivot_row[fname]
+            if val is None: continue
+            if isinstance(val, float) and np.isnan(val): continue
+            if ftype in [FieldType.INT, FieldType.FLOAT, FieldType.STRING, FieldType.BOOL, FieldType.DATETIME]:
+                valid_fields.append(f)
+
+        if not valid_fields:
+            # 纯 ID 兜底
+            pid = int(pivot_row["id"])
+            return HasIdCondition(has_id=[pid]), f"id == {pid}"
+
+        count = min(random.randint(min_fields, n), len(valid_fields))
+        chosen = random.sample(valid_fields, count)
+
+        filters = []
+        exprs = []
+        for f in chosen:
+            fname = f["name"]
+            ftype = f["type"]
+            val = pivot_row[fname]
+            if hasattr(val, "item"): val = val.item()
+
+            try:
+                if ftype == FieldType.BOOL:
+                    filters.append(FieldCondition(key=fname, match=MatchValue(value=bool(val))))
+                    exprs.append(f"{fname}=={bool(val)}")
+                elif ftype == FieldType.INT or ftype == FieldType.DATETIME:
+                    v = int(val)
+                    filters.append(FieldCondition(key=fname, range=Range(gte=v, lte=v)))
+                    exprs.append(f"{fname}=={v}")
+                elif ftype == FieldType.FLOAT:
+                    v = float(val)
+                    eps = 1e-5
+                    filters.append(FieldCondition(key=fname, range=Range(gte=v-eps, lte=v+eps)))
+                    exprs.append(f"{fname}~={v}")
+                elif ftype == FieldType.STRING:
+                    v = str(val)
+                    filters.append(FieldCondition(key=fname, match=MatchValue(value=v)))
+                    exprs.append(f'{fname}=="{v}"')
+            except:
+                pass
+
+        if not filters:
+            pid = int(pivot_row["id"])
+            return HasIdCondition(has_id=[pid]), f"id == {pid}"
+
+        combined = Filter(must=filters)
+        return combined, " AND ".join(exprs)
+
     def gen_pqs_filter(self, pivot_row, depth):
         """生成针对指定行必真的过滤条件"""
         force_recursion = depth > 3
 
         if depth <= 0 or (not force_recursion and random.random() < 0.3):
+            # 30% 概率使用多字段合取 fallback（更强攻击性）
+            if random.random() < 0.3:
+                return self.gen_multi_field_true_filter(pivot_row)
             return self.gen_true_atomic_filter(pivot_row)
 
         op = random.choice(["and", "or", "nested_not"])
@@ -1898,57 +2187,131 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
 
     def _gen_pqs_json_filter(self, fname, json_obj):
-        """生成针对 JSON 字段的必真条件"""
+        """
+        融合版 JSON 必真条件生成器：
+        支持递归深度下钻（最多12层），到达标量时生成边界条件。
+        """
         if json_obj is None:
             return self._null_filter(fname), f"{fname} is null"
-        if not isinstance(json_obj, dict):
+        if not isinstance(json_obj, dict) and not isinstance(json_obj, list):
             return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
 
-        # 尝试下钻到标量值
-        strategies = []
+        # 将 numpy 类型转换
+        if hasattr(json_obj, "tolist"): json_obj = json_obj.tolist()
+        if hasattr(json_obj, "item"): json_obj = json_obj.item()
 
-        # 策略 1: price 字段
-        if "price" in json_obj:
-            price = json_obj["price"]
-            if isinstance(price, (int, float)):
-                strategies.append((
-                    FieldCondition(key=f"{fname}.price", match=MatchValue(value=int(price))),
-                    f"{fname}.price == {int(price)}"
-                ))
+        current = json_obj
+        path_str = fname  # Qdrant 使用点号路径: fname.key1.key2
 
-        # 策略 2: color 字段
-        if "color" in json_obj:
-            color = json_obj["color"]
-            if isinstance(color, str):
-                strategies.append((
-                    FieldCondition(key=f"{fname}.color", match=MatchValue(value=color)),
-                    f'{fname}.color == "{color}"'
-                ))
+        max_depth = random.randint(1, 12)
+        depth = 0
 
-        # 策略 3: active 字段
-        if "active" in json_obj:
-            active = json_obj["active"]
-            if isinstance(active, bool):
-                strategies.append((
-                    FieldCondition(key=f"{fname}.active", match=MatchValue(value=active)),
-                    f"{fname}.active == {active}"
-                ))
+        while depth < max_depth:
+            if isinstance(current, dict) and len(current) > 0:
+                k = random.choice(list(current.keys()))
+                path_str += f".{k}"
+                current = current[k]
+                depth += 1
+                if self._has_valid_content(current) and random.random() < 0.2:
+                    break
+            elif isinstance(current, (list, np.ndarray)) and len(current) > 0:
+                idx = random.randint(0, len(current) - 1)
+                path_str += f"[{idx}]"
+                current = current[idx]
+                depth += 1
+            else:
+                break
 
-        # 策略 4: nested config.version
-        if "config" in json_obj and isinstance(json_obj["config"], dict):
-            if "version" in json_obj["config"]:
-                version = json_obj["config"]["version"]
-                if isinstance(version, int):
-                    strategies.append((
-                        FieldCondition(key=f"{fname}.config.version", match=MatchValue(value=version)),
-                        f"{fname}.config.version == {version}"
-                    ))
+        # 转换 numpy 标量
+        if hasattr(current, "item"): current = current.item()
 
-        if strategies:
-            return random.choice(strategies)
+        # Case 1: Null
+        if current is None:
+            return IsNullCondition(is_null=PayloadField(key=path_str)), f"{path_str} is null"
 
-        # Qdrant 不支持 is_null=False，需要用 must_not 包装
+        # Case 2: 复杂类型停在中间 → is not null
+        if isinstance(current, (dict, list, np.ndarray)):
+            return Filter(must_not=[self._is_null_condition(path_str)]), f"{path_str} is not null"
+
+        # Case 3: 标量 → 生成边界条件
+        if isinstance(current, bool):
+            return FieldCondition(key=path_str, match=MatchValue(value=current)), f"{path_str} == {current}"
+
+        elif isinstance(current, int):
+            return self._gen_pqs_boundary_int(path_str, current)
+
+        elif isinstance(current, float):
+            return self._gen_pqs_boundary_float(path_str, current)
+
+        elif isinstance(current, str):
+            return self._gen_pqs_boundary_str(path_str, current)
+
         return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+
+    def _gen_pqs_boundary_int(self, path, val):
+        """JSON 深层 INT 边界条件（10种策略）"""
+        val = int(val)
+        strategies = []
+        # 1. 精确匹配
+        strategies.append((FieldCondition(key=path, match=MatchValue(value=val)), f"{path} == {val}"))
+        # 2. 闭区间
+        strategies.append((FieldCondition(key=path, range=Range(gte=val, lte=val)), f"{path} >= {val} AND <= {val}"))
+        # 3. 开区间 ±1
+        strategies.append((FieldCondition(key=path, range=Range(gt=val-1, lt=val+1)), f"{path} > {val-1} AND < {val+1}"))
+        # 4. NOT反面 (val < boundary → NOT gte boundary)
+        boundary = val + random.randint(1, 100)
+        strategies.append((Filter(must_not=[FieldCondition(key=path, range=Range(gte=boundary))]), f"NOT ({path} >= {boundary})"))
+        # 5. NOT反面 (val > boundary → NOT lte boundary)
+        boundary_low = val - random.randint(1, 100)
+        strategies.append((Filter(must_not=[FieldCondition(key=path, range=Range(lte=boundary_low))]), f"NOT ({path} <= {boundary_low})"))
+        # 6. MatchAny 包含噪声
+        dummies = [val + random.randint(100000, 200000) for _ in range(3)]
+        candidates = dummies + [val]
+        random.shuffle(candidates)
+        strategies.append((FieldCondition(key=path, match=MatchAny(any=candidates)), f"{path} in {candidates}"))
+        # 7. 零值特殊: 如果 val >= 0，用 gte=0
+        if val >= 0:
+            strategies.append((FieldCondition(key=path, range=Range(gte=0)), f"{path} >= 0"))
+        # 8. 符号逻辑: 如果 val > 0，NOT lte=-1
+        if val > 0:
+            strategies.append((Filter(must_not=[FieldCondition(key=path, range=Range(lte=-1))]), f"NOT ({path} <= -1)"))
+        return random.choice(strategies)
+
+    def _gen_pqs_boundary_float(self, path, val):
+        """JSON 深层 FLOAT 边界条件（7种策略）"""
+        val = float(val)
+        eps = 1e-5
+        strategies = []
+        # 1. 窄 epsilon
+        strategies.append((FieldCondition(key=path, range=Range(gt=val-eps, lt=val+eps)), f"{path} ~= {val}"))
+        # 2. 宽 epsilon
+        wide = random.uniform(0.01, 1.0)
+        strategies.append((FieldCondition(key=path, range=Range(gte=val-wide, lte=val+wide)), f"{path} in [{val-wide:.4f}, {val+wide:.4f}]"))
+        # 3. 单边 gte
+        strategies.append((FieldCondition(key=path, range=Range(gte=val-eps)), f"{path} >= {val-eps}"))
+        # 4. NOT反面
+        boundary = val - random.uniform(1.0, 100.0)
+        strategies.append((Filter(must_not=[FieldCondition(key=path, range=Range(lte=boundary))]), f"NOT ({path} <= {boundary:.4f})"))
+        # 5. 符号逻辑
+        if val > 0:
+            strategies.append((FieldCondition(key=path, range=Range(gt=0)), f"{path} > 0"))
+        return random.choice(strategies)
+
+    def _gen_pqs_boundary_str(self, path, val):
+        """JSON 深层 STRING 边界条件（4种策略）"""
+        val = str(val)
+        strategies = []
+        # 1. 精确匹配
+        strategies.append((FieldCondition(key=path, match=MatchValue(value=val)), f'{path} == "{val}"'))
+        # 2. MatchAny
+        dummies = [self._random_string(8) for _ in range(3)]
+        candidates = dummies + [val]
+        random.shuffle(candidates)
+        strategies.append((FieldCondition(key=path, match=MatchAny(any=candidates)), f'{path} in {candidates}'))
+        # 3. MatchExcept 排除假值
+        fake = [self._random_string(12) for _ in range(3)]
+        strategies.append((FieldCondition(key=path, match=MatchExcept(**{"except": fake})), f'{path} not in {fake}'))
+        return random.choice(strategies)
 
     def gen_complex_noise(self, depth):
         """生成复杂的噪声表达式"""
@@ -2215,7 +2578,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                 _do_dynamic_op(dm, qm, file_log)
 
             # 生成查询
-            depth = random.randint(1, 10)
+            depth = random.randint(1, 15)
             filter_obj = None
             for _ in range(10):
                 filter_obj, pandas_mask, expr_str = qg.gen_complex_expr(depth)
