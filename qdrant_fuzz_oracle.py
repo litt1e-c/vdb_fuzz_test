@@ -11,10 +11,12 @@ Features:
 import time
 import random
 import string
+import math
 import numpy as np
 import pandas as pd
 import json
 import sys
+from datetime import datetime, timedelta
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import (
@@ -22,6 +24,8 @@ from qdrant_client.http.models import (
     Filter, FieldCondition, MatchValue, MatchAny, MatchExcept,
     Range, DatetimeRange, PayloadField,
     IsNullCondition, IsEmptyCondition,
+    HasIdCondition, PointIdsList,
+    GeoPoint, GeoBoundingBox, GeoRadius,
     PayloadSchemaType
 )
 
@@ -53,6 +57,9 @@ class FieldType:
     JSON = "JSON"
     ARRAY_INT = "ARRAY_INT"
     ARRAY_STR = "ARRAY_STR"
+    ARRAY_FLOAT = "ARRAY_FLOAT"
+    DATETIME = "DATETIME"
+    GEO = "GEO"
 
 def get_type_name(dtype):
     """Map field type to string"""
@@ -100,7 +107,7 @@ class DataManager:
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
         num_fields = random.randint(3, 20)
-        types_pool = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING]
+        types_pool = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.DATETIME]
 
         for i in range(num_fields):
             ftype = random.choice(types_pool)
@@ -123,14 +130,21 @@ class DataManager:
             "max_capacity": self.array_capacity
         })
 
+        # 添加浮点数组
+        self.schema_config.append({
+            "name": "scores_array",
+            "type": FieldType.ARRAY_FLOAT,
+            "max_capacity": self.array_capacity
+        })
+
+        # 添加 GEO 字段（经纬度坐标）
+        self.schema_config.append({"name": "location_geo", "type": FieldType.GEO})
+
         print(f"   -> Generated {len(self.schema_config)} dynamic fields (plus id & vector).")
         print("   -> Schema Structure:")
         for f in self.schema_config:
             t_name = get_type_name(f["type"])
-            if f["type"] in [FieldType.ARRAY_INT, FieldType.ARRAY_STR]:
-                print(f"      - {f['name']:<15} : {t_name}")
-            else:
-                print(f"      - {f['name']:<15} : {t_name}")
+            print(f"      - {f['name']:<15} : {t_name}")
 
     def generate_data(self):
         print(f"🌊 2. Generating {N} rows (Vector Dim={DIM})...")
@@ -192,6 +206,30 @@ class DataManager:
                     length = random.randint(0, 5)
                     arr_list.append([self._random_string(2, 8) for _ in range(length)])
                 data[fname] = self._apply_nulls(arr_list, rng)
+            elif ftype == FieldType.ARRAY_FLOAT:
+                arr_list = []
+                for _ in range(N):
+                    length = random.randint(0, 5)
+                    arr_list.append([round(float(rng.random() * 1000), 2) for _ in range(length)])
+                data[fname] = self._apply_nulls(arr_list, rng)
+            elif ftype == FieldType.DATETIME:
+                # 生成时间戳（epoch 秒数，整型）
+                # 范围：2020-01-01 到 2025-01-01
+                epoch_2020 = int(datetime(2020, 1, 1).timestamp())
+                epoch_2025 = int(datetime(2025, 1, 1).timestamp())
+                values = [int(rng.integers(epoch_2020, epoch_2025)) for _ in range(N)]
+                data[fname] = self._apply_nulls(values, rng)
+            elif ftype == FieldType.GEO:
+                geo_list = []
+                for _ in range(N):
+                    if rng.random() < self.null_ratio:
+                        geo_list.append(None)
+                    else:
+                        geo_list.append({
+                            "lat": round(float(rng.uniform(-90, 90)), 6),
+                            "lon": round(float(rng.uniform(-180, 180)), 6)
+                        })
+                data[fname] = geo_list
 
         self.df = pd.DataFrame(data)
         print("✅ Data Generation Complete.")
@@ -277,6 +315,14 @@ class QdrantManager:
             # BOOL 字段确保是 Python bool
             elif ftype == FieldType.BOOL:
                 return bool(v)
+            # DATETIME 字段转为 int（epoch 秒数）
+            elif ftype == FieldType.DATETIME:
+                return int(v)
+            # GEO 字段确保是正确的 dict
+            elif ftype == FieldType.GEO:
+                if isinstance(v, dict) and "lat" in v and "lon" in v:
+                    return {"lat": float(v["lat"]), "lon": float(v["lon"])}
+                return None
             # 其他类型递归转换
             else:
                 return convert_numpy_types(v)
@@ -355,6 +401,18 @@ class QdrantManager:
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
                         field_schema=PayloadSchemaType.BOOL
+                    )
+                elif ftype == FieldType.DATETIME:
+                    self.client.create_payload_index(
+                        collection_name=COLLECTION_NAME,
+                        field_name=fname,
+                        field_schema=PayloadSchemaType.INTEGER
+                    )
+                elif ftype == FieldType.GEO:
+                    self.client.create_payload_index(
+                        collection_name=COLLECTION_NAME,
+                        field_name=fname,
+                        field_schema=PayloadSchemaType.GEO
                     )
             except Exception as e:
                 # 索引创建失败不是致命错误
@@ -471,6 +529,18 @@ class OracleQueryGenerator:
 
         elif ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR]:
             return random.randint(50000, 100000)
+
+        elif ftype == FieldType.ARRAY_FLOAT:
+            return round(random.random() * 2000, 2)
+
+        elif ftype == FieldType.DATETIME:
+            # 生成一个随机时间戳（epoch 秒数）
+            epoch_2020 = int(datetime(2020, 1, 1).timestamp())
+            epoch_2025 = int(datetime(2025, 1, 1).timestamp())
+            return random.randint(epoch_2020, epoch_2025)
+
+        elif ftype == FieldType.GEO:
+            return {"lat": round(random.uniform(-90, 90), 6), "lon": round(random.uniform(-180, 180), 6)}
 
         return None
 
@@ -616,6 +686,73 @@ class OracleQueryGenerator:
                 filter_cond = Filter(must_not=[self._is_empty_condition(name)])
                 mask = series.apply(lambda x: isinstance(x, list) and len(x) > 0)
                 expr_str = f'{name} is not empty'
+
+        elif ftype == FieldType.ARRAY_FLOAT:
+            # 浮点数组 - 使用范围查询（检查数组中是否有元素在范围内）
+            valid_series = self.df[name].dropna()
+            all_items = []
+            for arr in valid_series:
+                if isinstance(arr, list):
+                    all_items.extend(arr)
+            if all_items:
+                target = random.choice(all_items)
+                target_f = float(target)
+                epsilon = 0.5  # 较大的 epsilon 避免浮点精度问题
+                filter_cond = FieldCondition(key=name, range=Range(gte=target_f - epsilon, lte=target_f + epsilon))
+                mask = series.apply(lambda x, t=target_f, e=epsilon:
+                    any(t - e <= float(v) <= t + e for v in x) if isinstance(x, list) and x else False)
+                expr_str = f'{name} has element ~= {target_f}'
+            else:
+                filter_cond = Filter(must_not=[self._is_empty_condition(name)])
+                mask = series.apply(lambda x: isinstance(x, list) and len(x) > 0)
+                expr_str = f'{name} is not empty'
+
+        elif ftype == FieldType.DATETIME:
+            val_int = int(val)
+            op = random.choice([">", "<", ">=", "<=", "==", "!="])
+            if op == "==":
+                filter_cond = FieldCondition(key=name, match=MatchValue(value=val_int))
+            elif op == "!=":
+                filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
+            elif op == ">":
+                filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
+            elif op == "<":
+                filter_cond = FieldCondition(key=name, range=Range(lt=val_int))
+            elif op == ">=":
+                filter_cond = FieldCondition(key=name, range=Range(gte=val_int))
+            elif op == "<=":
+                filter_cond = FieldCondition(key=name, range=Range(lte=val_int))
+            mask = series.apply(safe_compare_scalar(op, val_int))
+            expr_str = f"{name} {op} {val_int} (timestamp)"
+
+        elif ftype == FieldType.GEO:
+            # GEO 使用 bounding box 查询
+            if isinstance(val, dict) and "lat" in val and "lon" in val:
+                center_lat = val["lat"]
+                center_lon = val["lon"]
+            else:
+                center_lat = random.uniform(-80, 80)
+                center_lon = random.uniform(-170, 170)
+            delta_lat = random.uniform(1, 30)
+            delta_lon = random.uniform(1, 30)
+            top_lat = min(center_lat + delta_lat, 90)
+            bottom_lat = max(center_lat - delta_lat, -90)
+            left_lon = max(center_lon - delta_lon, -180)
+            right_lon = min(center_lon + delta_lon, 180)
+            filter_cond = FieldCondition(
+                key=name,
+                geo_bounding_box=GeoBoundingBox(
+                    top_left=GeoPoint(lat=top_lat, lon=left_lon),
+                    bottom_right=GeoPoint(lat=bottom_lat, lon=right_lon)
+                )
+            )
+            mask = series.apply(lambda x: (
+                x is not None and isinstance(x, dict)
+                and "lat" in x and "lon" in x
+                and bottom_lat <= x["lat"] <= top_lat
+                and left_lon <= x["lon"] <= right_lon
+            ))
+            expr_str = f"{name} in bbox({bottom_lat:.2f},{left_lon:.2f} -> {top_lat:.2f},{right_lon:.2f})"
 
         if filter_cond is not None and mask is not None:
             return (filter_cond, mask & series.notnull(), expr_str)
@@ -780,12 +917,21 @@ class OracleQueryGenerator:
 
         # 递归生成子节点
         filter_l, mask_l, expr_l = self.gen_complex_expr(depth - 1)
+        if not filter_l: return self.gen_complex_expr(depth)
+
+        op = random.choice(["and", "or", "not"])
+
+        if op == "not":
+            # NOT 逻辑：取反子表达式
+            # Qdrant must_not: 排除匹配的点（null 值的点由于不匹配条件，会被保留）
+            # Pandas ~mask: True -> False, False -> True（与 must_not 语义一致）
+            not_filter = Filter(must_not=[filter_l])
+            not_mask = ~mask_l.fillna(False)
+            return not_filter, not_mask, f"NOT ({expr_l})"
+
+        # AND/OR 需要第二个子表达式
         filter_r, mask_r, expr_r = self.gen_complex_expr(depth - 1)
-
-        if not filter_l: return filter_r, mask_r, expr_r
         if not filter_r: return filter_l, mask_l, expr_l
-
-        op = random.choice(["and", "or"])
 
         if op == "and":
             # AND 逻辑：将两个 Filter 作为整体放入 must 列表
@@ -849,8 +995,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
         name = field["name"]
         dtype = field["type"]
 
-        if dtype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR]:
-            # 数组长度检查 - Qdrant 没有直接的数组长度条件，使用不可能的值
+        if dtype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT]:
             impossible_val = "qdrant_fuzz_impossible_" + self._random_string(10)
             return (
                 FieldCondition(key=name, match=MatchValue(value=impossible_val)),
@@ -889,6 +1034,22 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                     match=MatchValue(value="non_exist")
                 ),
                 f'{name}.qdrant_fuzz_ghost_key_v3 == "non_exist"'
+            )
+
+        elif dtype == FieldType.DATETIME:
+            return (
+                FieldCondition(key=name, range=Range(gt=9999999999)),
+                f'{name} > 9999999999 (impossible timestamp)'
+            )
+
+        elif dtype == FieldType.GEO:
+            # 使用极小的不可能区域
+            return (
+                FieldCondition(key=name, geo_bounding_box=GeoBoundingBox(
+                    top_left=GeoPoint(lat=89.99999, lon=179.99998),
+                    bottom_right=GeoPoint(lat=89.99998, lon=179.99999)
+                )),
+                f'{name} in impossible tiny bbox near pole'
             )
 
         # 默认：使用 INT 字段的不可能范围
@@ -1109,7 +1270,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         false_filter, false_expr = self._gen_guaranteed_false_filter()
 
         if op == "nested_not":
-            inner_filter, inner_expr = self.gen_pqs_filter(pivot_row, depth)
+            inner_filter, inner_expr = self.gen_pqs_filter(pivot_row, depth - 1)
             if not inner_filter:
                 inner_filter = tautology_filter
                 inner_expr = tautology_expr
@@ -1131,7 +1292,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         else:  # OR
             filter_l, expr_l = self.gen_pqs_filter(pivot_row, depth - 1)
-            noise_filter, noise_expr = self.gen_complex_noise(depth + random.randint(0, 3))
+            noise_filter, noise_expr = self.gen_complex_noise(min(depth + random.randint(0, 3), 8))
 
             if not filter_l:
                 filter_l = tautology_filter
@@ -1255,6 +1416,34 @@ class PQSQueryGenerator(OracleQueryGenerator):
             # Qdrant 不支持 is_null=False，需要用 must_not 包装
             return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
 
+        elif ftype == FieldType.ARRAY_FLOAT:
+            if not isinstance(val, list) or len(val) == 0:
+                return self._empty_or_null_filter(fname), f"{fname} is empty"
+            valid_items = [x for x in val if x is not None]
+            if valid_items:
+                target = float(random.choice(valid_items))
+                epsilon = 0.5
+                return FieldCondition(key=fname, range=Range(gte=target - epsilon, lte=target + epsilon)), f"{fname} has element ~= {target}"
+            return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+
+        elif ftype == FieldType.DATETIME:
+            val_int = int(val) if hasattr(val, "item") else int(val)
+            # 使用包含该精确值的范围
+            return FieldCondition(key=fname, range=Range(gte=val_int, lte=val_int)), f'{fname} timestamp == {val_int}'
+
+        elif ftype == FieldType.GEO:
+            if isinstance(val, dict) and "lat" in val and "lon" in val:
+                lat, lon = val["lat"], val["lon"]
+                delta = 0.001  # 极小范围确保命中
+                return FieldCondition(
+                    key=fname,
+                    geo_bounding_box=GeoBoundingBox(
+                        top_left=GeoPoint(lat=min(lat + delta, 90), lon=max(lon - delta, -180)),
+                        bottom_right=GeoPoint(lat=max(lat - delta, -90), lon=min(lon + delta, 180))
+                    )
+                ), f"{fname} in tiny bbox around ({lat},{lon})"
+            return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+
         return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
 
     def _gen_pqs_json_filter(self, fname, json_obj):
@@ -1312,7 +1501,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
     def gen_complex_noise(self, depth):
         """生成复杂的噪声表达式"""
-        if depth <= 0:
+        if depth <= 0 or random.random() < 0.3:
             if random.random() < 0.8:
                 res = self.gen_atomic_expr()
                 if res and res[0]:
