@@ -38,6 +38,10 @@ DIM = 128                  # 向量维度
 BATCH_SIZE = 500           # 批次大小
 SLEEP_INTERVAL = 0.01      # 每次插入后暂停
 
+# 全局度量类型列表（延迟初始化，在 run() 内种子设置后随机选取）
+ALL_DISTANCE_TYPES = [Distance.EUCLID, Distance.COSINE, Distance.DOT, Distance.MANHATTAN]
+DISTANCE_TYPE = None  # 延迟初始化
+
 # 随机化配置
 INDEX_TYPE = random.choice(["hnsw"])  # Qdrant 主要使用 HNSW
 VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)  # 20-80% 概率做向量+标量联合校验
@@ -45,6 +49,15 @@ VECTOR_TOPK = random.randint(50, 200)          # TopK 在 50-200 之间随机
 
 # 混淆开关（默认关闭）
 CHAOS_RATE = 0.0
+
+# 唯一 ID 计数器（用于动态插入）
+_global_id_counter = N * 10
+
+def generate_unique_id():
+    """生成全局唯一 ID（用于动态 upsert 新行）"""
+    global _global_id_counter
+    _global_id_counter += 1
+    return _global_id_counter
 
 # --- 1. Data Manager ---
 
@@ -66,6 +79,8 @@ def get_type_name(dtype):
     return dtype
 
 class DataManager:
+    _id_counter = 0  # 类级别 ID 计数器
+
     def __init__(self):
         self.df = None
         self.vectors = None
@@ -243,6 +258,72 @@ class DataManager:
                 values[idx] = None
         return values
 
+    def generate_single_row(self, id_override=None):
+        """生成单条数据行（用于动态插入/upsert）"""
+        rng = np.random.default_rng(np.random.randint(0, 2**31))
+        row = {}
+        # 生成唯一 id
+        if id_override is not None:
+            row["id"] = int(id_override)
+        else:
+            DataManager._id_counter += 1
+            row["id"] = 10000000 + DataManager._id_counter * 1000 + random.randint(1, 999)
+
+        for field in self.schema_config:
+            fname = field["name"]
+            ftype = field["type"]
+
+            if ftype == FieldType.INT:
+                row[fname] = int(rng.integers(-self.int_range, self.int_range))
+            elif ftype == FieldType.FLOAT:
+                row[fname] = float(rng.random() * self.double_scale)
+            elif ftype == FieldType.BOOL:
+                row[fname] = bool(rng.choice([True, False]))
+            elif ftype == FieldType.STRING:
+                row[fname] = self._random_string(0, random.randint(5, 50))
+            elif ftype == FieldType.JSON:
+                base_obj = {
+                    "price": int(rng.integers(0, 1000)),
+                    "color": rng.choice(["Red", "Blue", "Green"]),
+                    "active": bool(rng.choice([True, False])),
+                }
+                if rng.random() < 0.8:
+                    base_obj["config"] = {"version": int(rng.integers(1, 10))}
+                if rng.random() < 0.8:
+                    base_obj["history"] = [int(x) for x in rng.integers(0, 100, size=3)]
+                random_part = self._gen_random_json_structure(rng, depth=self.json_max_depth)
+                if isinstance(random_part, dict):
+                    base_obj.update(random_part)
+                else:
+                    base_obj["random_payload"] = random_part
+                row[fname] = base_obj
+            elif ftype == FieldType.ARRAY_INT:
+                arr_len = rng.integers(0, 6)
+                row[fname] = [int(x) for x in rng.integers(0, 100, size=arr_len)]
+            elif ftype == FieldType.ARRAY_STR:
+                arr_len = rng.integers(0, 6)
+                row[fname] = [self._random_string(2, 8) for _ in range(arr_len)]
+            elif ftype == FieldType.ARRAY_FLOAT:
+                arr_len = rng.integers(0, 6)
+                row[fname] = [round(float(rng.random() * 1000), 2) for _ in range(arr_len)]
+            elif ftype == FieldType.DATETIME:
+                from datetime import datetime as dt_cls
+                epoch_2020 = int(dt_cls(2020, 1, 1).timestamp())
+                epoch_2025 = int(dt_cls(2025, 1, 1).timestamp())
+                row[fname] = int(rng.integers(epoch_2020, epoch_2025))
+            elif ftype == FieldType.GEO:
+                row[fname] = {
+                    "lat": round(float(rng.uniform(-90, 90)), 6),
+                    "lon": round(float(rng.uniform(-180, 180)), 6)
+                }
+        return row
+
+    def generate_single_vector(self):
+        """生成一条单位化的向量"""
+        vec = np.random.randn(DIM).astype(np.float32)
+        vec /= np.linalg.norm(vec)
+        return vec.tolist()
+
 # --- 2. Qdrant Manager ---
 
 class QdrantManager:
@@ -262,6 +343,12 @@ class QdrantManager:
             exit(1)
 
     def reset_collection(self, schema_config):
+        global DISTANCE_TYPE
+        # 延迟初始化距离度量（在种子设置后随机选取）
+        if DISTANCE_TYPE is None:
+            DISTANCE_TYPE = random.choice(ALL_DISTANCE_TYPES)
+        print(f"📐 Distance Metric: {DISTANCE_TYPE}")
+
         # 删除已存在的 collection
         try:
             self.client.delete_collection(COLLECTION_NAME)
@@ -271,7 +358,7 @@ class QdrantManager:
         # 创建新 collection
         self.client.create_collection(
             collection_name=COLLECTION_NAME,
-            vectors_config=VectorParams(size=DIM, distance=Distance.EUCLID),
+            vectors_config=VectorParams(size=DIM, distance=DISTANCE_TYPE),
         )
         print("🛠️ Collection Created.")
 
@@ -428,7 +515,12 @@ class OracleQueryGenerator:
     """
     def __init__(self, dm):
         self.schema = dm.schema_config
-        self.df = dm.df
+        self._dm = dm  # 保存 dm 引用，动态获取最新 df
+
+    @property
+    def df(self):
+        """动态获取最新的 DataFrame（支持动态插入/删除/upsert 后数据同步）"""
+        return self._dm.df
 
     def _random_string(self, min_len=5, max_len=10):
         chars = string.ascii_letters + string.digits
@@ -1557,12 +1649,111 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return self._gen_fallback_tautology()
 
 
-# --- 6. Main Execution Functions ---
+# --- 6. Dynamic Data Operations Helper ---
 
-def run(rounds=100, seed=None):
+def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
+    """
+    执行一次随机动态数据操作（insert/delete/upsert）。
+    同时同步 dm.df 和 dm.vectors。
+    """
+    op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
+    batch_count = random.randint(1, 5)
+
+    if op == "insert":
+        new_rows = []
+        new_vecs = []
+        for _ in range(batch_count):
+            row = dm.generate_single_row()
+            vec = dm.generate_single_vector()
+            new_rows.append(row)
+            new_vecs.append(vec)
+        try:
+            points = []
+            for row, vec in zip(new_rows, new_vecs):
+                payload = {k: v for k, v in row.items() if k != "id"}
+                points.append(PointStruct(id=row["id"], vector=vec, payload=payload))
+            qm.client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points,
+                wait=True
+            )
+            dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+            dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
+            inserted_ids = [r["id"] for r in new_rows]
+            file_log(f"[Dynamic] Inserted {len(new_rows)} rows: ids={inserted_ids}")
+        except Exception as e:
+            file_log(f"[Dynamic] Insert failed: {e}")
+
+    elif op == "delete":
+        if len(dm.df) > delete_min_rows:
+            del_count = min(batch_count, len(dm.df) - delete_min_rows)
+            del_ids = random.sample(dm.df["id"].tolist(), del_count)
+            try:
+                qm.client.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=models.PointIdsList(points=del_ids),
+                    wait=True
+                )
+                idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
+                dm.df = dm.df.drop(idx).reset_index(drop=True)
+                dm.vectors = np.delete(dm.vectors, idx, axis=0)
+                file_log(f"[Dynamic] Deleted {len(del_ids)} rows: ids={del_ids}")
+            except Exception as e:
+                file_log(f"[Dynamic] Delete failed: {e}")
+
+    else:  # upsert
+        upsert_rows = []
+        upsert_vecs = []
+        for _ in range(batch_count):
+            use_existing = (not dm.df.empty) and (random.random() < 0.7)
+            if use_existing:
+                target_id = random.choice(dm.df["id"].tolist())
+            else:
+                target_id = generate_unique_id()
+            row = dm.generate_single_row(id_override=target_id)
+            vec = dm.generate_single_vector()
+            upsert_rows.append(row)
+            upsert_vecs.append(vec)
+        try:
+            points = []
+            for row, vec in zip(upsert_rows, upsert_vecs):
+                payload = {k: v for k, v in row.items() if k != "id"}
+                points.append(PointStruct(id=row["id"], vector=vec, payload=payload))
+            qm.client.upsert(
+                collection_name=COLLECTION_NAME,
+                points=points,
+                wait=True
+            )
+            new_rows = []
+            new_vectors = []
+            for row, vec in zip(upsert_rows, upsert_vecs):
+                rid = row["id"]
+                match_idx = dm.df.index[dm.df["id"] == rid].tolist()
+                if match_idx:
+                    idx = match_idx[0]
+                    for k, v in row.items():
+                        dm.df.at[idx, k] = v
+                    dm.vectors[idx] = vec
+                else:
+                    new_rows.append(row)
+                    new_vectors.append(vec)
+            if new_rows:
+                dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
+            upsert_ids = [r["id"] for r in upsert_rows]
+            file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows: ids={upsert_ids}")
+        except Exception as e:
+            file_log(f"[Dynamic] Upsert failed: {e}")
+
+
+# --- 7. Main Execution Functions ---
+
+def run(rounds=100, seed=None, enable_dynamic_ops=False):
     """
     Oracle 模式主测试：Qdrant vs Pandas 对比
     """
+    global DISTANCE_TYPE
+    DISTANCE_TYPE = None  # 重置，随机选取
     current_seed = seed
     if current_seed is None:
         current_seed = random.randint(0, 2**31 - 1)
@@ -1613,6 +1804,10 @@ def run(rounds=100, seed=None):
         for i in range(total_test):
             print(f"\r⏳ Running Test {i+1}/{total_test}...", end="", flush=True)
 
+            # --- 动态插入/删除/Upsert ---
+            if enable_dynamic_ops and i > 0 and i % 10 == 0:
+                _do_dynamic_op(dm, qm, file_log)
+
             # 生成查询
             depth = random.randint(1, 10)
             filter_obj = None
@@ -1632,10 +1827,11 @@ def run(rounds=100, seed=None):
                 start_t = time.time()
 
                 # Qdrant 查询
+                scroll_limit = len(dm.df) + 1000  # 动态数据量自适应
                 scroll_result = qm.client.scroll(
                     collection_name=COLLECTION_NAME,
                     scroll_filter=filter_obj,
-                    limit=N,
+                    limit=scroll_limit,
                     with_payload=False,
                     with_vectors=False
                 )
@@ -1750,10 +1946,12 @@ def run(rounds=100, seed=None):
         print(f"🔑 全局复现命令: python qdrant_fuzz_oracle.py --seed {current_seed}")
 
 
-def run_equivalence_mode(rounds=100, seed=None):
+def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     """
     等价性测试模式
     """
+    global DISTANCE_TYPE
+    DISTANCE_TYPE = None  # 重置
     if seed is not None:
         print(f"\n🔒 Equivalence 模式使用固定种子 {seed}")
         random.seed(seed)
@@ -1795,6 +1993,10 @@ def run_equivalence_mode(rounds=100, seed=None):
         for i in range(rounds):
             print(f"\r⚖️  Test {i+1}/{rounds}...", end="", flush=True)
 
+            # --- 动态操作（20% 概率）---
+            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+                _do_dynamic_op(dm, qm, file_log)
+
             # 生成基础查询
             base_filter = None
             for _ in range(10):
@@ -1809,10 +2011,11 @@ def run_equivalence_mode(rounds=100, seed=None):
 
             # 执行基础查询
             try:
+                scroll_limit = len(dm.df) + 1000
                 base_res = qm.client.scroll(
                     collection_name=COLLECTION_NAME,
                     scroll_filter=base_filter,
-                    limit=N,
+                    limit=scroll_limit,
                     with_payload=False
                 )
                 base_ids = set(p.id for p in base_res[0])
@@ -1833,7 +2036,7 @@ def run_equivalence_mode(rounds=100, seed=None):
                     mut_res = qm.client.scroll(
                         collection_name=COLLECTION_NAME,
                         scroll_filter=m_filter,
-                        limit=N,
+                        limit=scroll_limit,
                         with_payload=False
                     )
                     mut_ids = set(p.id for p in mut_res[0])
@@ -1880,10 +2083,12 @@ def run_equivalence_mode(rounds=100, seed=None):
         print(f"✅ 所有等价性测试通过。")
 
 
-def run_pqs_mode(rounds=100, seed=None):
+def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     """
     PQS 模式测试：验证生成的查询必须命中指定行
     """
+    global DISTANCE_TYPE
+    DISTANCE_TYPE = None  # 重置
     if seed is not None:
         print(f"\n🔒 PQS模式使用固定种子 {seed}")
         random.seed(seed)
@@ -1936,6 +2141,10 @@ def run_pqs_mode(rounds=100, seed=None):
         file_log("=" * 80)
 
         for i in range(rounds):
+            # --- 动态操作（20% 概率）---
+            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+                _do_dynamic_op(dm, qm, file_log)
+
             random_idx = random.randint(0, len(dm.df) - 1)
             pivot_row = dm.df.iloc[random_idx]
             pivot_id = int(pivot_row["id"])
@@ -1965,10 +2174,11 @@ def run_pqs_mode(rounds=100, seed=None):
 
             try:
                 start_t = time.time()
+                scroll_limit = len(dm.df) + 1000
                 res = qm.client.scroll(
                     collection_name=COLLECTION_NAME,
                     scroll_filter=filter_obj,
-                    limit=N,
+                    limit=scroll_limit,
                     with_payload=False
                 )
                 cost = (time.time() - start_t) * 1000
@@ -2021,10 +2231,12 @@ def run_pqs_mode(rounds=100, seed=None):
         print(f"📄 详细数据已记录至日志: {log_filename}")
 
 
-def run_group_test(rounds=50, seed=None):
+def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
     """
     Group By 测试模式 (Qdrant 使用 group_by 参数)
     """
+    global DISTANCE_TYPE
+    DISTANCE_TYPE = None  # 重置
     if seed is not None:
         print(f"\n🔒 GroupBy 模式使用固定种子 {seed}")
         random.seed(seed)
@@ -2071,6 +2283,10 @@ def run_group_test(rounds=50, seed=None):
 
         for i in range(rounds):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
+
+            # --- 动态操作（20% 概率）---
+            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+                _do_dynamic_op(dm, qm, file_log)
 
             group_field = random.choice(potential_group_fields)
             group_size = random.randint(1, 5)
@@ -2128,6 +2344,7 @@ if __name__ == "__main__":
     rounds = 1000
     pqs_rounds = 1000
     mode = "oracle"  # 默认模式
+    enable_dynamic = False  # 动态数据操作开关
 
     # 解析命令行参数
     if len(sys.argv) > 1:
@@ -2153,6 +2370,9 @@ if __name__ == "__main__":
             elif arg == "--group":
                 mode = "group"
                 i += 1
+            elif arg == "--dynamic":
+                enable_dynamic = True
+                i += 1
             elif arg == "--chaos":
                 CHAOS_RATE = 0.1
                 i += 1
@@ -2176,6 +2396,7 @@ Qdrant Fuzz Oracle - 动态模糊测试工具
   --equiv             运行等价性测试模式
   --pqs               运行 PQS (必中查询) 测试模式
   --group             运行 GroupBy 测试模式
+  --dynamic           开启动态数据操作 (insert/delete/upsert)
   --chaos             开启混淆模式 (10%)
   --chaos-rate <比率> 自定义混淆概率 (0.0-1.0)
   --help              显示此帮助信息
@@ -2185,6 +2406,7 @@ Qdrant Fuzz Oracle - 动态模糊测试工具
   python qdrant_fuzz_oracle.py --seed 12345       # 使用种子复现
   python qdrant_fuzz_oracle.py --equiv --rounds 500
   python qdrant_fuzz_oracle.py --pqs --pqs-rounds 200
+  python qdrant_fuzz_oracle.py --dynamic --rounds 300  # 动态操作模式
 """)
                 sys.exit(0)
             else:
@@ -2196,17 +2418,18 @@ Qdrant Fuzz Oracle - 动态模糊测试工具
     print(f"   主测试轮数: {rounds}")
     print(f"   PQS测试轮数: {pqs_rounds}")
     print(f"   随机种子: {seed if seed else '(随机)'}")
+    print(f"   动态操作: {'开启' if enable_dynamic else '关闭'}")
     print(f"   混淆概率: {CHAOS_RATE}")
     print("=" * 80)
 
     if mode == "equiv":
-        run_equivalence_mode(rounds=rounds, seed=seed)
+        run_equivalence_mode(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
     elif mode == "pqs":
-        run_pqs_mode(rounds=pqs_rounds, seed=seed)
+        run_pqs_mode(rounds=pqs_rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
     elif mode == "group":
-        run_group_test(rounds=rounds, seed=seed)
+        run_group_test(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
     else:
         # 默认运行 Oracle 模式
-        run(rounds=rounds, seed=seed)
+        run(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
         # 可选：同时运行 PQS 模式
         # run_pqs_mode(rounds=pqs_rounds, seed=seed)
