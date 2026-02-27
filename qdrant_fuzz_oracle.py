@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import json
 import sys
+import argparse
 from datetime import datetime, timedelta
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -3130,99 +3131,95 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
         print(f"🚫 GroupBy 测试发现 {len(errors)} 个问题！请查看日志。")
 
 
-# --- Main Entry Point ---
+# ---------------------------------------------------------------------------
+#  Main Entry Point
+# ---------------------------------------------------------------------------
+
+MODE_DISPATCH = {
+    "oracle": lambda a: run(rounds=a.rounds, seed=a.seed,
+                            enable_dynamic_ops=a.dynamic),
+    "equiv":  lambda a: run_equivalence_mode(rounds=a.rounds, seed=a.seed,
+                                             enable_dynamic_ops=a.dynamic),
+    "pqs":    lambda a: run_pqs_mode(rounds=a.pqs_rounds, seed=a.seed,
+                                     enable_dynamic_ops=a.dynamic),
+    "group":  lambda a: run_group_test(rounds=a.rounds, seed=a.seed,
+                                       enable_dynamic_ops=a.dynamic),
+}
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """解析命令行参数，返回 Namespace。"""
+    p = argparse.ArgumentParser(
+        prog="qdrant_fuzz_oracle",
+        description="Qdrant Fuzz Oracle — 动态模糊测试工具",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python qdrant_fuzz_oracle.py                         # 默认 Oracle 模式
+  python qdrant_fuzz_oracle.py --seed 12345            # 固定种子
+  python qdrant_fuzz_oracle.py --equiv --rounds 500    # 等价性模式
+  python qdrant_fuzz_oracle.py --pqs --pqs-rounds 200  # PQS 模式
+  python qdrant_fuzz_oracle.py --dynamic --rounds 300  # 动态操作模式
+        """,
+    )
+
+    # ---- 模式 (互斥) ----
+    grp = p.add_mutually_exclusive_group()
+    grp.add_argument("--oracle", action="store_const", dest="mode",
+                     const="oracle", help="Oracle 差分测试模式 (默认)")
+    grp.add_argument("--equiv",  action="store_const", dest="mode",
+                     const="equiv",  help="等价性变换测试模式")
+    grp.add_argument("--pqs",    action="store_const", dest="mode",
+                     const="pqs",    help="PQS (必中查询) 测试模式")
+    grp.add_argument("--group",  action="store_const", dest="mode",
+                     const="group",  help="GroupBy 测试模式")
+    p.set_defaults(mode="oracle")
+
+    # ---- 轮次 ----
+    p.add_argument("--seed",       type=int, default=None,
+                   help="固定随机种子以复现测试 (默认: 随机)")
+    p.add_argument("--rounds",     type=int, default=1000,
+                   help="主测试轮数 (默认: 1000)")
+    p.add_argument("--pqs-rounds", type=int, default=1000, dest="pqs_rounds",
+                   help="PQS 测试轮数 (默认: 1000)")
+
+    # ---- 功能开关 ----
+    p.add_argument("--dynamic", action="store_true",
+                   help="开启动态数据操作 (insert/delete/upsert)")
+    p.add_argument("--chaos",   action="store_true",
+                   help="开启混淆模式 (默认概率 10%%)")
+    p.add_argument("--chaos-rate", type=float, default=0.0, dest="chaos_rate",
+                   metavar="RATE",
+                   help="自定义混淆概率 0.0-1.0 (隐含 --chaos)")
+
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    global CHAOS_RATE
+
+    args = parse_args(argv)
+
+    # 处理 chaos 相关逻辑
+    if args.chaos_rate > 0:
+        CHAOS_RATE = args.chaos_rate
+    elif args.chaos:
+        CHAOS_RATE = 0.1
+
+    # Banner
+    print("=" * 80)
+    print("🚀 Qdrant Fuzz Oracle 启动")
+    print(f"   模式:       {args.mode}")
+    print(f"   主测试轮数: {args.rounds}")
+    print(f"   PQS测试轮数: {args.pqs_rounds}")
+    print(f"   随机种子:   {args.seed or '(随机)'}")
+    print(f"   动态操作:   {'开启' if args.dynamic else '关闭'}")
+    print(f"   混淆概率:   {CHAOS_RATE}")
+    print("=" * 80)
+
+    # Dispatch
+    MODE_DISPATCH[args.mode](args)
+
 
 if __name__ == "__main__":
-    seed = None
-    rounds = 1000
-    pqs_rounds = 1000
-    mode = "oracle"  # 默认模式
-    enable_dynamic = False  # 动态数据操作开关
-
-    # 解析命令行参数
-    if len(sys.argv) > 1:
-        args = sys.argv[1:]
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg == "--seed" and i + 1 < len(args):
-                seed = int(args[i + 1])
-                i += 2
-            elif arg == "--rounds" and i + 1 < len(args):
-                rounds = int(args[i + 1])
-                i += 2
-            elif arg == "--pqs-rounds" and i + 1 < len(args):
-                pqs_rounds = int(args[i + 1])
-                i += 2
-            elif arg == "--equiv":
-                mode = "equiv"
-                i += 1
-            elif arg == "--pqs":
-                mode = "pqs"
-                i += 1
-            elif arg == "--group":
-                mode = "group"
-                i += 1
-            elif arg == "--dynamic":
-                enable_dynamic = True
-                i += 1
-            elif arg == "--chaos":
-                CHAOS_RATE = 0.1
-                i += 1
-            elif arg == "--chaos-rate" and i + 1 < len(args):
-                try:
-                    CHAOS_RATE = float(args[i + 1])
-                except:
-                    pass
-                i += 2
-            elif arg == "--help":
-                print("""
-Qdrant Fuzz Oracle - 动态模糊测试工具
-
-用法:
-  python qdrant_fuzz_oracle.py [选项]
-
-选项:
-  --seed <数字>       使用固定种子以复现测试
-  --rounds <数字>     主测试轮数 (默认: 1000)
-  --pqs-rounds <数字> PQS 测试轮数 (默认: 1000)
-  --equiv             运行等价性测试模式
-  --pqs               运行 PQS (必中查询) 测试模式
-  --group             运行 GroupBy 测试模式
-  --dynamic           开启动态数据操作 (insert/delete/upsert)
-  --chaos             开启混淆模式 (10%)
-  --chaos-rate <比率> 自定义混淆概率 (0.0-1.0)
-  --help              显示此帮助信息
-
-示例:
-  python qdrant_fuzz_oracle.py                    # 默认 Oracle 模式
-  python qdrant_fuzz_oracle.py --seed 12345       # 使用种子复现
-  python qdrant_fuzz_oracle.py --equiv --rounds 500
-  python qdrant_fuzz_oracle.py --pqs --pqs-rounds 200
-  python qdrant_fuzz_oracle.py --dynamic --rounds 300  # 动态操作模式
-""")
-                sys.exit(0)
-            else:
-                i += 1
-
-    print("=" * 80)
-    print(f"🚀 Qdrant Fuzz Oracle 启动")
-    print(f"   模式: {mode}")
-    print(f"   主测试轮数: {rounds}")
-    print(f"   PQS测试轮数: {pqs_rounds}")
-    print(f"   随机种子: {seed if seed else '(随机)'}")
-    print(f"   动态操作: {'开启' if enable_dynamic else '关闭'}")
-    print(f"   混淆概率: {CHAOS_RATE}")
-    print("=" * 80)
-
-    if mode == "equiv":
-        run_equivalence_mode(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
-    elif mode == "pqs":
-        run_pqs_mode(rounds=pqs_rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
-    elif mode == "group":
-        run_group_test(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
-    else:
-        # 默认运行 Oracle 模式
-        run(rounds=rounds, seed=seed, enable_dynamic_ops=enable_dynamic)
-        # 可选：同时运行 PQS 模式
-        # run_pqs_mode(rounds=pqs_rounds, seed=seed)
+    main()
