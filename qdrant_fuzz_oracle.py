@@ -26,7 +26,8 @@ from qdrant_client.http.models import (
     IsNullCondition, IsEmptyCondition,
     HasIdCondition, PointIdsList,
     GeoPoint, GeoBoundingBox, GeoRadius,
-    PayloadSchemaType
+    PayloadSchemaType,
+    SearchParams
 )
 
 # --- Configuration (User Specified) ---
@@ -506,6 +507,55 @@ class QdrantManager:
                 pass
         print("✅ Index creation complete.")
 
+    def rebuild_payload_indexes(self, schema_config):
+        """
+        随机删除并重建 payload 索引，测试索引重建后的数据一致性。
+        每次随机选择 1~3 个字段进行索引重建。
+        """
+        indexable = [f for f in schema_config if f["type"] in (
+            FieldType.INT, FieldType.FLOAT, FieldType.STRING,
+            FieldType.BOOL, FieldType.DATETIME, FieldType.GEO
+        )]
+        if not indexable:
+            return []
+
+        n_rebuild = random.randint(1, min(3, len(indexable)))
+        fields_to_rebuild = random.sample(indexable, n_rebuild)
+        rebuilt = []
+
+        type_to_schema = {
+            FieldType.INT: PayloadSchemaType.INTEGER,
+            FieldType.FLOAT: PayloadSchemaType.FLOAT,
+            FieldType.STRING: PayloadSchemaType.KEYWORD,
+            FieldType.BOOL: PayloadSchemaType.BOOL,
+            FieldType.DATETIME: PayloadSchemaType.INTEGER,
+            FieldType.GEO: PayloadSchemaType.GEO,
+        }
+
+        for field in fields_to_rebuild:
+            fname = field["name"]
+            ftype = field["type"]
+            try:
+                # 删除索引
+                self.client.delete_payload_index(
+                    collection_name=COLLECTION_NAME,
+                    field_name=fname,
+                    wait=True
+                )
+                time.sleep(0.1)
+                # 重建索引
+                self.client.create_payload_index(
+                    collection_name=COLLECTION_NAME,
+                    field_name=fname,
+                    field_schema=type_to_schema.get(ftype, PayloadSchemaType.KEYWORD),
+                    wait=True
+                )
+                rebuilt.append(fname)
+            except Exception as e:
+                pass  # 索引重建失败不是致命错误
+
+        return rebuilt
+
 # --- 3. Query Generator (Oracle Mode) ---
 
 class OracleQueryGenerator:
@@ -875,33 +925,61 @@ class OracleQueryGenerator:
                 expr_str = f"{name} not in {excl_vals} (timestamp)"
 
         elif ftype == FieldType.GEO:
-            # GEO 使用 bounding box 查询
             if isinstance(val, dict) and "lat" in val and "lon" in val:
                 center_lat = val["lat"]
                 center_lon = val["lon"]
             else:
                 center_lat = random.uniform(-80, 80)
                 center_lon = random.uniform(-170, 170)
-            delta_lat = random.uniform(1, 30)
-            delta_lon = random.uniform(1, 30)
-            top_lat = min(center_lat + delta_lat, 90)
-            bottom_lat = max(center_lat - delta_lat, -90)
-            left_lon = max(center_lon - delta_lon, -180)
-            right_lon = min(center_lon + delta_lon, 180)
-            filter_cond = FieldCondition(
-                key=name,
-                geo_bounding_box=GeoBoundingBox(
-                    top_left=GeoPoint(lat=top_lat, lon=left_lon),
-                    bottom_right=GeoPoint(lat=bottom_lat, lon=right_lon)
+
+            geo_strategy = random.choice(["bbox", "radius"])
+
+            if geo_strategy == "bbox":
+                # GeoBoundingBox 查询
+                delta_lat = random.uniform(1, 30)
+                delta_lon = random.uniform(1, 30)
+                top_lat = min(center_lat + delta_lat, 90)
+                bottom_lat = max(center_lat - delta_lat, -90)
+                left_lon = max(center_lon - delta_lon, -180)
+                right_lon = min(center_lon + delta_lon, 180)
+                filter_cond = FieldCondition(
+                    key=name,
+                    geo_bounding_box=GeoBoundingBox(
+                        top_left=GeoPoint(lat=top_lat, lon=left_lon),
+                        bottom_right=GeoPoint(lat=bottom_lat, lon=right_lon)
+                    )
                 )
-            )
-            mask = series.apply(lambda x: (
-                x is not None and isinstance(x, dict)
-                and "lat" in x and "lon" in x
-                and bottom_lat <= x["lat"] <= top_lat
-                and left_lon <= x["lon"] <= right_lon
-            ))
-            expr_str = f"{name} in bbox({bottom_lat:.2f},{left_lon:.2f} -> {top_lat:.2f},{right_lon:.2f})"
+                mask = series.apply(lambda x: (
+                    x is not None and isinstance(x, dict)
+                    and "lat" in x and "lon" in x
+                    and bottom_lat <= x["lat"] <= top_lat
+                    and left_lon <= x["lon"] <= right_lon
+                ))
+                expr_str = f"{name} in bbox({bottom_lat:.2f},{left_lon:.2f} -> {top_lat:.2f},{right_lon:.2f})"
+            else:
+                # GeoRadius 查询 - Qdrant 独有的圆形地理范围查询
+                radius_m = random.uniform(100_000, 5_000_000)  # 100km ~ 5000km
+                filter_cond = FieldCondition(
+                    key=name,
+                    geo_radius=GeoRadius(
+                        center=GeoPoint(lat=center_lat, lon=center_lon),
+                        radius=radius_m
+                    )
+                )
+                # Haversine 公式计算地球距离
+                def _haversine_check(x, clat=center_lat, clon=center_lon, r=radius_m):
+                    if x is None or not isinstance(x, dict) or "lat" not in x or "lon" not in x:
+                        return False
+                    lat1, lon1 = math.radians(clat), math.radians(clon)
+                    lat2, lon2 = math.radians(x["lat"]), math.radians(x["lon"])
+                    dlat = lat2 - lat1
+                    dlon = lon2 - lon1
+                    a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
+                    c = 2 * math.asin(min(1.0, math.sqrt(a)))
+                    dist = 6_371_000 * c  # 地球平均半径(m)
+                    return dist <= r
+                mask = series.apply(_haversine_check)
+                expr_str = f"{name} in radius({center_lat:.2f},{center_lon:.2f}, r={radius_m:.0f}m)"
 
         if filter_cond is not None and mask is not None:
             return (filter_cond, mask & series.notnull(), expr_str)
@@ -912,6 +990,28 @@ class OracleQueryGenerator:
 
     def gen_json_expr(self, name, series, val):
         """生成 JSON 嵌套字段查询"""
+        # CHAOS_RATE: 按概率注入类型混淆（故意用错误类型查询）
+        if CHAOS_RATE > 0 and random.random() < CHAOS_RATE:
+            chaos_type = random.choice(["str_as_int", "int_as_str", "bool_as_int"])
+            if chaos_type == "str_as_int":
+                # 对 color(string) 用 int 查询
+                fake_val = random.randint(0, 1000)
+                filter_cond = FieldCondition(key=f"{name}.color", match=MatchValue(value=fake_val))
+                mask = pd.Series(False, index=self.df.index)  # 不可能匹配
+                return (filter_cond, mask, f'CHAOS: {name}.color == {fake_val} (type mismatch)')
+            elif chaos_type == "int_as_str":
+                # 对 price(int) 用 string 查询
+                fake_str = self._random_string(3, 8)
+                filter_cond = FieldCondition(key=f"{name}.price", match=MatchValue(value=fake_str))
+                mask = pd.Series(False, index=self.df.index)
+                return (filter_cond, mask, f'CHAOS: {name}.price == "{fake_str}" (type mismatch)')
+            else:  # bool_as_int
+                # 对 active(bool) 用 int 查询
+                fake_int = random.randint(0, 1)
+                filter_cond = FieldCondition(key=f"{name}.active", match=MatchValue(value=fake_int))
+                mask = pd.Series(False, index=self.df.index)
+                return (filter_cond, mask, f'CHAOS: {name}.active == {fake_int} (type mismatch)')
+
         strategy = random.choice(["range", "nested", "index", "multi_key"])
 
         if strategy == "range":
@@ -1631,17 +1731,40 @@ class PQSQueryGenerator(OracleQueryGenerator):
         elif ftype == FieldType.INT:
             val_int = int(val) if hasattr(val, "item") else int(val)
             strategies = []
+            # 策略1: 精确匹配
             strategies.append((
                 FieldCondition(key=fname, match=MatchValue(value=val_int)),
                 f"{fname} == {val_int}"
             ))
+            # 策略2: 闭区间包裹
             strategies.append((
                 FieldCondition(key=fname, range=Range(gte=val_int, lte=val_int)),
                 f"{fname} >= {val_int} AND <= {val_int}"
             ))
+            # 策略3: 开区间包裹
             strategies.append((
                 FieldCondition(key=fname, range=Range(gt=val_int-1, lt=val_int+1)),
                 f"{fname} > {val_int-1} AND < {val_int+1}"
+            ))
+            # 策略4: MatchAny 包含真值+噪声
+            dummies = [val_int + random.randint(100000, 200000) for _ in range(3)]
+            candidates = dummies + [val_int]
+            random.shuffle(candidates)
+            strategies.append((
+                FieldCondition(key=fname, match=MatchAny(any=candidates)),
+                f"{fname} in {candidates}"
+            ))
+            # 策略5: MatchExcept 排除不存在的假值
+            fake_vals = [val_int + random.randint(100000, 200000) for _ in range(3)]
+            strategies.append((
+                FieldCondition(key=fname, match=MatchExcept(**{"except": fake_vals})),
+                f"{fname} not in {fake_vals}"
+            ))
+            # 策略6: must_not + Range 反面 (val < boundary → must_not val >= boundary)
+            boundary = val_int + random.randint(1, 100)
+            strategies.append((
+                Filter(must_not=[FieldCondition(key=fname, range=Range(gte=boundary))]),
+                f"NOT ({fname} >= {boundary})"
             ))
             return random.choice(strategies)
 
@@ -1649,30 +1772,51 @@ class PQSQueryGenerator(OracleQueryGenerator):
             val_float = float(val)
             epsilon = 1e-5
             strategies = []
+            # 策略1: 窄epsilon范围
             strategies.append((
                 FieldCondition(key=fname, range=Range(gt=val_float - epsilon, lt=val_float + epsilon)),
                 f"{fname} > {val_float - epsilon} AND < {val_float + epsilon}"
             ))
+            # 策略2: 单边gte
             strategies.append((
                 FieldCondition(key=fname, range=Range(gte=val_float - epsilon)),
                 f"{fname} >= {val_float - epsilon}"
+            ))
+            # 策略3: 宽epsilon闭区间
+            wide_eps = random.uniform(0.01, 1.0)
+            strategies.append((
+                FieldCondition(key=fname, range=Range(gte=val_float - wide_eps, lte=val_float + wide_eps)),
+                f"{fname} in [{val_float - wide_eps:.6f}, {val_float + wide_eps:.6f}]"
+            ))
+            # 策略4: must_not 反面 (val > boundary → NOT val <= boundary)
+            boundary = val_float - random.uniform(1.0, 100.0)
+            strategies.append((
+                Filter(must_not=[FieldCondition(key=fname, range=Range(lte=boundary))]),
+                f"NOT ({fname} <= {boundary:.6f})"
             ))
             return random.choice(strategies)
 
         elif ftype == FieldType.STRING:
             val_str = str(val)
             strategies = []
+            # 策略1: 精确匹配
             strategies.append((
                 FieldCondition(key=fname, match=MatchValue(value=val_str)),
                 f'{fname} == "{val_str}"'
             ))
-            # in 列表包含
+            # 策略2: MatchAny 包含真值
             dummies = [self._random_string(5) for _ in range(3)]
             candidates = dummies + [val_str]
             random.shuffle(candidates)
             strategies.append((
                 FieldCondition(key=fname, match=MatchAny(any=candidates)),
                 f'{fname} in {candidates}'
+            ))
+            # 策略3: MatchExcept 排除不存在的假值
+            fake_strs = [self._random_string(12) for _ in range(3)]
+            strategies.append((
+                FieldCondition(key=fname, match=MatchExcept(**{"except": fake_strs})),
+                f'{fname} not in {fake_strs}'
             ))
             return random.choice(strategies)
 
@@ -1704,20 +1848,51 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         elif ftype == FieldType.DATETIME:
             val_int = int(val) if hasattr(val, "item") else int(val)
-            # 使用包含该精确值的范围
-            return FieldCondition(key=fname, range=Range(gte=val_int, lte=val_int)), f'{fname} timestamp == {val_int}'
+            strategies = []
+            # 策略1: 精确闭区间
+            strategies.append((
+                FieldCondition(key=fname, range=Range(gte=val_int, lte=val_int)),
+                f'{fname} timestamp == {val_int}'
+            ))
+            # 策略2: 开区间包裹
+            strategies.append((
+                FieldCondition(key=fname, range=Range(gt=val_int - 1, lt=val_int + 1)),
+                f'{fname} timestamp in ({val_int-1}, {val_int+1})'
+            ))
+            # 策略3: must_not 反面（排除未来）
+            future = val_int + random.randint(1, 86400)
+            strategies.append((
+                Filter(must_not=[FieldCondition(key=fname, range=Range(gte=future))]),
+                f'NOT ({fname} >= {future})'
+            ))
+            return random.choice(strategies)
 
         elif ftype == FieldType.GEO:
             if isinstance(val, dict) and "lat" in val and "lon" in val:
                 lat, lon = val["lat"], val["lon"]
-                delta = 0.001  # 极小范围确保命中
-                return FieldCondition(
-                    key=fname,
-                    geo_bounding_box=GeoBoundingBox(
-                        top_left=GeoPoint(lat=min(lat + delta, 90), lon=max(lon - delta, -180)),
-                        bottom_right=GeoPoint(lat=max(lat - delta, -90), lon=min(lon + delta, 180))
-                    )
-                ), f"{fname} in tiny bbox around ({lat},{lon})"
+                strategies = []
+                # 策略1: 极小bbox
+                delta = 0.001
+                strategies.append((
+                    FieldCondition(
+                        key=fname,
+                        geo_bounding_box=GeoBoundingBox(
+                            top_left=GeoPoint(lat=min(lat + delta, 90), lon=max(lon - delta, -180)),
+                            bottom_right=GeoPoint(lat=max(lat - delta, -90), lon=min(lon + delta, 180))
+                        )
+                    ), f"{fname} in tiny bbox around ({lat},{lon})"
+                ))
+                # 策略2: GeoRadius 极小半径确保命中
+                strategies.append((
+                    FieldCondition(
+                        key=fname,
+                        geo_radius=GeoRadius(
+                            center=GeoPoint(lat=lat, lon=lon),
+                            radius=1000.0  # 1km 足够小确保命中
+                        )
+                    ), f"{fname} in radius 1km around ({lat},{lon})"
+                ))
+                return random.choice(strategies)
             return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
 
         return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
@@ -2029,6 +2204,12 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
         for i in range(total_test):
             print(f"\r⏳ Running Test {i+1}/{total_test}...", end="", flush=True)
 
+            # --- Payload 索引随机重建 (每50轮) ---
+            if i > 0 and i % 50 == 0:
+                rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
+                if rebuilt:
+                    file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
+
             # --- 动态插入/删除/Upsert ---
             if enable_dynamic_ops and i > 0 and i % 10 == 0:
                 _do_dynamic_op(dm, qm, file_log)
@@ -2115,12 +2296,18 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                         q_vec = dm.vectors[q_idx].tolist()
                         search_k = min(VECTOR_TOPK, len(dm.df))
 
+                        # search_params 随机化：测试不同 HNSW 参数和精确搜索模式
+                        use_exact = random.random() < 0.1  # 10% 使用精确搜索
+                        hnsw_ef = random.choice([64, 128, 256, 512])
+                        sp = SearchParams(hnsw_ef=hnsw_ef, exact=use_exact)
+
                         search_res = qm.client.search(
                             collection_name=COLLECTION_NAME,
                             query_vector=q_vec,
                             query_filter=filter_obj,
                             limit=search_k,
-                            with_payload=False
+                            with_payload=False,
+                            search_params=sp
                         )
 
                         returned_ids = set(p.id for p in search_res)
@@ -2217,6 +2404,12 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
         for i in range(rounds):
             print(f"\r⚖️  Test {i+1}/{rounds}...", end="", flush=True)
+
+            # --- Payload 索引随机重建 (每50轮) ---
+            if i > 0 and i % 50 == 0:
+                rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
+                if rebuilt:
+                    file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
 
             # --- 动态操作（20% 概率）---
             if enable_dynamic_ops and i > 0 and random.random() < 0.2:
@@ -2366,6 +2559,12 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         file_log("=" * 80)
 
         for i in range(rounds):
+            # --- Payload 索引随机重建 (每50轮) ---
+            if i > 0 and i % 50 == 0:
+                rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
+                if rebuilt:
+                    file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
+
             # --- 动态操作（20% 概率）---
             if enable_dynamic_ops and i > 0 and random.random() < 0.2:
                 _do_dynamic_op(dm, qm, file_log)
@@ -2508,6 +2707,12 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
 
         for i in range(rounds):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
+
+            # --- Payload 索引随机重建 (每50轮) ---
+            if i > 0 and i % 50 == 0:
+                rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
+                if rebuilt:
+                    file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
 
             # --- 动态操作（20% 概率）---
             if enable_dynamic_ops and i > 0 and random.random() < 0.2:
