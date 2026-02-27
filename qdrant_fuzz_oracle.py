@@ -700,23 +700,52 @@ class OracleQueryGenerator:
 
         elif ftype == FieldType.INT:
             val_int = int(val)
-            op = random.choice([">", "<", "==", "!=", ">=", "<="])
+            op = random.choice([">", "<", "==", "!=", ">=", "<=", "in", "not_in"])
             
             if op == "==":
                 filter_cond = FieldCondition(key=name, match=MatchValue(value=val_int))
+                mask = series.apply(safe_compare_scalar("==", val_int))
+                expr_str = f"{name} == {val_int}"
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
+                mask = series.apply(safe_compare_scalar("!=", val_int))
+                expr_str = f"{name} != {val_int}"
             elif op == ">":
                 filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
+                mask = series.apply(safe_compare_scalar(">", val_int))
+                expr_str = f"{name} > {val_int}"
             elif op == "<":
                 filter_cond = FieldCondition(key=name, range=Range(lt=val_int))
+                mask = series.apply(safe_compare_scalar("<", val_int))
+                expr_str = f"{name} < {val_int}"
             elif op == ">=":
                 filter_cond = FieldCondition(key=name, range=Range(gte=val_int))
+                mask = series.apply(safe_compare_scalar(">=", val_int))
+                expr_str = f"{name} >= {val_int}"
             elif op == "<=":
                 filter_cond = FieldCondition(key=name, range=Range(lte=val_int))
-            
-            mask = series.apply(safe_compare_scalar(op, val_int))
-            expr_str = f"{name} {op} {val_int}"
+                mask = series.apply(safe_compare_scalar("<=", val_int))
+                expr_str = f"{name} <= {val_int}"
+            elif op == "in":
+                # IN 列表查询：从实际数据中采样 2-6 个值
+                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                sample_size = min(random.randint(2, 6), len(valid_vals))
+                in_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
+                if val_int not in in_vals:
+                    in_vals[0] = val_int  # 确保至少包含查询基准值
+                filter_cond = FieldCondition(key=name, match=MatchAny(any=in_vals))
+                in_set = set(in_vals)
+                mask = series.apply(lambda x: int(x) in in_set if pd.notna(x) else False)
+                expr_str = f"{name} in {in_vals}"
+            else:  # not_in
+                # NOT IN 排除查询
+                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                sample_size = min(random.randint(2, 6), len(valid_vals))
+                excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
+                filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
+                excl_set = set(excl_vals)
+                mask = series.apply(lambda x: int(x) not in excl_set if pd.notna(x) else False)
+                expr_str = f"{name} not in {excl_vals}"
 
         elif ftype == FieldType.FLOAT:
             val_float = float(val)
@@ -801,21 +830,49 @@ class OracleQueryGenerator:
 
         elif ftype == FieldType.DATETIME:
             val_int = int(val)
-            op = random.choice([">", "<", ">=", "<=", "==", "!="])
+            op = random.choice([">", "<", ">=", "<=", "==", "!=", "in", "not_in"])
             if op == "==":
                 filter_cond = FieldCondition(key=name, match=MatchValue(value=val_int))
+                mask = series.apply(safe_compare_scalar("==", val_int))
+                expr_str = f"{name} == {val_int} (timestamp)"
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
+                mask = series.apply(safe_compare_scalar("!=", val_int))
+                expr_str = f"{name} != {val_int} (timestamp)"
             elif op == ">":
                 filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
+                mask = series.apply(safe_compare_scalar(">", val_int))
+                expr_str = f"{name} > {val_int} (timestamp)"
             elif op == "<":
                 filter_cond = FieldCondition(key=name, range=Range(lt=val_int))
+                mask = series.apply(safe_compare_scalar("<", val_int))
+                expr_str = f"{name} < {val_int} (timestamp)"
             elif op == ">=":
                 filter_cond = FieldCondition(key=name, range=Range(gte=val_int))
+                mask = series.apply(safe_compare_scalar(">=", val_int))
+                expr_str = f"{name} >= {val_int} (timestamp)"
             elif op == "<=":
                 filter_cond = FieldCondition(key=name, range=Range(lte=val_int))
-            mask = series.apply(safe_compare_scalar(op, val_int))
-            expr_str = f"{name} {op} {val_int} (timestamp)"
+                mask = series.apply(safe_compare_scalar("<=", val_int))
+                expr_str = f"{name} <= {val_int} (timestamp)"
+            elif op == "in":
+                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                sample_size = min(random.randint(2, 6), len(valid_vals))
+                in_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
+                if val_int not in in_vals:
+                    in_vals[0] = val_int
+                filter_cond = FieldCondition(key=name, match=MatchAny(any=in_vals))
+                in_set = set(in_vals)
+                mask = series.apply(lambda x: int(x) in in_set if pd.notna(x) else False)
+                expr_str = f"{name} in {in_vals} (timestamp)"
+            else:  # not_in
+                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                sample_size = min(random.randint(2, 6), len(valid_vals))
+                excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
+                filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
+                excl_set = set(excl_vals)
+                mask = series.apply(lambda x: int(x) not in excl_set if pd.notna(x) else False)
+                expr_str = f"{name} not in {excl_vals} (timestamp)"
 
         elif ftype == FieldType.GEO:
             # GEO 使用 bounding box 查询
@@ -931,6 +988,33 @@ class OracleQueryGenerator:
 
             return (filter_cond, series.apply(check_multi), f'{name}.active == true and {name}.color == "{color}"')
 
+    def gen_has_id_expr(self):
+        """
+        生成 HasId 条件：使用点 ID 直接过滤。
+        返回: (Filter, pandas_mask, expr_str)
+        """
+        all_ids = self.df["id"].tolist()
+        if not all_ids:
+            return None, None, None
+
+        # 随机采样 1-10 个 ID
+        sample_size = min(random.randint(1, 10), len(all_ids))
+        selected_ids = [int(x) for x in random.sample(all_ids, sample_size)]
+
+        # 50% 概率：正向 HasId，50%：NOT HasId
+        if random.random() < 0.5:
+            filter_obj = Filter(must=[HasIdCondition(has_id=selected_ids)])
+            id_set = set(selected_ids)
+            mask = self.df["id"].apply(lambda x: int(x) in id_set)
+            expr_str = f"id in {selected_ids}"
+        else:
+            filter_obj = Filter(must_not=[HasIdCondition(has_id=selected_ids)])
+            id_set = set(selected_ids)
+            mask = self.df["id"].apply(lambda x: int(x) not in id_set)
+            expr_str = f"id not in {selected_ids}"
+
+        return filter_obj, mask, expr_str
+
     def gen_constant_expr(self):
         """生成常量表达式（Qdrant 支持有限）"""
         # Qdrant 中 id 是点 ID，不能用于 FieldCondition 过滤
@@ -980,6 +1064,12 @@ class OracleQueryGenerator:
                     if isinstance(filter_obj, FieldCondition):
                         filter_obj = Filter(must=[filter_obj])
                     return filter_obj, res[1], res[2]
+
+            # HasId 条件：10% 概率使用 ID 直接过滤
+            if random.random() < 0.1 and not self.df.empty:
+                res = self.gen_has_id_expr()
+                if res[0]:
+                    return res
 
             if random.random() < 0.3:
                 # 尝试生成 JSON 表达式
@@ -1258,6 +1348,100 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 "filter": Filter(should=[Filter(must=[base_filter]), Filter(must=[false_filter2] if isinstance(false_filter2, FieldCondition) else [false_filter2])]),
                 "expr": f"({base_expr}) OR ({false_expr2})"
             })
+
+        # 7. 恒真条件左侧注入 (TautologyAnd_Left)
+        # True AND A => A
+        if tautology_filter:
+            mutations.append({
+                "type": "TautologyAnd_Left",
+                "filter": Filter(must=[tautology_filter, base_filter]),
+                "expr": f"({tautology_expr}) AND ({base_expr})"
+            })
+
+        # 8. 整数范围微调 (IntRangeShift)
+        # 对 INT 字段：gt=N <=> gte=N+1, lt=N <=> lte=N-1
+        self._add_int_range_shift_mutations(base_filter, base_expr, mutations)
+
+        return mutations
+
+    def _add_int_range_shift_mutations(self, base_filter, base_expr, mutations):
+        """
+        尝试在 base_filter 中找到 INT 字段的 Range 条件，生成等价的微调变体。
+        gt=N <=> gte=N+1, lt=N <=> lte=N-1 (仅对整数字段有效)
+        """
+        if not isinstance(base_filter, Filter):
+            return
+
+        # 查找 must 列表中的 FieldCondition + Range
+        conditions = base_filter.must or []
+        for cond in conditions:
+            if not isinstance(cond, FieldCondition):
+                continue
+            if cond.range is None:
+                continue
+
+            # 检查是否为 INT 类型字段
+            fname = cond.key
+            ftype = self.field_types.get(fname)
+            if ftype not in [FieldType.INT, FieldType.DATETIME]:
+                continue
+
+            rng = cond.range
+            # gt=N → gte=N+1
+            if rng.gt is not None and isinstance(rng.gt, (int, float)):
+                shifted_val = int(rng.gt) + 1
+                new_cond = FieldCondition(key=fname, range=Range(
+                    gte=shifted_val, lt=rng.lt, lte=rng.lte
+                ))
+                new_must = [new_cond if c is cond else c for c in conditions]
+                mutations.append({
+                    "type": "IntRangeShift_gt_to_gte",
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "expr": f"{base_expr} [gt={int(rng.gt)} → gte={shifted_val}]"
+                })
+                break
+
+            # lt=N → lte=N-1
+            if rng.lt is not None and isinstance(rng.lt, (int, float)):
+                shifted_val = int(rng.lt) - 1
+                new_cond = FieldCondition(key=fname, range=Range(
+                    gt=rng.gt, gte=rng.gte, lte=shifted_val
+                ))
+                new_must = [new_cond if c is cond else c for c in conditions]
+                mutations.append({
+                    "type": "IntRangeShift_lt_to_lte",
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "expr": f"{base_expr} [lt={int(rng.lt)} → lte={shifted_val}]"
+                })
+                break
+
+            # gte=N → gt=N-1
+            if rng.gte is not None and isinstance(rng.gte, (int, float)):
+                shifted_val = int(rng.gte) - 1
+                new_cond = FieldCondition(key=fname, range=Range(
+                    gt=shifted_val, lt=rng.lt, lte=rng.lte
+                ))
+                new_must = [new_cond if c is cond else c for c in conditions]
+                mutations.append({
+                    "type": "IntRangeShift_gte_to_gt",
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "expr": f"{base_expr} [gte={int(rng.gte)} → gt={shifted_val}]"
+                })
+                break
+
+            # lte=N → lt=N+1
+            if rng.lte is not None and isinstance(rng.lte, (int, float)):
+                shifted_val = int(rng.lte) + 1
+                new_cond = FieldCondition(key=fname, range=Range(
+                    gt=rng.gt, gte=rng.gte, lt=shifted_val
+                ))
+                new_must = [new_cond if c is cond else c for c in conditions]
+                mutations.append({
+                    "type": "IntRangeShift_lte_to_lt",
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "expr": f"{base_expr} [lte={int(rng.lte)} → lt={shifted_val}]"
+                })
+                break
 
         return mutations
 
@@ -1698,6 +1882,20 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 dm.df = dm.df.drop(idx).reset_index(drop=True)
                 dm.vectors = np.delete(dm.vectors, idx, axis=0)
                 file_log(f"[Dynamic] Deleted {len(del_ids)} rows: ids={del_ids}")
+
+                # 删除后验证：确认被删 ID 真的不再存在
+                for did in del_ids:
+                    try:
+                        verify_res = qm.client.retrieve(
+                            collection_name=COLLECTION_NAME,
+                            ids=[did],
+                            with_payload=False,
+                            with_vectors=False
+                        )
+                        if verify_res:
+                            file_log(f"[DELETE_WARN] ID {did} still exists in Qdrant after delete!")
+                    except Exception as ve:
+                        file_log(f"[DELETE_VERIFY] ID {did} verification error: {ve}")
             except Exception as e:
                 file_log(f"[Dynamic] Delete failed: {e}")
 
@@ -1742,6 +1940,33 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
             upsert_ids = [r["id"] for r in upsert_rows]
             file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows: ids={upsert_ids}")
+
+            # Upsert 后数据同步验证：回查 Qdrant 确认数据一致
+            for row in upsert_rows:
+                rid = row["id"]
+                try:
+                    qdrant_res = qm.client.retrieve(
+                        collection_name=COLLECTION_NAME,
+                        ids=[rid],
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not qdrant_res:
+                        file_log(f"[SYNC_WARN] ID {rid} not found in Qdrant after upsert")
+                    else:
+                        # 检查一个关键字段是否同步
+                        payload = qdrant_res[0].payload
+                        pandas_row = dm.df[dm.df["id"] == rid]
+                        if not pandas_row.empty:
+                            # 检查 meta_json.price 是否一致
+                            if "meta_json" in row and isinstance(row["meta_json"], dict):
+                                pd_price = row["meta_json"].get("price")
+                                qd_json = payload.get("meta_json", {})
+                                qd_price = qd_json.get("price") if isinstance(qd_json, dict) else None
+                                if pd_price != qd_price:
+                                    file_log(f"[SYNC_WARN] ID {rid} price mismatch: Pandas={pd_price} vs Qdrant={qd_price}")
+                except Exception as ve:
+                    file_log(f"[SYNC_VERIFY] ID {rid} verification error: {ve}")
         except Exception as e:
             file_log(f"[Dynamic] Upsert failed: {e}")
 
