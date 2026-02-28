@@ -11,6 +11,7 @@ Features:
 8. NOT expressions: Filter.not_() with multiple strategies
 9. not_equal / contains_all / contains_none operators
 10. Randomized vector index (HNSW/FLAT/Dynamic) + distance metric
+13. Tokenization.FIELD for TEXT/TEXT_ARRAY: case-sensitive, no stopword filtering
 11. Consistency level cycling (ONE/QUORUM/ALL)
 12. Dynamic ops: insert/delete/update mid-test
 """
@@ -26,7 +27,7 @@ import argparse
 import weaviate
 from weaviate.classes.config import (
     Configure, Property, DataType, Reconfigure,
-    VectorDistances,
+    VectorDistances, Tokenization,
 )
 from weaviate.classes.query import Filter, GroupBy
 from weaviate.classes.data import DataObject
@@ -435,10 +436,15 @@ class WeaviateManager:
                 idx_filterable = random.choice([True, True, True, False])  # 75% on
                 idx_searchable = random.choice([True, False]) if field["type"] == FieldType.TEXT else False
                 idx_range = random.choice([True, False]) if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.DATE) else False
-                p = Property(name=field["name"], data_type=wv_type,
-                             index_filterable=idx_filterable,
-                             index_searchable=idx_searchable,
-                             index_range_filterable=idx_range)
+                # TEXT/TEXT_ARRAY 使用 Tokenization.FIELD: 精确匹配, 区分大小写, 无停用词过滤
+                tok = Tokenization.FIELD if field["type"] in (FieldType.TEXT, FieldType.TEXT_ARRAY) else None
+                p_kwargs = dict(name=field["name"], data_type=wv_type,
+                                index_filterable=idx_filterable,
+                                index_searchable=idx_searchable,
+                                index_range_filterable=idx_range)
+                if tok is not None:
+                    p_kwargs["tokenization"] = tok
+                p = Property(**p_kwargs)
                 properties.append(p)
                 if idx_filterable:
                     filterable_fields.add(field["name"])
@@ -482,9 +488,9 @@ class WeaviateManager:
                     self.client.collections.delete(CLASS_NAME)
                 except Exception:
                     pass
-                if "async indexing" in err_msg or "dynamic" in err_msg.lower():
+                if "async indexing" in err_msg or "dynamic" in err_msg.lower() or "422" in err_msg:
                     vi_config = Configure.VectorIndex.hnsw(distance_metric=dist)
-                    print(f"   -> Falling back to HNSW (dynamic not supported)")
+                    print(f"   -> Falling back to HNSW (dynamic requires ASYNC_INDEXING=true in server env)")
                 elif attempt == 0:
                     # Try without inverted_index_config
                     try:
@@ -694,7 +700,8 @@ class OracleQueryGenerator:
             if isinstance(arr, list):
                 all_items.extend(arr)
         if ftype == FieldType.TEXT_ARRAY:
-            all_items = [x for x in all_items if not is_stopword(x)]
+            # Tokenization.FIELD: 不需要停用词过滤
+            pass
         if not all_items:
             return None, None, None
         num = min(random.randint(2, 4), len(set(all_items)))
@@ -703,31 +710,19 @@ class OracleQueryGenerator:
         targets = [self._convert_to_native(t) for t in random.sample(list(set(all_items)), num)]
 
         mode = random.choice(["contains_any", "contains_all", "contains_none"])
-        is_text = ftype == FieldType.TEXT_ARRAY
-        if is_text:
-            tl = [str(t).lower() for t in targets]
-
+        # Tokenization.FIELD → 精确匹配, 不再需要 .lower() 变换
         if mode == "contains_any":
             fc = Filter.by_property(fname).contains_any(targets)
-            if is_text:
-                mask = series.apply(lambda x: any(str(i).lower() in tl for i in x) if isinstance(x, list) else False)
-            else:
-                mask = series.apply(lambda x: any(i in targets for i in x) if isinstance(x, list) else False)
+            mask = series.apply(lambda x: any(i in targets for i in x) if isinstance(x, list) else False)
             return fc, mask, f"{fname} contains_any {targets}"
         elif mode == "contains_all":
             fc = Filter.by_property(fname).contains_all(targets)
-            if is_text:
-                mask = series.apply(lambda x: all(any(str(i).lower() == t for i in x) for t in tl) if isinstance(x, list) else False)
-            else:
-                mask = series.apply(lambda x: all(t in x for t in targets) if isinstance(x, list) else False)
+            mask = series.apply(lambda x: all(t in x for t in targets) if isinstance(x, list) else False)
             return fc, mask, f"{fname} contains_all {targets}"
         else:
-            # WORKAROUND: contains_none 语义验证 — 不含 targets 中任何值; null 数组视为匹配
+            # contains_none: 不含 targets 中任何值; null 数组视为匹配
             fc = Filter.by_property(fname).contains_none(targets)
-            if is_text:
-                mask = series.apply(lambda x: not any(str(i).lower() in tl for i in x) if isinstance(x, list) else True)
-            else:
-                mask = series.apply(lambda x: not any(i in targets for i in x) if isinstance(x, list) else True)
+            mask = series.apply(lambda x: not any(i in targets for i in x) if isinstance(x, list) else True)
             return fc, mask, f"{fname} contains_none {targets}"
 
     def gen_nested_object_expr(self):
@@ -787,8 +782,8 @@ class OracleQueryGenerator:
             val = self.get_value_for_query(name, ftype)
             if val is None: return None, None, None
             fc = Filter.not_(Filter.by_property(name).equal(val))
-            vl = str(val).lower()
-            return fc, series.apply(lambda x: str(x).lower() != vl if pd.notna(x) else True), f'NOT({name} == "{val}")'
+            # Tokenization.FIELD → 精确比较, 不再需要 .lower()
+            return fc, series.apply(lambda x: str(x) != str(val) if pd.notna(x) else True), f'NOT({name} == "{val}")'
 
         elif strat == "not_range" and ftype in [FieldType.INT, FieldType.NUMBER]:
             v1 = self.get_value_for_query(name, ftype)
@@ -806,14 +801,13 @@ class OracleQueryGenerator:
             all_items = []
             for arr in self.df[name].dropna():
                 if isinstance(arr, list): all_items.extend(arr)
-            if ftype == FieldType.TEXT_ARRAY:
-                all_items = [x for x in all_items if not is_stopword(x)]
+            # Tokenization.FIELD: 不需要停用词过滤
             if all_items:
                 t = self._convert_to_native(random.choice(all_items))
                 fc = Filter.not_(Filter.by_property(name).contains_any([t]))
                 if ftype == FieldType.TEXT_ARRAY:
-                    tl = str(t).lower()
-                    return fc, series.apply(lambda x: not any(str(i).lower() == tl for i in x) if isinstance(x, list) else True), f"NOT({name} contains {t})"
+                    # Tokenization.FIELD → 精确比较
+                    return fc, series.apply(lambda x: not any(str(i) == str(t) for i in x) if isinstance(x, list) else True), f"NOT({name} contains {t})"
                 return fc, series.apply(lambda x: t not in x if isinstance(x, list) else True), f"NOT({name} contains {t})"
 
         elif strat == "not_null" and ENABLE_NULL_FILTER:
@@ -907,47 +901,48 @@ class OracleQueryGenerator:
             sv = str(val)
             if op == "==":
                 fc = Filter.by_property(name).equal(val)
-                vl = sv.lower()
-                mask = series.apply(lambda x, v=vl: str(x).lower() == v if pd.notna(x) else False)
+                # Tokenization.FIELD → 精确匹配, 区分大小写
+                mask = series.apply(lambda x, v=sv: str(x) == v if pd.notna(x) else False)
                 es = f'{name} == "{val}"'
             elif op == "!=":
                 fc = Filter.by_property(name).not_equal(val)
-                vl = sv.lower()
-                # Weaviate not_equal includes null rows
-                mask = series.apply(lambda x, v=vl: str(x).lower() != v if pd.notna(x) else True)
+                # Weaviate not_equal includes null rows (二值逻辑)
+                mask = series.apply(lambda x, v=sv: str(x) != v if pd.notna(x) else True)
                 es = f'{name} != "{val}"'
             elif op == "like_prefix":
                 k = random.randint(1, min(4, max(1, len(sv))))
                 prefix = ''.join(c for c in sv[:k] if c.isalnum()) or "a"
                 fc = Filter.by_property(name).like(f"{prefix}*")
-                mask = series.apply(lambda x, p=prefix: str(x).lower().startswith(p.lower()) if pd.notna(x) else False)
+                # Tokenization.FIELD → like 也区分大小写
+                mask = series.apply(lambda x, p=prefix: str(x).startswith(p) if pd.notna(x) else False)
                 es = f'{name} like "{prefix}*"'
             elif op == "like_suffix" and len(sv) >= 2:
                 k = random.randint(1, min(4, len(sv)))
                 suffix = ''.join(c for c in sv[-k:] if c.isalnum()) or "z"
                 fc = Filter.by_property(name).like(f"*{suffix}")
-                mask = series.apply(lambda x, s=suffix: str(x).lower().endswith(s.lower()) if pd.notna(x) else False)
+                mask = series.apply(lambda x, s=suffix: str(x).endswith(s) if pd.notna(x) else False)
                 es = f'{name} like "*{suffix}"'
             elif op == "like_contains" and len(sv) >= 3:
                 i_start = random.randint(0, len(sv) - 2)
                 j_end = random.randint(i_start + 1, min(i_start + 5, len(sv)))
                 sub = ''.join(c for c in sv[i_start:j_end] if c.isalnum()) or "a"
                 fc = Filter.by_property(name).like(f"*{sub}*")
-                mask = series.apply(lambda x, s=sub: s.lower() in str(x).lower() if pd.notna(x) else False)
+                mask = series.apply(lambda x, s=sub: s in str(x) if pd.notna(x) else False)
                 es = f'{name} like "*{sub}*"'
             elif op == "like_single" and len(sv) >= 2:
                 pos = random.randint(0, len(sv) - 1)
                 pat = sv[:pos] + "?" + sv[pos+1:]
                 fc = Filter.by_property(name).like(pat)
                 import re as _re
-                regex = _re.compile("^" + _re.escape(sv[:pos]) + "." + _re.escape(sv[pos+1:]) + "$", _re.IGNORECASE)
+                # Tokenization.FIELD → 区分大小写, 不用 IGNORECASE
+                regex = _re.compile("^" + _re.escape(sv[:pos]) + "." + _re.escape(sv[pos+1:]) + "$")
                 mask = series.apply(lambda x, r=regex: bool(r.match(str(x))) if pd.notna(x) else False)
                 es = f'{name} like "{pat}"'
             else:
                 # fallback to prefix
                 prefix = ''.join(c for c in sv[:3] if c.isalnum()) or "a"
                 fc = Filter.by_property(name).like(f"{prefix}*")
-                mask = series.apply(lambda x, p=prefix: str(x).lower().startswith(p.lower()) if pd.notna(x) else False)
+                mask = series.apply(lambda x, p=prefix: str(x).startswith(p) if pd.notna(x) else False)
                 es = f'{name} like "{prefix}*"'
 
         elif ftype == FieldType.DATE:
@@ -961,16 +956,11 @@ class OracleQueryGenerator:
             all_items = []
             for arr in self.df[name].dropna():
                 if isinstance(arr, list): all_items.extend(arr)
-            if ftype == FieldType.TEXT_ARRAY:
-                all_items = [x for x in all_items if not is_stopword(x)]
+            # Tokenization.FIELD: 不需要停用词过滤, 精确匹配
             if all_items:
                 t = self._convert_to_native(random.choice(all_items))
                 fc = Filter.by_property(name).contains_any([t])
-                if ftype == FieldType.TEXT_ARRAY:
-                    tl = str(t).lower()
-                    mask = series.apply(lambda x, tt=tl: any(str(i).lower() == tt for i in x) if isinstance(x, list) else False)
-                else:
-                    mask = series.apply(lambda x, tt=t: tt in x if isinstance(x, list) else False)
+                mask = series.apply(lambda x, tt=t: tt in x if isinstance(x, list) else False)
                 es = f'{name} contains {t}'
             else:
                 if ENABLE_NULL_FILTER:
@@ -1373,8 +1363,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             elif ftype in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]:
                 if not isinstance(val, list) or not val: continue
                 items = [x for x in val if x is not None]
-                if ftype == FieldType.TEXT_ARRAY:
-                    items = [x for x in items if not is_stopword(x)]
+                # Tokenization.FIELD: 不需要停用词过滤
                 if items:
                     strat = random.choice(["contains_any", "contains_all", "contains_any_noise"])
                     if strat == "contains_any":
