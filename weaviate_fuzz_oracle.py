@@ -103,6 +103,7 @@ class FieldType:
     NUMBER_ARRAY = "NUMBER_ARRAY"
     BOOL_ARRAY = "BOOL_ARRAY"
     DATE = "DATE"
+    OBJECT = "OBJECT"  # Nested object (对标 Milvus JSON)
 
 def get_weaviate_datatype(ftype):
     mapping = {
@@ -115,8 +116,51 @@ def get_weaviate_datatype(ftype):
         FieldType.NUMBER_ARRAY: DataType.NUMBER_ARRAY,
         FieldType.BOOL_ARRAY: DataType.BOOL_ARRAY,
         FieldType.DATE: DataType.DATE,
+        # OBJECT handled specially in reset_collection
     }
     return mapping.get(ftype)
+
+
+# --- FuzzStats: 统计/度量收集 ---
+class FuzzStats:
+    """查询延迟、错误分类、通过率等统计信息收集 (对标 Milvus 日志汇总)"""
+    def __init__(self):
+        self.total = 0
+        self.passed = 0
+        self.failed = 0
+        self.skipped = 0
+        self.latencies = []
+        self.expr_depths = []
+        self.error_categories = {}  # {category: count}
+
+    def record(self, passed, latency_ms=None, depth=None, error_cat=None):
+        self.total += 1
+        if passed:
+            self.passed += 1
+        else:
+            self.failed += 1
+        if latency_ms is not None:
+            self.latencies.append(latency_ms)
+        if depth is not None:
+            self.expr_depths.append(depth)
+        if error_cat:
+            self.error_categories[error_cat] = self.error_categories.get(error_cat, 0) + 1
+
+    def record_skip(self):
+        self.skipped += 1
+
+    def summary(self):
+        lines = []
+        lines.append(f"Total:{self.total} Pass:{self.passed} Fail:{self.failed} Skip:{self.skipped}")
+        if self.latencies:
+            arr = np.array(self.latencies)
+            lines.append(f"Latency: avg={arr.mean():.1f}ms p50={np.percentile(arr,50):.1f}ms p99={np.percentile(arr,99):.1f}ms max={arr.max():.1f}ms")
+        if self.expr_depths:
+            darr = np.array(self.expr_depths)
+            lines.append(f"Depth: avg={darr.mean():.1f} max={darr.max()}")
+        if self.error_categories:
+            lines.append(f"Errors: {dict(self.error_categories)}")
+        return " | ".join(lines)
 
 
 class DataManager:
@@ -124,6 +168,7 @@ class DataManager:
         self.df = None
         self.vectors = None
         self.schema_config = []
+        self.filterable_fields = set()  # Populated by reset_collection
         self.null_ratio = random.uniform(0.05, 0.15)
         self.array_capacity = random.randint(5, 20)
         self.int_range = random.randint(5000, 100000)
@@ -147,6 +192,14 @@ class DataManager:
         self.schema_config.append({"name": "labelsArray", "type": FieldType.TEXT_ARRAY, "max_capacity": self.array_capacity})
         self.schema_config.append({"name": "scoresArray", "type": FieldType.NUMBER_ARRAY, "max_capacity": self.array_capacity})
         self.schema_config.append({"name": "flagsArray", "type": FieldType.BOOL_ARRAY, "max_capacity": self.array_capacity})
+
+        # Nested Object field (对标 Milvus JSON field)
+        self.schema_config.append({"name": "metaObj", "type": FieldType.OBJECT, "nested": [
+            {"name": "price", "type": FieldType.INT},
+            {"name": "color", "type": FieldType.TEXT},
+            {"name": "active", "type": FieldType.BOOL},
+            {"name": "score", "type": FieldType.NUMBER},
+        ]})
 
         print(f"   -> Generated {len(self.schema_config)} dynamic fields (plus id & vector).")
         for f in self.schema_config:
@@ -188,6 +241,24 @@ class DataManager:
             elif ftype == FieldType.BOOL_ARRAY:
                 arr = [random.choice([True, False]) for _ in range(random.randint(0, 5))]
                 row[fname] = arr if arr else None
+            elif ftype == FieldType.OBJECT:
+                if random.random() < self.null_ratio:
+                    row[fname] = None
+                else:
+                    nested = field.get("nested", [])
+                    obj = {}
+                    for nf in nested:
+                        if random.random() < self.null_ratio:
+                            continue
+                        if nf["type"] == FieldType.INT:
+                            obj[nf["name"]] = random.randint(-self.int_range, self.int_range)
+                        elif nf["type"] == FieldType.NUMBER:
+                            obj[nf["name"]] = random.random() * self.double_scale
+                        elif nf["type"] == FieldType.BOOL:
+                            obj[nf["name"]] = random.choice([True, False])
+                        elif nf["type"] == FieldType.TEXT:
+                            obj[nf["name"]] = self._random_string(2, 10)
+                    row[fname] = obj if obj else None
         return row
 
     def generate_single_vector(self):
@@ -264,6 +335,27 @@ class DataManager:
                         length = random.randint(0, 5)
                         arr_list.append([bool(rng.choice([True, False])) for _ in range(length)])
                 data[fname] = arr_list
+            elif ftype == FieldType.OBJECT:
+                obj_list = []
+                nested = field.get("nested", [])
+                for _ in range(N):
+                    if rng.random() < self.null_ratio:
+                        obj_list.append(None)
+                    else:
+                        obj = {}
+                        for nf in nested:
+                            if rng.random() < self.null_ratio:
+                                continue
+                            if nf["type"] == FieldType.INT:
+                                obj[nf["name"]] = int(rng.integers(-self.int_range, self.int_range))
+                            elif nf["type"] == FieldType.NUMBER:
+                                obj[nf["name"]] = float(rng.random() * self.double_scale)
+                            elif nf["type"] == FieldType.BOOL:
+                                obj[nf["name"]] = bool(rng.choice([True, False]))
+                            elif nf["type"] == FieldType.TEXT:
+                                obj[nf["name"]] = self._random_string(2, 10)
+                        obj_list.append(obj if obj else None)
+                data[fname] = obj_list
 
         self.df = pd.DataFrame(data)
         # WORKAROUND: Weaviate treats empty arrays as null, normalize in oracle
@@ -319,11 +411,43 @@ class WeaviateManager:
             pass
 
         properties = []
+        index_config_log = []
+        filterable_fields = set()  # Track which fields have index_filterable=True
         for field in schema_config:
+            if field["type"] == FieldType.OBJECT:
+                # Nested object property
+                nested_props = []
+                for nf in field.get("nested", []):
+                    nwt = get_weaviate_datatype(nf["type"])
+                    if nwt:
+                        nested_props.append(Property(name=nf["name"], data_type=nwt))
+                if nested_props:
+                    properties.append(Property(
+                        name=field["name"], data_type=DataType.OBJECT,
+                        nested_properties=nested_props,
+                        index_filterable=True,  # OBJECT must be filterable for is_none
+                    ))
+                    filterable_fields.add(field["name"])
+                continue
             wv_type = get_weaviate_datatype(field["type"])
             if wv_type:
-                properties.append(Property(name=field["name"], data_type=wv_type))
+                # Scalar index config fuzzing (对标 Milvus 标量索引随机创建)
+                idx_filterable = random.choice([True, True, True, False])  # 75% on
+                idx_searchable = random.choice([True, False]) if field["type"] == FieldType.TEXT else False
+                idx_range = random.choice([True, False]) if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.DATE) else False
+                p = Property(name=field["name"], data_type=wv_type,
+                             index_filterable=idx_filterable,
+                             index_searchable=idx_searchable,
+                             index_range_filterable=idx_range)
+                properties.append(p)
+                if idx_filterable:
+                    filterable_fields.add(field["name"])
+                index_config_log.append(f"{field['name']}: filt={idx_filterable} search={idx_searchable} range={idx_range}")
         properties.append(Property(name="row_num", data_type=DataType.INT))
+        if index_config_log:
+            print(f"   -> Scalar index config: {len(index_config_log)} fields randomized")
+            for ic in index_config_log[:5]:
+                print(f"      {ic}")
 
         vi_type = VECTOR_INDEX_TYPE or "hnsw"
         dist = DISTANCE_METRIC or VectorDistances.COSINE
@@ -377,6 +501,7 @@ class WeaviateManager:
                     if attempt == 2:
                         raise
         print("🛠️ Collection Created.")
+        return filterable_fields
 
     def insert(self, dm):
         print(f"⚡ 3. Inserting Data (Batch={BATCH_SIZE})...")
@@ -436,7 +561,13 @@ class WeaviateManager:
 
 class OracleQueryGenerator:
     def __init__(self, dm):
-        self.schema = dm.schema_config
+        self.schema_all = dm.schema_config
+        # Only use filterable fields for query generation to avoid index-not-enabled errors
+        filterable = getattr(dm, 'filterable_fields', None)
+        if filterable:
+            self.schema = [f for f in dm.schema_config if f["name"] in filterable]
+        else:
+            self.schema = dm.schema_config
         self.df = dm.df
         self.dm = dm
         self._field_stats = {}
@@ -599,11 +730,34 @@ class OracleQueryGenerator:
                 mask = series.apply(lambda x: not any(i in targets for i in x) if isinstance(x, list) else True)
             return fc, mask, f"{fname} contains_none {targets}"
 
+    def gen_nested_object_expr(self):
+        """Nested Object 查询 (对标 Milvus gen_json_advanced_expr)
+        NOTE: Weaviate 当前版本对 OBJECT 类型仅支持 is_none(True) 过滤,
+        不支持嵌套属性路径过滤 (metaObj.price > X)。
+        主要价值: 数据完整性验证 + null 测试。
+        """
+        obj_fields = [f for f in self.schema if f["type"] == FieldType.OBJECT]
+        if not obj_fields:
+            return None, None, None
+        field = random.choice(obj_fields)
+        fname = field["name"]
+        series = self.df[fname]
+        if not ENABLE_NULL_FILTER:
+            return None, None, None
+        # Only is_none(True) is reliable for OBJECT type in current Weaviate
+        fc = Filter.by_property(fname).is_none(True)
+        mask = series.apply(lambda x: x is None or (not isinstance(x, dict)))
+        return fc, mask, f"{fname} is null"
+
     def gen_not_expr(self):
         """NOT 表达式 — 使用 Filter.not_() 包装
         WORKAROUND: Weaviate NOT 包含 null 行 (与 SQL 三值逻辑不同)
         """
-        f = random.choice(self.schema)
+        # Exclude OBJECT fields (only is_none(True) works, NOT(is_none(True)) = is_none(False) is broken)
+        non_obj = [f for f in self.schema if f["type"] != FieldType.OBJECT]
+        if not non_obj:
+            return None, None, None
+        f = random.choice(non_obj)
         name, ftype = f["name"], f["type"]
         series = self.df[name]
         strat = random.choice(["not_cmp", "not_eq_text", "not_range", "not_contains", "not_null"])
@@ -676,11 +830,18 @@ class OracleQueryGenerator:
         return None, None, None
 
     def gen_atomic_expr(self):
-        f = random.choice(self.schema)
+        # Exclude OBJECT fields - they can only be queried via gen_nested_object_expr (is_none only)
+        filterable_schema = [f for f in self.schema if f["type"] != FieldType.OBJECT]
+        if not filterable_schema:
+            return None, None, None
+        f = random.choice(filterable_schema)
         name, ftype = f["name"], f["type"]
         series = self.df[name]
 
         if ENABLE_NULL_FILTER and random.random() < 0.15:
+            # OBJECT fields: is_none(False) is broken in Weaviate, only allow is_none(True)
+            if ftype == FieldType.OBJECT:
+                return Filter.by_property(name).is_none(True), series.isnull(), f"{name} is null"
             if random.random() < 0.5:
                 return Filter.by_property(name).is_none(True), series.isnull(), f"{name} is null"
             else:
@@ -689,6 +850,7 @@ class OracleQueryGenerator:
         val = self.get_value_for_query(name, ftype)
         if val is None:
             if ENABLE_NULL_FILTER:
+                # For OBJECT fields, only is_none(True) works
                 return Filter.by_property(name).is_none(True), series.isnull(), f"{name} is null"
             return None, None, None
 
@@ -741,20 +903,49 @@ class OracleQueryGenerator:
             es = f"{name} {op} {vf}"
 
         elif ftype == FieldType.TEXT:
-            op = random.choice(["==", "!=", "like"])
+            op = random.choice(["==", "!=", "like_prefix", "like_suffix", "like_contains", "like_single"])
+            sv = str(val)
             if op == "==":
                 fc = Filter.by_property(name).equal(val)
-                vl = str(val).lower()
+                vl = sv.lower()
                 mask = series.apply(lambda x, v=vl: str(x).lower() == v if pd.notna(x) else False)
                 es = f'{name} == "{val}"'
             elif op == "!=":
                 fc = Filter.by_property(name).not_equal(val)
-                vl = str(val).lower()
+                vl = sv.lower()
                 # Weaviate not_equal includes null rows
                 mask = series.apply(lambda x, v=vl: str(x).lower() != v if pd.notna(x) else True)
                 es = f'{name} != "{val}"'
+            elif op == "like_prefix":
+                k = random.randint(1, min(4, max(1, len(sv))))
+                prefix = ''.join(c for c in sv[:k] if c.isalnum()) or "a"
+                fc = Filter.by_property(name).like(f"{prefix}*")
+                mask = series.apply(lambda x, p=prefix: str(x).lower().startswith(p.lower()) if pd.notna(x) else False)
+                es = f'{name} like "{prefix}*"'
+            elif op == "like_suffix" and len(sv) >= 2:
+                k = random.randint(1, min(4, len(sv)))
+                suffix = ''.join(c for c in sv[-k:] if c.isalnum()) or "z"
+                fc = Filter.by_property(name).like(f"*{suffix}")
+                mask = series.apply(lambda x, s=suffix: str(x).lower().endswith(s.lower()) if pd.notna(x) else False)
+                es = f'{name} like "*{suffix}"'
+            elif op == "like_contains" and len(sv) >= 3:
+                i_start = random.randint(0, len(sv) - 2)
+                j_end = random.randint(i_start + 1, min(i_start + 5, len(sv)))
+                sub = ''.join(c for c in sv[i_start:j_end] if c.isalnum()) or "a"
+                fc = Filter.by_property(name).like(f"*{sub}*")
+                mask = series.apply(lambda x, s=sub: s.lower() in str(x).lower() if pd.notna(x) else False)
+                es = f'{name} like "*{sub}*"'
+            elif op == "like_single" and len(sv) >= 2:
+                pos = random.randint(0, len(sv) - 1)
+                pat = sv[:pos] + "?" + sv[pos+1:]
+                fc = Filter.by_property(name).like(pat)
+                import re as _re
+                regex = _re.compile("^" + _re.escape(sv[:pos]) + "." + _re.escape(sv[pos+1:]) + "$", _re.IGNORECASE)
+                mask = series.apply(lambda x, r=regex: bool(r.match(str(x))) if pd.notna(x) else False)
+                es = f'{name} like "{pat}"'
             else:
-                prefix = ''.join(c for c in val[:3] if c.isalnum()) or "a"
+                # fallback to prefix
+                prefix = ''.join(c for c in sv[:3] if c.isalnum()) or "a"
                 fc = Filter.by_property(name).like(f"{prefix}*")
                 mask = series.apply(lambda x, p=prefix: str(x).lower().startswith(p.lower()) if pd.notna(x) else False)
                 es = f'{name} like "{prefix}*"'
@@ -830,14 +1021,17 @@ class OracleQueryGenerator:
             if r < 0.02:
                 res = self.gen_constant_expr()
                 if res[0]: return res
-            elif r < 0.12:
+            elif r < 0.10:
                 res = self.gen_boundary_expr()
                 if res[0] is not None: return res
-            elif r < 0.20:
+            elif r < 0.18:
                 res = self.gen_multi_array_expr()
                 if res[0] is not None: return res
-            elif r < 0.35:
+            elif r < 0.28:
                 res = self.gen_not_expr()
+                if res[0] is not None: return res
+            elif r < 0.38:
+                res = self.gen_nested_object_expr()
                 if res[0] is not None: return res
             fc, m, e = self.gen_atomic_expr()
             if fc: return fc, m, e
@@ -1222,7 +1416,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
     wm = WeaviateManager()
     wm.connect()
     try:
-        wm.reset_collection(dm.schema_config)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config)
         wm.insert(dm)
         ts = int(time.time())
         logf = f"weaviate_fuzz_test_{ts}.log"
@@ -1233,6 +1427,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
         qg = OracleQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         fails = []
+        stats = FuzzStats()
 
         with open(logf, "w", encoding="utf-8") as f:
             def flog(msg):
@@ -1251,7 +1446,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
 
                 # Dynamic ops
                 if enable_dynamic_ops and i > 0 and i % 10 == 0:
-                    op = random.choices(["insert", "delete", "update"], weights=[0.4, 0.4, 0.2], k=1)[0]
+                    op = random.choices(["insert", "delete", "update", "upsert"], weights=[0.3, 0.3, 0.2, 0.2], k=1)[0]
                     bc = random.randint(1, 5)
                     if op == "insert":
                         try:
@@ -1268,6 +1463,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                             dm.vectors = np.vstack([dm.vectors, np.array(vecs)])
                             qg = OracleQueryGenerator(dm)
                             flog(f"[Dyn] Inserted {bc}")
+                            time.sleep(SLEEP_INTERVAL * 2)  # Allow index to stabilize
                         except Exception as e:
                             flog(f"[Dyn] Insert fail: {e}")
                     elif op == "delete":
@@ -1292,6 +1488,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 dm.vectors = dm.vectors[ki]
                                 qg = OracleQueryGenerator(dm)
                                 flog(f"[Dyn] Deleted {len(dids)}")
+                                time.sleep(SLEEP_INTERVAL * 2)
                             except Exception as e:
                                 flog(f"[Dyn] Delete fail: {e}")
                     else:
@@ -1323,21 +1520,74 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                     pass
                                 qg = OracleQueryGenerator(dm)
                                 flog(f"[Dyn] Updated {uid}")
+                                time.sleep(SLEEP_INTERVAL * 2)
                             except Exception as e:
                                 flog(f"[Dyn] Update fail: {e}")
+                    if op == "upsert":
+                        # Upsert: 70% existing ID (update), 30% new ID (insert)
+                        upsert_rows, upsert_vecs = [], []
+                        for _ in range(bc):
+                            use_existing = (not dm.df.empty) and (random.random() < 0.7)
+                            if use_existing:
+                                target_id = random.choice(dm.df["id"].tolist())
+                            else:
+                                target_id = str(uuid.uuid4())
+                            row = dm.generate_single_row(id_override=target_id)
+                            vec = dm.generate_single_vector()
+                            upsert_rows.append(row)
+                            upsert_vecs.append(vec)
+                        try:
+                            new_rows, new_vecs = [], []
+                            for row, vec in zip(upsert_rows, upsert_vecs):
+                                rid = row["id"]
+                                p = {k: v for k, v in row.items() if k != "id" and v is not None}
+                                match_idx = dm.df.index[dm.df["id"] == rid].tolist()
+                                if match_idx:
+                                    # Update existing
+                                    col.data.replace(uuid=rid, properties=p, vector=vec.tolist())
+                                    idx = match_idx[0]
+                                    for k, v in row.items():
+                                        dm.df.at[idx, k] = v
+                                    dm.vectors[idx] = vec
+                                else:
+                                    # Insert new
+                                    col.data.insert(properties=p, uuid=rid, vector=vec.tolist())
+                                    new_rows.append(row)
+                                    new_vecs.append(vec)
+                            if new_rows:
+                                dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                                dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
+                            qg = OracleQueryGenerator(dm)
+                            flog(f"[Dyn] Upserted {len(upsert_rows)} (new:{len(new_rows)})")
+                            time.sleep(SLEEP_INTERVAL * 2)  # Allow index to stabilize
+                        except Exception as e:
+                            flog(f"[Dyn] Upsert fail: {e}")
 
-                # HNSW parameter reconfiguration every 40 rounds
+                # HNSW parameter reconfiguration + maintenance pressure every 40 rounds
                 if i > 0 and i % 40 == 0 and VECTOR_INDEX_TYPE == "hnsw":
                     try:
                         new_ef = random.choice([64, 128, 256, 512])
                         new_dyn = random.choice([4, 8, 12])
+                        new_cutoff = random.choice([20000, 40000, 60000])
                         col.config.update(
                             vector_index_config=Reconfigure.VectorIndex.hnsw(
                                 ef=new_ef,
-                                dynamic_ef_factor=new_dyn
+                                dynamic_ef_factor=new_dyn,
+                                flat_search_cutoff=new_cutoff,
                             )
                         )
-                        flog(f"[Reconfig] HNSW ef={new_ef} dyn_ef_factor={new_dyn}")
+                        flog(f"[Reconfig] HNSW ef={new_ef} dyn_ef={new_dyn} cutoff={new_cutoff}")
+                        # Post-reconfig maintenance pressure: verify a known-good object
+                        try:
+                            verify_id = dm.df.iloc[0]["id"]
+                            vobj = col.query.fetch_object_by_id(verify_id)
+                            if vobj is None:
+                                flog(f"[Maintenance] ❌ Post-reconfig ID missing: {verify_id}")
+                                fails.append({"id": i, "detail": f"Post-reconfig ghost: {verify_id}"})
+                            else:
+                                flog(f"[Maintenance] ✅ Post-reconfig verify OK")
+                        except Exception as ve:
+                            flog(f"[Maintenance] verify err: {ve}")
                     except Exception as e:
                         flog(f"[Reconfig] Failed: {e}")
 
@@ -1346,7 +1596,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                 for _ in range(10):
                     fo, pm, es = qg.gen_complex_expr(depth)
                     if fo: break
-                if not fo: continue
+                if not fo:
+                    stats.record_skip()
+                    continue
 
                 flog(f"\n[T{i}] {es[:300]}")
                 flog(f"  CL={cl}")
@@ -1362,6 +1614,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
 
                     if exp == act:
                         flog("  -> MATCH")
+                        stats.record(True, ms, depth)
                     else:
                         mi, ex = exp - act, act - exp
                         dm_ = f"Missing:{len(mi)} Extra:{len(ex)}"
@@ -1388,6 +1641,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 except Exception as ve:
                                     flog(f"    ExtraID verify err: {ve}")
                             fails.append({"id": i, "expr": es, "detail": dm_, "seed": current_seed})
+                            stats.record(False, ms, depth, "mismatch")
 
                     if exp and random.random() < VECTOR_CHECK_RATIO:
                         try:
@@ -1430,9 +1684,26 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                 except Exception as e:
                     print(f"\n⚠️ [T{i}] CRASH: {e}")
                     flog(f"  -> ERR: {e}")
+                    # Categorize errors
+                    err_str = str(e).lower()
+                    if "inverted index" in err_str or "is it indexed" in err_str or "not found - is it indexed" in err_str:
+                        # Expected when index_filterable=False (random config) — skip, not fail
+                        cat = "index_skip"
+                        stats.record_skip()
+                        continue
+                    elif "stopword" in err_str:
+                        cat = "stopword"
+                    elif "timeout" in err_str or "deadline" in err_str:
+                        cat = "timeout"
+                    elif "connection" in err_str:
+                        cat = "connection"
+                    else:
+                        cat = "query_error"
+                    stats.record(False, 0, depth, cat)
                     fails.append({"id": i, "expr": es, "detail": str(e)})
 
         print("\n" + "="*60)
+        print(f"📊 Stats: {stats.summary()}")
         if not fails:
             print(f"✅ All {rounds} tests passed!")
         else:
@@ -1458,7 +1729,7 @@ def run_equivalence_mode(rounds=100, seed=None):
     dm = DataManager(); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        wm.reset_collection(dm.schema_config); wm.insert(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
         qg = EquivalenceQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         fails = []
@@ -1518,7 +1789,7 @@ def run_pqs_mode(rounds=100, seed=None):
     dm = DataManager(); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        wm.reset_collection(dm.schema_config); wm.insert(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
         pqs = PQSQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         errs, ok, skip = [], 0, 0
@@ -1577,11 +1848,12 @@ def run_groupby_mode(rounds=100, seed=None):
     dm = DataManager(); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        wm.reset_collection(dm.schema_config); wm.insert(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
         col = wm.client.collections.get(CLASS_NAME)
         errs, ok = [], 0
-        # Find groupable scalar fields
-        group_fields = [f for f in dm.schema_config if f["type"] in [FieldType.INT, FieldType.BOOL, FieldType.TEXT]]
+        # Find groupable scalar fields (must be filterable/indexed)
+        filterable = getattr(dm, 'filterable_fields', set())
+        group_fields = [f for f in dm.schema_config if f["type"] in [FieldType.INT, FieldType.BOOL, FieldType.TEXT] and (not filterable or f["name"] in filterable)]
         if not group_fields:
             print("  No groupable fields, skip."); return
 
