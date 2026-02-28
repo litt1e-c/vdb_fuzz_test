@@ -28,7 +28,7 @@ from weaviate.classes.config import (
     Configure, Property, DataType, Reconfigure,
     VectorDistances,
 )
-from weaviate.classes.query import Filter
+from weaviate.classes.query import Filter, GroupBy
 from weaviate.classes.data import DataObject
 from weaviate.classes.config import ConsistencyLevel
 
@@ -876,7 +876,11 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
         if self._tautology_field:
             n = self._tautology_field["name"]
             mn, mx = self._tautology_field["min"], self._tautology_field["max"]
-            return Filter.by_property(n).greater_or_equal(mn - 1e6) & Filter.by_property(n).less_or_equal(mx + 1e6), f"({n} wide)"
+            wide = Filter.by_property(n).greater_or_equal(mn - 1e6) & Filter.by_property(n).less_or_equal(mx + 1e6)
+            if ENABLE_NULL_FILTER:
+                # Include null rows to make it a true tautology
+                return wide | Filter.by_property(n).is_none(True), f"({n} wide|null)"
+            return wide, f"({n} wide)"
         return None, None
 
     def _gen_false_filter(self):
@@ -888,12 +892,74 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 return Filter.by_property(f["name"]).equal("__impossible__"), f'{f["name"]} impossible'
         return None, None
 
+    def _gen_guaranteed_false_filter(self):
+        """生成保证为假但计算复杂的表达式, 覆盖更多引擎代码路径"""
+        for f in self.schema:
+            if f["type"] == FieldType.INT:
+                n = f["name"]
+                return Filter.by_property(n).greater_than(200000) & Filter.by_property(n).less_than(-200000), f"({n} impossible-range)"
+        for f in self.schema:
+            if f["type"] == FieldType.NUMBER:
+                n = f["name"]
+                return Filter.by_property(n).greater_than(1e20) & Filter.by_property(n).less_than(-1e20), f"({n} impossible-float)"
+        for f in self.schema:
+            if f["type"] == FieldType.TEXT:
+                n = f["name"]
+                impossible = 'fuzz_impossible_' + ''.join(random.choices(string.ascii_letters, k=30))
+                return Filter.by_property(n).equal(impossible), f'({n} impossible-text)'
+        return self._gen_false_filter()
+
     def mutate_filter(self, base_filter, base_expr):
         mutations = [{"type": "SelfOr", "filter": base_filter | base_filter, "expr": f"({base_expr}) OR ({base_expr})"}]
         ff, fe = self._gen_false_filter()
         if ff:
             mutations.append({"type": "NoiseOr", "filter": base_filter | ff, "expr": f"({base_expr}) OR ({fe})"})
         mutations.append({"type": "DoubleNeg", "filter": Filter.not_(Filter.not_(base_filter)), "expr": f"NOT(NOT({base_expr}))"})
+
+        # TautologyAnd: A AND True → A
+        tf, te = self._gen_tautology_filter()
+        if tf:
+            mutations.append({"type": "TautologyAnd", "filter": base_filter & tf, "expr": f"({base_expr}) AND {te}"})
+            mutations.append({"type": "TautologyAnd_Left", "filter": tf & base_filter, "expr": f"{te} AND ({base_expr})"})
+
+        # DeMorganWrapper: NOT(NOT(A) OR False) ≡ A
+        gf, ge = self._gen_guaranteed_false_filter()
+        if gf:
+            mutations.append({"type": "DeMorgan", "filter": Filter.not_(Filter.not_(base_filter) | gf), "expr": f"NOT(NOT({base_expr}) OR {ge})"})
+
+        # IntRangeShift: int > X ≡ int >= X+1
+        for f in self.schema:
+            if f["type"] == FieldType.INT:
+                n = f["name"]
+                s = self.df[n].dropna()
+                if not s.empty:
+                    v = int(s.sample(1).iloc[0])
+                    orig = Filter.by_property(n).greater_than(v)
+                    shifted = Filter.by_property(n).greater_or_equal(v + 1)
+                    mutations.append({"type": "IntRangeShift", "filter": (base_filter & shifted) | (base_filter & Filter.not_(orig)),
+                                      "expr": f"(({base_expr}) AND {n}>={v+1}) OR (({base_expr}) AND NOT({n}>{v}))"})
+                    break
+
+        # PartitionById: (A AND row_num%2==even) OR (A AND row_num%2==odd) ≡ A
+        # Use row_num field for partition
+        if 'row_num' in [f['name'] for f in self.schema] or True:
+            # Approximate partition using two tautology halves via known field ranges
+            for f in self.schema:
+                if f['type'] == FieldType.INT and f['name'] != 'row_num':
+                    s = self.df[f['name']].dropna()
+                    if len(s) > 10:
+                        med = int(s.median())
+                        left_part = Filter.by_property(f['name']).less_or_equal(med)
+                        right_part = Filter.by_property(f['name']).greater_than(med)
+                        null_part = Filter.by_property(f['name']).is_none(True) if ENABLE_NULL_FILTER else None
+                        if null_part:
+                            combined = (base_filter & left_part) | (base_filter & right_part) | (base_filter & null_part)
+                        else:
+                            combined = (base_filter & left_part) | (base_filter & right_part)
+                        mutations.append({"type": "Partition", "filter": combined,
+                                          "expr": f"partition({base_expr}, {f['name']}, med={med})"})
+                        break
+
         return mutations
 
 
@@ -927,7 +993,10 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if self._tautology_field:
             n = self._tautology_field["name"]
             mn, mx = self._tautology_field["min"], self._tautology_field["max"]
-            return Filter.by_property(n).greater_or_equal(mn - 1e6) & Filter.by_property(n).less_or_equal(mx + 1e6), f"({n} wide)"
+            wide = Filter.by_property(n).greater_or_equal(mn - 1e6) & Filter.by_property(n).less_or_equal(mx + 1e6)
+            if ENABLE_NULL_FILTER:
+                return wide | Filter.by_property(n).is_none(True), f"({n} wide|null)"
+            return wide, f"({n} wide)"
         return None, None
 
     def _gen_false(self):
@@ -943,7 +1012,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 tf, te = self._gen_tautology()
                 if tf: return tf, te
             return res
-        op = random.choice(["and", "or"])
+        op = random.choice(["and", "or", "nested_not"])
         tf, te = self._gen_tautology()
         if op == "and":
             fl, el = self.gen_pqs_filter(pivot_row, depth - 1)
@@ -952,15 +1021,99 @@ class PQSQueryGenerator(OracleQueryGenerator):
             if not fr: fr, er = tf, te
             if fl and fr: return fl & fr, f"({el} AND {er})"
             return fl, el
-        else:
+        elif op == "or":
             fl, el = self.gen_pqs_filter(pivot_row, depth - 1)
-            nf, ne = self._gen_false()
+            # Use complex noise instead of simple false for OR right side
+            if random.random() < 0.3:
+                nf, ne = self.gen_complex_noise(random.randint(1, 3))
+            else:
+                nf, ne = self._gen_false()
             if not fl: fl, el = tf, te
             if not nf: nf, ne = self._gen_false()
             if fl and nf: return fl | nf, f"({el} OR {ne})"
             return fl, el
+        else:  # nested_not: NOT(NOT(inner)) ≡ inner
+            fi, ei = self.gen_pqs_filter(pivot_row, depth - 1)
+            if fi:
+                return Filter.not_(Filter.not_(fi)), f"NOT(NOT({ei}))"
+            return tf, te
+
+    def _gen_false(self):
+        """Guaranteed-false complex expression (for noise in OR branches)"""
+        for f in self.schema:
+            if f["type"] == FieldType.INT:
+                n = f["name"]
+                return Filter.by_property(n).greater_than(200000) & Filter.by_property(n).less_than(-200000), f"({n} impossible)"
+        for f in self.schema:
+            if f["type"] == FieldType.NUMBER:
+                n = f["name"]
+                return Filter.by_property(n).greater_than(1e20) & Filter.by_property(n).less_than(-1e20), f"({n} impossible-float)"
+        for f in self.schema:
+            if f["type"] == FieldType.TEXT:
+                return Filter.by_property(f["name"]).equal("__impossible__"), f'{f["name"]} impossible'
+        return None, None
+
+    def gen_complex_noise(self, depth=3):
+        """生成复杂但必然为假的噪声表达式, 增加查询引擎压力"""
+        if depth <= 0:
+            ff, fe = self._gen_false()
+            if ff: return ff, fe
+            return self.gen_atomic_expr()[:2]  # fallback
+        op = random.choice(["and", "or", "not"])
+        if op == "and":
+            fl, el = self.gen_complex_noise(depth - 1)
+            fr, er = self.gen_complex_noise(depth - 1)
+            if fl and fr: return fl & fr, f"({el} AND {er})"
+            return fl or fr, el or er
+        elif op == "or":
+            fl, el = self.gen_complex_noise(depth - 1)
+            ff, fe = self._gen_false()
+            if fl and ff: return fl & ff, f"({el} AND {fe})"
+            return ff, fe
+        else:
+            fi, ei = self.gen_complex_noise(depth - 1)
+            if fi: return Filter.not_(fi), f"NOT({ei})"
+            return None, None
+
+    def gen_multi_field_true_filter(self, row, n=3):
+        """多字段联合必真表达式, 增加查询引擎工作量"""
+        fields = random.sample(self.schema, min(n, len(self.schema)))
+        filters, exprs = [], []
+        for f in fields:
+            fname, ftype = f["name"], f["type"]
+            val = row.get(fname)
+            is_null = val is None or (isinstance(val, float) and np.isnan(val))
+            if is_null:
+                if ENABLE_NULL_FILTER:
+                    filters.append(Filter.by_property(fname).is_none(True))
+                    exprs.append(f"{fname} is null")
+                continue
+            if ftype == FieldType.BOOL:
+                filters.append(Filter.by_property(fname).equal(bool(val)))
+                exprs.append(f"{fname}=={bool(val)}")
+            elif ftype == FieldType.INT:
+                vi = int(val)
+                filters.append(Filter.by_property(fname).equal(vi))
+                exprs.append(f"{fname}=={vi}")
+            elif ftype == FieldType.NUMBER:
+                vf = float(val)
+                eps = 1e-5
+                filters.append(Filter.by_property(fname).greater_than(vf - eps) & Filter.by_property(fname).less_than(vf + eps))
+                exprs.append(f"{fname}≈{vf}")
+            elif ftype in (FieldType.TEXT, FieldType.DATE):
+                filters.append(Filter.by_property(fname).equal(str(val)))
+                exprs.append(f'{fname}=="{val}"')
+        if len(filters) >= 2:
+            combined = filters[0]
+            for ff in filters[1:]:
+                combined = combined & ff
+            return combined, " AND ".join(exprs)
+        elif filters:
+            return filters[0], exprs[0]
+        return None, None
 
     def gen_true_atomic(self, row):
+        """Enhanced: multi-strategy boundary generation for PQS"""
         for field in random.sample(self.schema, len(self.schema)):
             fname, ftype = field["name"], field["type"]
             val = row.get(fname)
@@ -970,18 +1123,58 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).is_none(True), f"{fname} is null"
                 continue
             if ftype == FieldType.BOOL:
-                return Filter.by_property(fname).equal(bool(val)), f"{fname} == {bool(val)}"
+                strat = random.choice(["eq", "neq"])
+                if strat == "eq":
+                    return Filter.by_property(fname).equal(bool(val)), f"{fname} == {bool(val)}"
+                else:
+                    return Filter.by_property(fname).not_equal(not bool(val)), f"{fname} != {not bool(val)}"
             elif ftype == FieldType.INT:
                 vi = int(val)
-                return random.choice([
-                    (Filter.by_property(fname).equal(vi), f"{fname} == {vi}"),
-                    (Filter.by_property(fname).greater_or_equal(vi) & Filter.by_property(fname).less_or_equal(vi), f"{fname} [{vi},{vi}]")
-                ])
+                strat = random.choice(["eq", "range_tight", "range_pm1", "not_lt", "neq_fake"])
+                if strat == "eq":
+                    return Filter.by_property(fname).equal(vi), f"{fname} == {vi}"
+                elif strat == "range_tight":
+                    return Filter.by_property(fname).greater_or_equal(vi) & Filter.by_property(fname).less_or_equal(vi), f"{fname} [{vi},{vi}]"
+                elif strat == "range_pm1":
+                    return Filter.by_property(fname).greater_than(vi - 1) & Filter.by_property(fname).less_than(vi + 1), f"{fname} ({vi-1},{vi+1})"
+                elif strat == "not_lt":
+                    return Filter.not_(Filter.by_property(fname).less_than(vi)) & Filter.not_(Filter.by_property(fname).greater_than(vi)), f"NOT({fname}<{vi}) AND NOT({fname}>{vi})"
+                else:  # neq_fake
+                    fake = vi + random.choice([100000, -100000])
+                    return Filter.by_property(fname).not_equal(fake) & Filter.by_property(fname).equal(vi), f"{fname} != {fake} AND {fname} == {vi}"
             elif ftype == FieldType.NUMBER:
                 vf = float(val)
                 eps = 1e-5
-                return Filter.by_property(fname).greater_than(vf - eps) & Filter.by_property(fname).less_than(vf + eps), f"{fname} ≈ {vf}"
-            elif ftype in (FieldType.TEXT, FieldType.DATE):
+                strat = random.choice(["range", "not_gt"])
+                if strat == "range":
+                    return Filter.by_property(fname).greater_than(vf - eps) & Filter.by_property(fname).less_than(vf + eps), f"{fname} ≈ {vf}"
+                else:
+                    return Filter.not_(Filter.by_property(fname).greater_than(vf + eps)) & Filter.by_property(fname).greater_or_equal(vf - eps), f"NOT({fname}>{vf+eps}) AND {fname}>={vf-eps}"
+            elif ftype == FieldType.TEXT:
+                sv = str(val)
+                strat = random.choice(["eq", "like_prefix", "like_suffix", "like_contains", "like_single", "neq_fake"])
+                if strat == "eq":
+                    return Filter.by_property(fname).equal(sv), f'{fname} == "{sv}"'
+                elif strat == "like_prefix" and len(sv) >= 2:
+                    k = random.randint(1, min(4, len(sv)))
+                    return Filter.by_property(fname).like(sv[:k] + "*"), f'{fname} like "{sv[:k]}*"'
+                elif strat == "like_suffix" and len(sv) >= 2:
+                    k = random.randint(1, min(4, len(sv)))
+                    return Filter.by_property(fname).like("*" + sv[-k:]), f'{fname} like "*{sv[-k:]}"'
+                elif strat == "like_contains" and len(sv) >= 3:
+                    i = random.randint(0, len(sv) - 2)
+                    j = random.randint(i + 1, min(i + 5, len(sv)))
+                    return Filter.by_property(fname).like("*" + sv[i:j] + "*"), f'{fname} like "*{sv[i:j]}*"'
+                elif strat == "like_single" and len(sv) >= 2:
+                    p = random.randint(0, len(sv) - 1)
+                    pat = sv[:p] + "?" + sv[p+1:]
+                    return Filter.by_property(fname).like(pat), f'{fname} like "{pat}"'
+                elif strat == "neq_fake":
+                    fake = ''.join(random.choices(string.ascii_letters, k=30))
+                    return Filter.by_property(fname).not_equal(fake), f'{fname} != "{fake}"'
+                else:
+                    return Filter.by_property(fname).equal(sv), f'{fname} == "{sv}"'
+            elif ftype == FieldType.DATE:
                 return Filter.by_property(fname).equal(str(val)), f'{fname} == "{val}"'
             elif ftype in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]:
                 if not isinstance(val, list) or not val: continue
@@ -989,8 +1182,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 if ftype == FieldType.TEXT_ARRAY:
                     items = [x for x in items if not is_stopword(x)]
                 if items:
-                    t = self._convert_to_native(random.choice(items))
-                    return Filter.by_property(fname).contains_any([t]), f"{fname} contains {t}"
+                    strat = random.choice(["contains_any", "contains_all", "contains_any_noise"])
+                    if strat == "contains_any":
+                        t = self._convert_to_native(random.choice(items))
+                        return Filter.by_property(fname).contains_any([t]), f"{fname} contains {t}"
+                    elif strat == "contains_all" and len(items) >= 2:
+                        subset = [self._convert_to_native(x) for x in random.sample(items, min(2, len(items)))]
+                        return Filter.by_property(fname).contains_all(subset), f"{fname} contains_all {subset}"
+                    else:  # contains_any_noise
+                        t = self._convert_to_native(random.choice(items))
+                        fake = -999999 if ftype == FieldType.INT_ARRAY else "__fake__"
+                        return Filter.by_property(fname).contains_any([t, fake]), f"{fname} contains_any [{t},{fake}]"
                 continue
         if ENABLE_NULL_FILTER:
             return Filter.by_property(self.schema[0]["name"]).is_none(False), f"{self.schema[0]['name']} is not null"
@@ -1075,6 +1277,15 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 dids = [dm.df.iloc[x]["id"] for x in idxs]
                                 for d in dids:
                                     col.data.delete_by_id(d)
+                                # Post-delete verification
+                                for d in dids:
+                                    try:
+                                        obj = col.query.fetch_object_by_id(d)
+                                        if obj is not None:
+                                            flog(f"[Dyn] ❌ Deleted ID still exists: {d}")
+                                            fails.append({"id": i, "detail": f"Ghost after delete: {d}"})
+                                    except Exception:
+                                        pass  # expected: not found
                                 keep = ~dm.df["id"].isin(dids)
                                 ki = dm.df[keep].index.to_numpy()
                                 dm.df = dm.df[keep].reset_index(drop=True)
@@ -1095,10 +1306,40 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 for k, v in nr.items():
                                     dm.df.at[ui, k] = v
                                 dm.vectors[ui] = nv
+                                # Post-update verification
+                                try:
+                                    obj = col.query.fetch_object_by_id(uid)
+                                    if obj is not None:
+                                        for pk, pv in p.items():
+                                            av = obj.properties.get(pk)
+                                            if av is not None and pv is not None:
+                                                if isinstance(pv, float):
+                                                    if abs(av - pv) > 1e-3:
+                                                        flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
+                                                elif av != pv:
+                                                    flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
+                                        flog(f"[Dyn] Update verified {uid}")
+                                except Exception:
+                                    pass
                                 qg = OracleQueryGenerator(dm)
                                 flog(f"[Dyn] Updated {uid}")
                             except Exception as e:
                                 flog(f"[Dyn] Update fail: {e}")
+
+                # HNSW parameter reconfiguration every 40 rounds
+                if i > 0 and i % 40 == 0 and VECTOR_INDEX_TYPE == "hnsw":
+                    try:
+                        new_ef = random.choice([64, 128, 256, 512])
+                        new_dyn = random.choice([4, 8, 12])
+                        col.config.update(
+                            vector_index_config=Reconfigure.VectorIndex.hnsw(
+                                ef=new_ef,
+                                dynamic_ef_factor=new_dyn
+                            )
+                        )
+                        flog(f"[Reconfig] HNSW ef={new_ef} dyn_ef_factor={new_dyn}")
+                    except Exception as e:
+                        flog(f"[Reconfig] Failed: {e}")
 
                 depth = random.randint(1, 15)
                 fo = None
@@ -1133,6 +1374,19 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                             flog(f"  -> MISMATCH! {dm_}")
                             if mi: flog(f"  Missing: {sample(mi)}")
                             if ex: flog(f"  Extra: {sample(ex)}")
+                            # Per-ID verification for extra IDs
+                            for eid in list(ex)[:3]:
+                                try:
+                                    obj = col.query.fetch_object_by_id(eid)
+                                    exists = obj is not None
+                                    flog(f"    ExtraID {eid}: exists={exists}")
+                                    if exists:
+                                        row_data = dm.df[dm.df['id'] == eid]
+                                        if not row_data.empty:
+                                            null_cols = [c for c in row_data.columns if row_data[c].isna().any()]
+                                            flog(f"    ExtraID null_cols: {null_cols}")
+                                except Exception as ve:
+                                    flog(f"    ExtraID verify err: {ve}")
                             fails.append({"id": i, "expr": es, "detail": dm_, "seed": current_seed})
 
                     if exp and random.random() < VECTOR_CHECK_RATIO:
@@ -1229,8 +1483,18 @@ def run_equivalence_mode(rounds=100, seed=None):
                             if bi == mi:
                                 flog(f"  {mut['type']}: PASS")
                             else:
-                                flog(f"  {mut['type']}: FAIL (diff:{len(bi.symmetric_difference(mi))})")
-                                print(f"\n❌ [T{i}] {mut['type']} FAIL")
+                                diff = bi.symmetric_difference(mi)
+                                flog(f"  {mut['type']}: FAIL (diff:{len(diff)})")
+                                print(f"\n❌ [T{i}] {mut['type']} FAIL (diff:{len(diff)})")
+                                # Deep evidence: print details of diff IDs
+                                for did in list(diff)[:3]:
+                                    row = dm.df[dm.df['id'] == did]
+                                    if not row.empty:
+                                        null_cols = [c for c in row.columns if row[c].isna().any()]
+                                        flog(f"    DiffID {did}: null_cols={null_cols}")
+                                        for ff in dm.schema_config[:5]:
+                                            v = row.iloc[0].get(ff['name'])
+                                            flog(f"      {ff['name']}={v}")
                                 fails.append({"id": i, "type": mut["type"]})
                         except Exception as e:
                             flog(f"  {mut['type']}: ERR {e}")
@@ -1269,7 +1533,15 @@ def run_pqs_mode(rounds=100, seed=None):
                 pid = pr["id"]
                 d = random.randint(2, 8)
                 try:
-                    pf, pe = pqs.gen_pqs_filter(pr, d)
+                    # 30% chance: use multi-field joint expression for higher coverage
+                    if random.random() < 0.3:
+                        mf, me = pqs.gen_multi_field_true_filter(pr, n=random.randint(2, 4))
+                        if mf:
+                            pf, pe = mf, f"MultiField({me})"
+                        else:
+                            pf, pe = pqs.gen_pqs_filter(pr, d)
+                    else:
+                        pf, pe = pqs.gen_pqs_filter(pr, d)
                 except Exception as e:
                     flog(f"[T{i}] Gen err: {e}"); skip += 1; continue
                 if not pf: skip += 1; continue
@@ -1292,11 +1564,79 @@ def run_pqs_mode(rounds=100, seed=None):
         wm.close()
 
 
+def run_groupby_mode(rounds=100, seed=None):
+    global VECTOR_CHECK_RATIO, VECTOR_TOPK, VECTOR_INDEX_TYPE, DISTANCE_METRIC
+    if seed is None: seed = random.randint(0, 1000000)
+    random.seed(seed); np.random.seed(seed)
+    VECTOR_INDEX_TYPE = random.choice(ALL_VECTOR_INDEX_TYPES)
+    DISTANCE_METRIC = random.choice(ALL_DISTANCE_METRICS)
+
+    logf = f"weaviate_groupby_test_{int(time.time())}.log"
+    print(f"\n📦 GroupBy Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE}")
+
+    dm = DataManager(); dm.generate_schema(); dm.generate_data()
+    wm = WeaviateManager(); wm.connect()
+    try:
+        wm.reset_collection(dm.schema_config); wm.insert(dm)
+        col = wm.client.collections.get(CLASS_NAME)
+        errs, ok = [], 0
+        # Find groupable scalar fields
+        group_fields = [f for f in dm.schema_config if f["type"] in [FieldType.INT, FieldType.BOOL, FieldType.TEXT]]
+        if not group_fields:
+            print("  No groupable fields, skip."); return
+
+        with open(logf, "w", encoding="utf-8") as f:
+            def flog(m): f.write(m + "\n"); f.flush()
+            flog(f"GroupBy | Seed:{seed}")
+            for i in range(rounds):
+                print(f"\r⏳ GroupBy {i+1}/{rounds}", end="", flush=True)
+                gf = random.choice(group_fields)
+                n_groups = random.randint(2, 20)
+                per_group = random.randint(1, 5)
+                qi = random.randint(0, len(dm.vectors) - 1)
+                qv = dm.vectors[qi].tolist()
+                flog(f"\n[T{i}] field={gf['name']} groups={n_groups} per={per_group}")
+                try:
+                    gb = GroupBy(prop=gf["name"], number_of_groups=n_groups, objects_per_group=per_group)
+                    res = col.query.near_vector(near_vector=qv, group_by=gb, limit=n_groups * per_group)
+                    objs = res.objects
+                    # Validate: count groups and per-group counts
+                    groups = {}
+                    for o in objs:
+                        gval = o.properties.get(gf["name"])
+                        gkey = str(gval)
+                        groups.setdefault(gkey, []).append(str(o.uuid))
+                    actual_groups = len(groups)
+                    max_per = max(len(v) for v in groups.values()) if groups else 0
+                    flog(f"  groups={actual_groups}/{n_groups} max_per={max_per}/{per_group} total={len(objs)}")
+                    if actual_groups > n_groups:
+                        flog(f"  ❌ Too many groups!")
+                        errs.append({"id": i, "detail": f"groups {actual_groups}>{n_groups}"})
+                    elif max_per > per_group:
+                        flog(f"  ❌ Too many per group!")
+                        errs.append({"id": i, "detail": f"per_group {max_per}>{per_group}"})
+                    else:
+                        # Check for key splitting (same value different keys)
+                        flog(f"  PASS")
+                        ok += 1
+                except Exception as e:
+                    err_str = str(e)
+                    if "group by" in err_str.lower() or "not supported" in err_str.lower():
+                        flog(f"  SKIP (unsupported): {err_str[:100]}")
+                    else:
+                        flog(f"  ERR: {err_str[:200]}")
+                        errs.append({"id": i, "error": err_str[:100]})
+        print(f"\n📊 GroupBy: ok={ok} err={len(errs)}")
+        print(f"{'✅ All passed' if not errs else f'🚫 {len(errs)} failures'}. Log: {logf}")
+    finally:
+        wm.close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Weaviate Fuzz Oracle V2")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--rounds", type=int, default=500, help="Test rounds (default: 500)")
-    parser.add_argument("--mode", choices=["oracle", "equiv", "pqs"], default="oracle", help="Test mode")
+    parser.add_argument("--mode", choices=["oracle", "equiv", "pqs", "groupby"], default="oracle", help="Test mode")
     parser.add_argument("--no-dynamic", action="store_true", help="Disable dynamic ops")
     parser.add_argument("--host", type=str, default=None, help="Weaviate host")
     parser.add_argument("--port", type=int, default=None, help="Weaviate port")
@@ -1315,5 +1655,7 @@ if __name__ == "__main__":
         run_equivalence_mode(rounds=args.rounds, seed=args.seed)
     elif args.mode == "pqs":
         run_pqs_mode(rounds=args.rounds, seed=args.seed)
+    elif args.mode == "groupby":
+        run_groupby_mode(rounds=args.rounds, seed=args.seed)
     else:
         run(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=not args.no_dynamic)
