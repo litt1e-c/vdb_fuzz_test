@@ -44,10 +44,16 @@ SLEEP_INTERVAL = 0.01      # 每次插入后暂停
 ALL_DISTANCE_TYPES = [Distance.EUCLID, Distance.COSINE, Distance.DOT, Distance.MANHATTAN]
 DISTANCE_TYPE = None  # 延迟初始化
 
-# 随机化配置
-INDEX_TYPE = random.choice(["hnsw"])  # Qdrant 主要使用 HNSW
-VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)  # 20-80% 概率做向量+标量联合校验
-VECTOR_TOPK = random.randint(50, 200)          # TopK 在 50-200 之间随机
+# 随机化配置（延迟初始化，在 run() 内种子设置后赋值，确保可复现）
+INDEX_TYPE = "hnsw"  # Qdrant 主要使用 HNSW
+VECTOR_CHECK_RATIO = None  # 延迟初始化
+VECTOR_TOPK = None          # 延迟初始化
+
+def _init_vector_check_config():
+    """在种子设置后调用，确保 VECTOR_CHECK_RATIO/VECTOR_TOPK 可复现"""
+    global VECTOR_CHECK_RATIO, VECTOR_TOPK
+    VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
+    VECTOR_TOPK = random.randint(50, 200)
 
 # 混淆开关（默认关闭）
 CHAOS_RATE = 0.0
@@ -275,6 +281,12 @@ class DataManager:
             fname = field["name"]
             ftype = field["type"]
 
+            # 按 null_ratio 概率生成 NULL（与 generate_data 的 _apply_nulls 保持一致）
+            # JSON 和 GEO 类型有自己的 null 处理逻辑，其它标量字段统一处理
+            if ftype not in [FieldType.JSON, FieldType.GEO] and rng.random() < self.null_ratio:
+                row[fname] = None
+                continue
+
             if ftype == FieldType.INT:
                 row[fname] = int(rng.integers(-self.int_range, self.int_range))
             elif ftype == FieldType.FLOAT:
@@ -284,6 +296,9 @@ class DataManager:
             elif ftype == FieldType.STRING:
                 row[fname] = self._random_string(0, random.randint(5, 50))
             elif ftype == FieldType.JSON:
+                if rng.random() < self.null_ratio:
+                    row[fname] = None
+                    continue
                 base_obj = {
                     "price": int(rng.integers(0, 1000)),
                     "color": rng.choice(["Red", "Blue", "Green"]),
@@ -314,10 +329,13 @@ class DataManager:
                 epoch_2025 = int(dt_cls(2025, 1, 1).timestamp())
                 row[fname] = int(rng.integers(epoch_2020, epoch_2025))
             elif ftype == FieldType.GEO:
-                row[fname] = {
-                    "lat": round(float(rng.uniform(-90, 90)), 6),
-                    "lon": round(float(rng.uniform(-180, 180)), 6)
-                }
+                if rng.random() < self.null_ratio:
+                    row[fname] = None
+                else:
+                    row[fname] = {
+                        "lat": round(float(rng.uniform(-90, 90)), 6),
+                        "lon": round(float(rng.uniform(-180, 180)), 6)
+                    }
         return row
 
     def generate_single_vector(self):
@@ -1314,8 +1332,17 @@ class OracleQueryGenerator:
             filter_cond = FieldCondition(key=field_name, range=Range(gt=impossible_val))
             return (filter_cond, false_mask, f"{field_name} > {impossible_val} (always false)")
 
-    def gen_complex_expr(self, depth):
-        """递归生成复杂表达式"""
+    def gen_complex_expr(self, depth, _retry=0):
+        """递归生成复杂表达式（_retry 用于防止无限递归）"""
+        _MAX_RETRY = 20
+        if _retry >= _MAX_RETRY:
+            # 到达重试上限，用 HasId 兜底确保不会无限递归
+            if not self.df.empty:
+                res = self.gen_has_id_expr()
+                if res and res[0]:
+                    return res
+            return None, None, None
+
         if depth == 0 or random.random() < 0.2:
             if random.random() < 0.02:
                 res = self.gen_constant_expr()
@@ -1365,11 +1392,11 @@ class OracleQueryGenerator:
                 if isinstance(filter_cond, FieldCondition):
                     filter_cond = Filter(must=[filter_cond])
                 return filter_cond, mask, expr_str
-            return self.gen_complex_expr(depth)
+            return self.gen_complex_expr(depth, _retry=_retry + 1)
 
         # 递归生成子节点
-        filter_l, mask_l, expr_l = self.gen_complex_expr(depth - 1)
-        if not filter_l: return self.gen_complex_expr(depth)
+        filter_l, mask_l, expr_l = self.gen_complex_expr(depth - 1, _retry=0)
+        if not filter_l: return self.gen_complex_expr(depth, _retry=_retry + 1)
 
         op = random.choice(["and", "or", "not"])
 
@@ -2529,7 +2556,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
         random.seed(seed)
         np.random.seed(seed)
 
-    # 1. 初始化
+    # 1. 初始化随机化配置（种子已设置，确保可复现）
+    _init_vector_check_config()
+
     dm = DataManager()
     dm.generate_schema()
     dm.generate_data()
@@ -2665,16 +2694,16 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                         hnsw_ef = random.choice([64, 128, 256, 512])
                         sp = SearchParams(hnsw_ef=hnsw_ef, exact=use_exact)
 
-                        search_res = qm.client.search(
+                        search_res = qm.client.query_points(
                             collection_name=COLLECTION_NAME,
-                            query_vector=q_vec,
+                            query=q_vec,
                             query_filter=filter_obj,
                             limit=search_k,
                             with_payload=False,
                             search_params=sp
                         )
 
-                        returned_ids = set(p.id for p in search_res)
+                        returned_ids = set(p.id for p in search_res.points)
 
                         if not returned_ids:
                             file_log("  VectorCheck: PASS (no ANN hits)")
@@ -2736,6 +2765,9 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         seed = random.randint(0, 1000000)
         random.seed(seed)
         np.random.seed(seed)
+
+    # 种子已设置，初始化可复现的随机配置
+    _init_vector_check_config()
 
     timestamp = int(time.time())
     log_filename = f"qdrant_equiv_test_{timestamp}.log"
@@ -2875,11 +2907,20 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         print(f"\n🔒 PQS模式使用固定种子 {seed}")
         random.seed(seed)
         np.random.seed(seed)
+    else:
+        seed = random.randint(0, 2**31 - 1)
+        random.seed(seed)
+        np.random.seed(seed)
+        print(f"\n🎲 PQS模式随机生成种子: {seed}")
+
+    # 种子已设置，初始化可复现的随机配置
+    _init_vector_check_config()
 
     timestamp = int(time.time())
     log_filename = f"qdrant_pqs_test_{timestamp}.log"
     print("\n" + "="*60)
     print(f"🚀 启动 PQS (Pivot Query Synthesis) 模式测试")
+    print(f"   Seed: {seed}")
     print(f"📄 详细日志将写入: {log_filename}")
     print("="*60)
 
@@ -3029,11 +3070,20 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
         print(f"\n🔒 GroupBy 模式使用固定种子 {seed}")
         random.seed(seed)
         np.random.seed(seed)
+    else:
+        seed = random.randint(0, 2**31 - 1)
+        random.seed(seed)
+        np.random.seed(seed)
+        print(f"\n🎲 GroupBy模式随机生成种子: {seed}")
+
+    # 种子已设置，初始化可复现的随机配置
+    _init_vector_check_config()
 
     timestamp = int(time.time())
     log_filename = f"qdrant_group_test_{timestamp}.log"
     print("\n" + "="*60)
     print(f"📊 启动 GroupBy 逻辑专项测试")
+    print(f"   Seed: {seed}")
     print(f"   日志: {log_filename}")
     print("="*60)
 
@@ -3067,7 +3117,7 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
             f.write(msg + "\n")
             f.flush()
 
-        file_log(f"GroupBy Test Started | Rounds: {rounds}")
+        file_log(f"GroupBy Test Started | Rounds: {rounds} | Seed: {seed}")
 
         for i in range(rounds):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
@@ -3091,9 +3141,9 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
 
             try:
                 # Qdrant 的 group_by 搜索 - 使用 search_groups
-                search_res = qm.client.search_groups(
+                search_res = qm.client.query_points_groups(
                     collection_name=COLLECTION_NAME,
-                    query_vector=q_vec,
+                    query=q_vec,
                     group_by=group_field,
                     limit=limit_groups,
                     group_size=group_size,
