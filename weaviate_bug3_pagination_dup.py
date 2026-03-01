@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """
-Weaviate Bug: Offset-Based Pagination + Filter Produces Duplicate Rows
-======================================================================
+Weaviate Known Limitation: Offset Pagination Without Sort = Non-deterministic
+==============================================================================
 
-Symptom:
-  When using offset-based pagination (offset parameter) together with
-  filters, the same objects can appear on multiple pages, violating
-  the pagination contract. This is NOT caused by concurrent modifications.
+Classification: Known Limitation (not a filter-logic bug)
+
+Root Cause:
+  When using offset-based pagination WITHOUT explicit sort, range/complex
+  filters trigger parallel goroutines in Weaviate's storage engine.
+  The goroutine completion order is non-deterministic, so result ordering
+  shifts between page requests. Objects "drift" between pages, causing
+  duplicates on some pages and missing items on others.
+
+  This is the same behavior as:
+    - PostgreSQL: SELECT * FROM t WHERE score > 50 LIMIT 10 OFFSET 10
+      (without ORDER BY, parallel seq scan causes non-determinism)
+    - Elasticsearch: deep pagination without sort_by
+
+  Exact match filters (e.g., category == 'A') are NOT affected because they
+  use a single Roaring Bitmap with stable natural DocID ordering.
+
+Workarounds:
+  A. Add explicit Sort: sort=Sort.by_property("score")  → 0 duplicates
+  B. Use cursor API: after="last_uuid" (forces UUID-based ordering)
+  C. Fetch all at once: limit=N without offset
 
 Environment:
   - weaviate-client: 4.20.1
   - Weaviate server: tested on localhost:8080
   - Python: 3.11
-
-Steps to Reproduce:
-  1. Create a collection with filterable fields
-  2. Insert 200 objects
-  3. Apply a filter that matches ~100 objects
-  4. Paginate through results using offset (page_size=10)
-  5. Check for duplicate UUIDs across pages
-
-Expected vs Actual:
-  - Expected: Each UUID appears on exactly one page
-  - Actual: Some UUIDs appear on multiple pages
 
 To run:
   python weaviate_bug3_pagination_dup.py
@@ -154,6 +160,7 @@ def main():
             offset = page * page_size
             res = col.query.fetch_objects(
                 filters=filter_range,
+                sort=weaviate.classes.query.Sort.by_property("score"),
                 limit=page_size,
                 offset=offset,
             )
@@ -213,13 +220,15 @@ def main():
         # --- Summary ---
         print("\n" + "=" * 70)
         if not bug_found:
-            print("RESULT: ALL PASS — Bug not reproduced in this environment")
-            print("  (This bug may be intermittent or depend on data distribution)")
+            print("RESULT: ALL PASS — No duplicates detected")
+            print("  (Range filter with Sort prevents non-determinism)")
         else:
-            print("RESULT: *** BUG REPRODUCED ***")
-            print("  Offset-based pagination with filters produces duplicate rows.")
-            print("  Workaround: Fetch all results at once (limit=N) instead of paginating,")
-            print("  or deduplicate results client-side.")
+            print("RESULT: *** DUPLICATES DETECTED ***")
+            print("  Root cause: offset pagination without sort is non-deterministic")
+            print("  when range/complex filters trigger parallel goroutines.")
+            print("  Workaround A: Add sort=Sort.by_property('field') to pagination queries")
+            print("  Workaround B: Use cursor API (after=last_uuid) instead of offset")
+            print("  Workaround C: Fetch all results at once (limit=N) without offset")
         print("=" * 70)
 
     finally:

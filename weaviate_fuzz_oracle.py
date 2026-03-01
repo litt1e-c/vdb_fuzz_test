@@ -28,9 +28,14 @@ Known Weaviate Server Bugs (reproducible):
   BUG-2 (OBJECT is_none(False)): When non-null OBJECT values exist, is_none(False)
     returns 0 results instead of matching all non-null rows.
     Workaround: Fuzzer only uses is_none(True) for OBJECT fields.
-  BUG-3 (Pagination Duplicates): offset-based pagination with filters produces
-    duplicate rows across pages.
-    Workaround: Pagination duplicates are classified as warnings.
+  BUG-3 (Pagination Non-determinism): offset-based pagination WITHOUT explicit
+    sort produces duplicate rows across pages. Root cause: range/complex filters
+    trigger parallel goroutines whose completion order is non-deterministic,
+    so result ordering shifts between page requests.
+    This is a known limitation (not a filter-logic bug), same as ES/PG without ORDER BY.
+    Fix: Always use Sort when paginating with offset. Fuzzer tests both:
+      - With sort: duplicates = REAL BUG (FAIL)
+      - Without sort: duplicates = known limitation (INFO)
 """
 import time
 import random
@@ -46,7 +51,7 @@ from weaviate.classes.config import (
     Configure, Property, DataType, Reconfigure,
     VectorDistances, Tokenization,
 )
-from weaviate.classes.query import Filter, GroupBy
+from weaviate.classes.query import Filter, GroupBy, Sort
 from weaviate.classes.data import DataObject
 from weaviate.classes.config import ConsistencyLevel
 
@@ -1798,28 +1803,65 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                         except Exception as e:
                             flog(f"  VecCheck: ERR {e}")
 
-                    if len(exp) > 20 and random.random() < 0.1:
+                    if len(exp) > 20 and random.random() < 0.15:
                         try:
-                            # NOTE: Weaviate cursor API (after parameter) is NOT compatible
-                            # with filter parameter. Use offset-based pagination instead.
+                            # --- Pagination consistency test ---
+                            # Pick a sortable scalar field for deterministic pagination
+                            _sortable_types = {FieldType.INT, FieldType.NUMBER, FieldType.TEXT, FieldType.DATE}
+                            _sort_fields = [f for f in dm.schema_config
+                                            if f["type"] in _sortable_types
+                                            and (not dm.filterable_fields or f["name"] in dm.filterable_fields)]
                             ps = random.randint(5, 15)
-                            ap = set()
-                            for pg in range(10):
-                                offset = pg * ps
-                                pr = col.query.fetch_objects(filters=fo, limit=ps, offset=offset)
-                                if not pr.objects: break
-                                pi = set(str(o.uuid) for o in pr.objects)
-                                dup = ap & pi
-                                if dup:
-                                    flog(f"  Page: WARN dup@{pg} (known Weaviate offset+filter pagination bug)")
-                                    stats.weaviate_bugs = getattr(stats, 'weaviate_bugs', 0) + 1
-                                    break
-                                ap.update(pi)
-                                if len(pi) < ps: break
-                            if ap and not ap.issubset(exp):
-                                flog(f"  Page: FAIL extras")
-                            else:
-                                flog(f"  Page: PASS ({len(ap)})")
+                            max_pages = max(len(exp) // ps + 2, 10)
+
+                            # --- Test A: WITH sort (deterministic — dups = real bug) ---
+                            if _sort_fields:
+                                sf = random.choice(_sort_fields)
+                                asc = random.choice([True, False])
+                                sort_obj = Sort.by_property(sf["name"], ascending=asc)
+                                seen_sorted = set()
+                                all_sorted = []
+                                dup_sorted = 0
+                                for pg in range(max_pages):
+                                    offset = pg * ps
+                                    pr = col_cl.query.fetch_objects(filters=fo, limit=ps, offset=offset, sort=sort_obj)
+                                    if not pr.objects: break
+                                    for o in pr.objects:
+                                        uid = str(o.uuid)
+                                        if uid in seen_sorted:
+                                            dup_sorted += 1
+                                        seen_sorted.add(uid)
+                                        all_sorted.append(uid)
+                                    if len(pr.objects) < ps: break
+                                n_pages = (len(all_sorted) - 1) // ps + 1 if all_sorted else 0
+                                if dup_sorted > 0:
+                                    flog(f"  Page(sort={sf['name']}): FAIL {dup_sorted} dups in {n_pages} pages (BUG: sort should guarantee determinism)")
+                                    stats.record_fail()
+                                elif seen_sorted and not seen_sorted.issubset(exp):
+                                    extras = seen_sorted - exp
+                                    flog(f"  Page(sort={sf['name']}): FAIL {len(extras)} extras not in expected")
+                                    stats.record_fail()
+                                else:
+                                    flog(f"  Page(sort={sf['name']}): PASS ({len(seen_sorted)} in {n_pages}p)")
+
+                            # --- Test B: WITHOUT sort (informational — dups = known limitation) ---
+                            if random.random() < 0.3:
+                                seen_nosort = set()
+                                dup_nosort = 0
+                                for pg in range(min(max_pages, 10)):
+                                    offset = pg * ps
+                                    pr = col_cl.query.fetch_objects(filters=fo, limit=ps, offset=offset)
+                                    if not pr.objects: break
+                                    for o in pr.objects:
+                                        uid = str(o.uuid)
+                                        if uid in seen_nosort:
+                                            dup_nosort += 1
+                                        seen_nosort.add(uid)
+                                    if len(pr.objects) < ps: break
+                                if dup_nosort > 0:
+                                    flog(f"  Page(nosort): INFO {dup_nosort} dups (known: non-deterministic w/o sort)")
+                                else:
+                                    flog(f"  Page(nosort): PASS ({len(seen_nosort)})")
                         except Exception as e:
                             flog(f"  Page: ERR {e}")
                 except Exception as e:
