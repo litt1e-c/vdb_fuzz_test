@@ -1023,6 +1023,15 @@ class OracleQueryGenerator:
             imp = mx + 1e7
             return Filter.by_property(fn).greater_than(imp), pd.Series(False, index=self.df.index), f"{fn} > {imp} (false)"
 
+    def _apply_not_mask(self, mask):
+        """Apply NOT to a boolean mask with Weaviate null semantics.
+        Weaviate NOT includes null rows: NOT(expr) returns rows where
+        expr is False OR the field is null. This differs from SQL 3VL.
+        For a compound expression mask, we invert True→False, False→True.
+        Null rows (NaN in mask) become True (included in NOT result).
+        """
+        return mask.apply(lambda x: True if pd.isna(x) else not x)
+
     def gen_complex_expr(self, depth):
         if depth == 0 or random.random() < 0.2:
             r = random.random()
@@ -1045,13 +1054,33 @@ class OracleQueryGenerator:
             if fc: return fc, m, e
             return self.gen_complex_expr(depth)
 
-        fl, ml, el = self.gen_complex_expr(depth - 1)
-        fr, mr, er = self.gen_complex_expr(depth - 1)
-        if not fl: return fr, mr, er
-        if not fr: return fl, ml, el
-        if random.choice(["and", "or"]) == "and":
-            return fl & fr, ml & mr, f"({el} AND {er})"
-        return fl | fr, ml | mr, f"({el} OR {er})"
+        # Recursive branch: AND (40%), OR (40%), NOT (20%)
+        # Matches Milvus gen_complex_expr: random.choices(["and","or","not"], weights=[0.4,0.4,0.2])
+        op = random.choices(["and", "or", "not"], weights=[0.4, 0.4, 0.2], k=1)[0]
+
+        if op == "not":
+            # NOT branch: negate one sub-expression
+            # 30% chance: use dedicated gen_not_expr for more targeted NOT patterns
+            if random.random() < 0.3:
+                not_res = self.gen_not_expr()
+                if not_res[0] is not None:
+                    return not_res
+
+            # Otherwise: recursively generate and negate
+            fl, ml, el = self.gen_complex_expr(depth - 1)
+            if not fl:
+                return self.gen_complex_expr(depth)
+            fc_not = Filter.not_(fl)
+            mask_not = self._apply_not_mask(ml)
+            return fc_not, mask_not, f"NOT({el})"
+        else:
+            fl, ml, el = self.gen_complex_expr(depth - 1)
+            fr, mr, er = self.gen_complex_expr(depth - 1)
+            if not fl: return fr, mr, er
+            if not fr: return fl, ml, el
+            if op == "and":
+                return fl & fr, ml & mr, f"({el} AND {er})"
+            return fl | fr, ml | mr, f"({el} OR {er})"
 
 
 # --- 4. Equivalence ---
