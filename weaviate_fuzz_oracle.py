@@ -1237,33 +1237,67 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return None, None
 
     def gen_pqs_filter(self, pivot_row, depth):
-        if depth <= 0 or (depth <= 3 and random.random() < 0.3):
+        """生成必真的复合表达式 (PQS: Pivot Query Synthesis)
+        参照 Milvus gen_pqs_expr:
+         - AND: 两个子表达式都是必真的 → 结果必真
+         - OR: 左侧必真, 右侧可以是任意噪声 → 结果必真
+         - NOT(NOT(...)): 双重否定 ≡ 原表达式 → 保持必真
+         - 噪声分支使用 gen_complex_noise 生成复杂但语义丰富的子树
+        """
+        force_recursion = depth > 5
+
+        if depth <= 0 or (not force_recursion and depth <= 3 and random.random() < 0.25):
             res = self.gen_true_atomic(pivot_row)
             if res[0] is None:
                 tf, te = self._gen_tautology()
                 if tf: return tf, te
             return res
-        op = random.choice(["and", "or", "nested_not"])
+
+        op = random.choices(
+            ["and", "or", "nested_not", "or_complex_noise", "tautology_and"],
+            weights=[0.30, 0.25, 0.20, 0.15, 0.10], k=1
+        )[0]
         tf, te = self._gen_tautology()
+
         if op == "and":
+            # A AND B: 两侧都必真
             fl, el = self.gen_pqs_filter(pivot_row, depth - 1)
             fr, er = self.gen_pqs_filter(pivot_row, depth - 1)
             if not fl: fl, el = tf, te
             if not fr: fr, er = tf, te
             if fl and fr: return fl & fr, f"({el} AND {er})"
             return fl, el
+
         elif op == "or":
+            # A OR False: 左侧必真, 右侧假 → 必真
             fl, el = self.gen_pqs_filter(pivot_row, depth - 1)
-            # Use complex noise instead of simple false for OR right side
-            if random.random() < 0.3:
-                nf, ne = self.gen_complex_noise(random.randint(1, 3))
-            else:
-                nf, ne = self._gen_false()
+            nf, ne = self._gen_false()
             if not fl: fl, el = tf, te
             if not nf: nf, ne = self._gen_false()
             if fl and nf: return fl | nf, f"({el} OR {ne})"
             return fl, el
-        else:  # nested_not: NOT(NOT(inner)) ≡ inner
+
+        elif op == "or_complex_noise":
+            # A OR ComplexNoise: 噪声深度递增, 增加查询引擎压力
+            fl, el = self.gen_pqs_filter(pivot_row, depth - 1)
+            noise_depth = random.randint(2, min(depth + 2, 8))
+            nf, ne = self.gen_complex_noise(noise_depth)
+            if not fl: fl, el = tf, te
+            if nf:
+                if random.random() < 0.5:
+                    return fl | nf, f"({el} OR {ne})"
+                else:
+                    return nf | fl, f"({ne} OR {el})"
+            return fl, el
+
+        elif op == "tautology_and":
+            # TrueExpr AND Tautology: 必真 AND 永真 → 必真
+            fl, el = self.gen_pqs_filter(pivot_row, depth - 1)
+            if not fl: fl, el = tf, te
+            if fl and tf: return fl & tf, f"({el} AND {te})"
+            return fl, el
+
+        else:  # nested_not: NOT(NOT(inner)) ≡ inner → 保持必真
             fi, ei = self.gen_pqs_filter(pivot_row, depth - 1)
             if fi:
                 return Filter.not_(Filter.not_(fi)), f"NOT(NOT({ei}))"
@@ -1285,12 +1319,22 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return None, None
 
     def gen_complex_noise(self, depth=3):
-        """生成复杂但必然为假的噪声表达式, 增加查询引擎压力"""
+        """生成复杂但不保证语义的噪声表达式 (用于 PQS OR 分支)
+        注意: 不要求必假, 只要求复杂——增加查询引擎的执行路径覆盖
+        对标 Milvus gen_complex_noise: 包含多层 AND/OR/NOT 嵌套
+        """
         if depth <= 0:
+            # 叶子节点: 50% 假表达式, 50% 随机原子表达式
+            if random.random() < 0.5:
+                ff, fe = self._gen_false()
+                if ff: return ff, fe
+            res = self.gen_atomic_expr()
+            if res[0]: return res[0], res[2]
             ff, fe = self._gen_false()
-            if ff: return ff, fe
-            return self.gen_atomic_expr()[:2]  # fallback
-        op = random.choice(["and", "or", "not"])
+            return ff, fe
+
+        op = random.choices(["and", "or", "not", "mixed"], weights=[0.3, 0.3, 0.2, 0.2], k=1)[0]
+
         if op == "and":
             fl, el = self.gen_complex_noise(depth - 1)
             fr, er = self.gen_complex_noise(depth - 1)
@@ -1298,17 +1342,29 @@ class PQSQueryGenerator(OracleQueryGenerator):
             return fl or fr, el or er
         elif op == "or":
             fl, el = self.gen_complex_noise(depth - 1)
-            ff, fe = self._gen_false()
-            if fl and ff: return fl & ff, f"({el} AND {fe})"
-            return ff, fe
-        else:
-            # BUG FIX: NOT(guaranteed-false) = TRUE, which breaks the invariant.
-            # Instead: use AND with a false filter to keep the result false.
+            fr, er = self.gen_complex_noise(depth - 1)
+            if fl and fr: return fl | fr, f"({el} OR {er})"
+            return fl or fr, el or er
+        elif op == "not":
             fi, ei = self.gen_complex_noise(depth - 1)
+            if fi: return Filter.not_(fi), f"NOT({ei})"
             ff, fe = self._gen_false()
-            if fi and ff: return fi & ff, f"({ei} AND {fe})"
-            if ff: return ff, fe
-            return fi, ei
+            return ff, fe
+        else:  # mixed: 组合不同类型的表达式
+            fl, el = self.gen_complex_noise(depth - 1)
+            # 右侧使用 gen_boundary_expr 或 gen_not_expr 或 gen_multi_array_expr
+            fr_gen = random.choice([self.gen_boundary_expr, self.gen_not_expr, self.gen_multi_array_expr])
+            res = fr_gen()
+            if res[0] is not None:
+                fr, er = res[0], res[2]
+            else:
+                fr, er = self.gen_complex_noise(depth - 1)
+            if fl and fr:
+                if random.random() < 0.5:
+                    return fl & fr, f"({el} AND {er})"
+                else:
+                    return fl | fr, f"({el} OR {er})"
+            return fl or fr, el or er
 
     def gen_multi_field_true_filter(self, row, n=3):
         """多字段联合必真表达式, 增加查询引擎工作量"""
@@ -1578,6 +1634,13 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                                     # Array fields: compare sorted to avoid order issues
                                                     if sorted(str(x) for x in av) != sorted(str(x) for x in pv) if isinstance(av, list) else True:
                                                         pass  # Skip noisy array comparison
+                                                elif isinstance(pv, dict):
+                                                    # OBJECT fields: compare by sorted keys
+                                                    if isinstance(av, dict):
+                                                        if sorted(av.items()) != sorted(pv.items()):
+                                                            flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
+                                                    else:
+                                                        flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
                                                 elif str(av) != str(pv):
                                                     flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
                                         flog(f"[Dyn] Update verified {uid}")
@@ -1666,7 +1729,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                     stats.record_skip()
                     continue
 
-                flog(f"\n[T{i}] {es[:300]}")
+                flog(f"\n[T{i}] {es}")
                 flog(f"  CL={cl}")
                 exp = set(dm.df[pm.fillna(False)]["id"].tolist())
 
@@ -1883,7 +1946,7 @@ def run_pqs_mode(rounds=100, seed=None):
                 pi = random.randint(0, len(dm.df) - 1)
                 pr = dm.df.iloc[pi].to_dict()
                 pid = pr["id"]
-                d = random.randint(2, 8)
+                d = random.randint(3, 13)
                 try:
                     # 30% chance: use multi-field joint expression for higher coverage
                     if random.random() < 0.3:
@@ -1898,6 +1961,7 @@ def run_pqs_mode(rounds=100, seed=None):
                     flog(f"[T{i}] Gen err: {e}"); skip += 1; continue
                 if not pf: skip += 1; continue
                 flog(f"\n[T{i}] Pivot:{pid}")
+                flog(f"  Expr: {pe}")
                 try:
                     res = col.query.fetch_objects(filters=pf, limit=lim)
                     ri = set(str(o.uuid) for o in res.objects)
