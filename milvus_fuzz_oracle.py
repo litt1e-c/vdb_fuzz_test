@@ -31,7 +31,7 @@ FLUSH_INTERVAL = 500     # 每 500 条刷盘
 
 # 稳定的索引类型列表（移除不稳定或需要特殊配置的索引）
 ALL_INDEX_TYPES = [
-    "FLAT", "HNSW", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"
+    "FLAT", "HNSW", "IVF_FLAT", "IVF_SQ8", "IVF_PQ", "DISKANN"
 ]
 # 注意：INDEX_TYPE 等随机变量移到 run() 内部，在种子设置后初始化，保证可重复性
 INDEX_TYPE = None  # 延迟初始化
@@ -74,6 +74,14 @@ SCALAR_INDEX_TYPES = {
     # DataType.JSON:  ["INVERTED"],
     DataType.ARRAY:   ["BITMAP", "INVERTED"],
 }
+
+# 支持的数组元素类型（用于随机生成多类型数组字段）
+ALL_ARRAY_ELEMENT_TYPES = [
+    DataType.INT8, DataType.INT16, DataType.INT32, DataType.INT64,
+    DataType.FLOAT, DataType.DOUBLE,
+    DataType.BOOL, DataType.VARCHAR,
+]
+
 # 标量索引创建概率（每个字段有多大概率被创建索引，延迟初始化）
 SCALAR_INDEX_PROBABILITY = None
 
@@ -162,8 +170,9 @@ class DataManager:
                 row[fname] = base_obj
             elif ftype == DataType.ARRAY:
                 # 与schema中的array_capacity一致
+                elem_type = field.get("element_type", DataType.INT64)
                 arr_len = rng.integers(1, min(self.array_capacity, 10) + 1)
-                row[fname] = [int(x) for x in rng.integers(0, 100, size=arr_len)]
+                row[fname] = self._gen_array_data(rng, elem_type, arr_len)
         return row
 
     def generate_single_vector(self):
@@ -210,6 +219,26 @@ class DataManager:
         chars = string.ascii_letters + string.digits
         return ''.join(random.choices(chars, k=random.randint(min_len, max_len)))
 
+    def _gen_array_data(self, rng, element_type, length):
+        """根据元素类型生成数组数据"""
+        length = int(length)
+        if element_type in ALL_INT_TYPES:
+            lo, hi = INT_RANGES.get(element_type, (-100, 100))
+            effective_lo = max(lo, -100)
+            effective_hi = min(hi, 100)
+            return [int(x) for x in rng.integers(effective_lo, effective_hi, size=length)]
+        elif element_type in ALL_FLOAT_TYPES:
+            vals = rng.random(length) * 200 - 100  # [-100, 100]
+            if element_type == DataType.FLOAT:
+                vals = vals.astype(np.float32).astype(np.float64)
+            return [float(x) for x in vals]
+        elif element_type == DataType.BOOL:
+            return [bool(rng.choice([True, False])) for _ in range(length)]
+        elif element_type == DataType.VARCHAR:
+            return [self._random_string(1, 8) for _ in range(length)]
+        else:
+            return [int(x) for x in rng.integers(0, 100, size=length)]
+
     def generate_schema(self):
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
@@ -221,12 +250,26 @@ class DataManager:
             self.schema_config.append({"name": f"c{i}", "type": ftype})
 
         self.schema_config.append({"name": "meta_json", "type": DataType.JSON})
-        self.schema_config.append({
-            "name": "tags_array",
-            "type": DataType.ARRAY,
-            "element_type": DataType.INT64,
-            "max_capacity": self.array_capacity
-        })
+
+        # 生成1-3个不同元素类型的数组字段（增强覆盖率）
+        num_arrays = random.randint(1, 3)
+        used_element_types = set()
+        for arr_i in range(num_arrays):
+            remaining = [t for t in ALL_ARRAY_ELEMENT_TYPES if t not in used_element_types]
+            if remaining:
+                elem_type = random.choice(remaining)
+            else:
+                elem_type = random.choice(ALL_ARRAY_ELEMENT_TYPES)
+            used_element_types.add(elem_type)
+            elem_name = get_type_name(elem_type).lower()
+            arr_name = f"arr_{elem_name}_{arr_i}"
+            arr_config = {
+                "name": arr_name,
+                "type": DataType.ARRAY,
+                "element_type": elem_type,
+                "max_capacity": self.array_capacity
+            }
+            self.schema_config.append(arr_config)
 
         print(f"   -> Generated {len(self.schema_config)} dynamic fields (plus id & vector).")
         print("   -> Schema Structure:")
@@ -287,10 +330,11 @@ class DataManager:
                     json_list.append(base_obj)
                 data[fname] = json_list
             elif ftype == DataType.ARRAY:
+                elem_type = field.get("element_type", DataType.INT64)
                 arr_list = []
                 for _ in range(N):
                     length = random.randint(0, 5)
-                    arr_list.append(list(rng.integers(0, 100, size=length)))
+                    arr_list.append(self._gen_array_data(rng, elem_type, length))
                 data[fname] = arr_list
 
             mask = rng.random(N) < self.null_ratio
@@ -329,11 +373,16 @@ class MilvusManager:
 
         for fc in schema_config:
             if fc["type"] == DataType.ARRAY:
-                fields.append(FieldSchema(
-                    name=fc["name"], dtype=DataType.ARRAY,
-                    element_type=fc["element_type"], max_capacity=fc["max_capacity"],
-                    nullable=True
-                ))
+                arr_kwargs = {
+                    "name": fc["name"],
+                    "dtype": DataType.ARRAY,
+                    "element_type": fc["element_type"],
+                    "max_capacity": fc["max_capacity"],
+                    "nullable": True
+                }
+                if fc["element_type"] == DataType.VARCHAR:
+                    arr_kwargs["max_length"] = 256
+                fields.append(FieldSchema(**arr_kwargs))
             else:
                 fields.append(FieldSchema(name=fc["name"], dtype=fc["type"], nullable=True, max_length=512))
 
@@ -444,6 +493,14 @@ class MilvusManager:
                 "params": {"nlist": 128, "m": 8, "nbits": 8}
             }
 
+        elif INDEX_TYPE == "DISKANN":
+            print("🔨 Building DISKANN Index (Disk-based ANN)...")
+            index_params = {
+                "metric_type": METRIC_TYPE,
+                "index_type": "DISKANN",
+                "params": {}
+            }
+
         try:
             # 创建向量索引
             self.col.create_index("vector", index_params, index_name=VECTOR_INDEX_NAME)
@@ -481,7 +538,16 @@ class MilvusManager:
                 continue
 
             # 从适用的索引类型中随机选一个
-            applicable_types = SCALAR_INDEX_TYPES[ftype]
+            applicable_types = list(SCALAR_INDEX_TYPES[ftype])
+
+            # 【修复】ARRAY 字段的 BITMAP 索引仅支持 bool/int/string 元素类型
+            if ftype == DataType.ARRAY:
+                elem_type = field.get("element_type", DataType.INT64)
+                if elem_type in ALL_FLOAT_TYPES:
+                    applicable_types = [t for t in applicable_types if t != "BITMAP"]
+                if not applicable_types:
+                    applicable_types = ["INVERTED"]
+
             chosen_type = random.choice(applicable_types)
 
             try:
@@ -532,7 +598,16 @@ class MilvusManager:
             if random.random() > rebuild_prob:
                 continue
 
-            applicable_types = SCALAR_INDEX_TYPES[ftype]
+            applicable_types = list(SCALAR_INDEX_TYPES[ftype])
+
+            # 【修复】ARRAY 字段的 BITMAP 索引仅支持 bool/int/string 元素类型
+            if ftype == DataType.ARRAY:
+                elem_type = field.get("element_type", DataType.INT64)
+                if elem_type in ALL_FLOAT_TYPES:
+                    applicable_types = [t for t in applicable_types if t != "BITMAP"]
+                if not applicable_types:
+                    applicable_types = ["INVERTED"]
+
             # 尝试选择一个不同于之前的索引类型（最大化覆盖）
             old_type = old_indexes.get(fname)
             candidates = [t for t in applicable_types if t != old_type]
@@ -842,10 +917,15 @@ class OracleQueryGenerator:
                 mask = series.apply(safe_compare_scalar("==", val_bool)).astype("boolean")
 
         elif ftype in ALL_INT_TYPES:
+            # 【新增】15% 概率生成算术表达式
+            if random.random() < 0.15:
+                arith_res = self._gen_arithmetic_oracle_expr(name, ftype, series)
+                if arith_res:
+                    return arith_res
             # 加入 in / not in 覆盖
             if random.random() < 0.25:
                 items = _sample_in_list(max_items=5)
-                # 兆底：确保至少有一个值
+                # 兜底：确保至少有一个值
                 if not items:
                     items = [int(val)]
                 items = [int(_normalize_scalar(x)) for x in items]
@@ -865,6 +945,11 @@ class OracleQueryGenerator:
                 mask = series.apply(safe_compare_scalar(op, val_int)).astype("boolean")
 
         elif ftype in ALL_FLOAT_TYPES:
+            # 【新增】15% 概率生成算术表达式
+            if random.random() < 0.15:
+                arith_res = self._gen_arithmetic_oracle_expr(name, ftype, series)
+                if arith_res:
+                    return arith_res
             val_float = float(val)
             # 🚨 关键回退：移除 "==", "!=" 以避免 IEEE 754 精度误报
             op = random.choice([">", "<", ">=", "<="])
@@ -1022,6 +1107,21 @@ class OracleQueryGenerator:
                 else:
                     return (f"{name} is not null", series.notnull().astype("boolean"))
 
+        elif ftype == DataType.ARRAY:
+            # 【新增】ARRAY 表达式处理（从官方测试脚本借鉴）
+            elem_type = None
+            for fc in self.schema:
+                if fc["name"] == name:
+                    elem_type = fc.get("element_type", DataType.INT64)
+                    break
+            if elem_type is None:
+                elem_type = DataType.INT64
+
+            arr_result = self._gen_array_oracle_expr(name, series, elem_type)
+            if arr_result and arr_result[0]:
+                return arr_result
+            return (f"{name} is not null", series.notnull().astype("boolean"))
+
         if mask is not None:
             # 对原子比较统一加非空护栏，规避 Milvus 的 NULL 比较歧义
             if ftype in [DataType.BOOL] + ALL_INT_TYPES + ALL_FLOAT_TYPES + [DataType.VARCHAR]:
@@ -1041,6 +1141,292 @@ class OracleQueryGenerator:
             return (expr, mask)
 
         return ("", None)
+
+    def _gen_array_oracle_expr(self, name, series, element_type):
+        """
+        【新增】为 ARRAY 字段生成带 Oracle mask 的表达式。
+        覆盖: array_contains, array_length, 数组下标访问, array_contains_all/any
+        灵感来源: 官方测试脚本中的数组操作覆盖模式。
+        """
+        strategy = random.choice([
+            "contains", "length", "subscript", "contains_all", "contains_any"
+        ])
+        notnull_mask = series.notnull().astype("boolean")
+
+        def _sample_element(s, etype):
+            """从现有数据中采样一个数组元素值"""
+            for val in s.dropna().values:
+                if isinstance(val, list) and len(val) > 0:
+                    items = [x for x in val if x is not None]
+                    if items:
+                        return random.choice(items)
+            # 兜底: 生成一个默认值
+            if etype in ALL_INT_TYPES:
+                return random.randint(-50, 50)
+            elif etype in ALL_FLOAT_TYPES:
+                return round(random.uniform(-50, 50), 4)
+            elif etype == DataType.BOOL:
+                return random.choice([True, False])
+            elif etype == DataType.VARCHAR:
+                return ''.join(random.choices(string.ascii_lowercase, k=4))
+            return 0
+
+        def _format_val(v, etype):
+            """格式化值为 Milvus 表达式字面量"""
+            if isinstance(v, bool):
+                return str(v).lower()
+            if isinstance(v, str):
+                safe = v.replace('\\', '\\\\').replace('"', '\\"')
+                return f'"{safe}"'
+            if isinstance(v, float):
+                return str(v)
+            return str(v)
+
+        # --- 策略 1: array_contains ---
+        if strategy == "contains":
+            target = _sample_element(series, element_type)
+            val_str = _format_val(target, element_type)
+            expr = f"array_contains({name}, {val_str})"
+
+            def check_contains(x, _target=target):
+                if x is None: return None
+                if not isinstance(x, list): return False
+                return _target in x
+
+            mask = series.apply(check_contains).astype("boolean")
+            return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+        # --- 策略 2: array_length ---
+        elif strategy == "length":
+            length_val = random.randint(0, 5)
+            op = random.choice(["==", ">", "<", ">=", "<="])
+            expr = f"array_length({name}) {op} {length_val}"
+
+            def check_length(x, _op=op, _val=length_val):
+                if x is None: return None
+                if not isinstance(x, list): return False
+                l = len(x)
+                if _op == "==": return l == _val
+                if _op == ">": return l > _val
+                if _op == "<": return l < _val
+                if _op == ">=": return l >= _val
+                if _op == "<=": return l <= _val
+                return False
+
+            mask = series.apply(check_length).astype("boolean")
+            return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+        # --- 策略 3: 数组下标访问 (arr[idx] op val) ---
+        elif strategy == "subscript":
+            idx = random.randint(0, 2)
+            target = _sample_element(series, element_type)
+            val_str = _format_val(target, element_type)
+
+            if element_type in ALL_INT_TYPES + ALL_FLOAT_TYPES:
+                op = random.choice([">", "<", "==", ">=", "<="])
+                expr = f"{name}[{idx}] {op} {val_str}"
+
+                def check_subscript_num(x, _idx=idx, _op=op, _target=target):
+                    if x is None: return None
+                    if not isinstance(x, list) or len(x) <= _idx: return False
+                    v = x[_idx]
+                    if v is None: return False
+                    try:
+                        is_v_num = isinstance(v, (int, float)) and not isinstance(v, bool)
+                        is_t_num = isinstance(_target, (int, float)) and not isinstance(_target, bool)
+                        if not (is_v_num and is_t_num): return False
+                        if _op == "==": return v == _target
+                        if _op == ">": return v > _target
+                        if _op == "<": return v < _target
+                        if _op == ">=": return v >= _target
+                        if _op == "<=": return v <= _target
+                    except: return False
+                    return False
+
+                mask = series.apply(check_subscript_num).astype("boolean")
+                return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+            elif element_type == DataType.VARCHAR:
+                sub_op = random.choice(["eq", "like"])
+                if sub_op == "eq":
+                    expr = f'{name}[{idx}] == {val_str}'
+
+                    def check_str_sub(x, _idx=idx, _target=str(target)):
+                        if x is None: return None
+                        if not isinstance(x, list) or len(x) <= _idx: return False
+                        return x[_idx] == _target
+
+                    mask = series.apply(check_str_sub).astype("boolean")
+                    return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+                else:
+                    prefix = str(target)[:2] if len(str(target)) >= 2 else str(target)[:1]
+                    if any(c in prefix for c in ['%', '_', '"', '\\\\']):
+                        prefix = 'a'
+                    expr = f'{name}[{idx}] like "{prefix}%"'
+
+                    def check_like_sub(x, _idx=idx, _prefix=prefix):
+                        if x is None: return None
+                        if not isinstance(x, list) or len(x) <= _idx: return False
+                        v = x[_idx]
+                        if not isinstance(v, str): return False
+                        return v.startswith(_prefix)
+
+                    mask = series.apply(check_like_sub).astype("boolean")
+                    return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+            elif element_type == DataType.BOOL:
+                val_bool = random.choice([True, False])
+                expr = f"{name}[{idx}] == {str(val_bool).lower()}"
+
+                def check_bool_sub(x, _idx=idx, _val=val_bool):
+                    if x is None: return None
+                    if not isinstance(x, list) or len(x) <= _idx: return False
+                    return x[_idx] == _val
+
+                mask = series.apply(check_bool_sub).astype("boolean")
+                return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+            return (f"{name} is not null", notnull_mask)
+
+        # --- 策略 4: array_contains_all ---
+        elif strategy == "contains_all":
+            # 从同一行采样多个元素作为子集
+            targets = []
+            for val in series.dropna().values:
+                if isinstance(val, list) and len(val) >= 2:
+                    items = [x for x in val if x is not None]
+                    if len(items) >= 2:
+                        k = random.randint(2, min(3, len(items)))
+                        targets = random.sample(items, k)
+                        break
+            if not targets:
+                target = _sample_element(series, element_type)
+                targets = [target]
+
+            targets_str = json.dumps(targets)
+            expr = f"array_contains_all({name}, {targets_str})"
+
+            def check_contains_all(x, _targets=targets):
+                if x is None: return None
+                if not isinstance(x, list): return False
+                return all(t in x for t in _targets)
+
+            mask = series.apply(check_contains_all).astype("boolean")
+            return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+        # --- 策略 5: array_contains_any ---
+        elif strategy == "contains_any":
+            target = _sample_element(series, element_type)
+            # 混入一个不存在的值
+            if element_type == DataType.VARCHAR:
+                noise = "zzzz_nonexist"
+            elif element_type == DataType.BOOL:
+                noise = not target
+            else:
+                noise = 999999
+            targets = [target, noise]
+            targets_str = json.dumps(targets)
+            expr = f"array_contains_any({name}, {targets_str})"
+
+            def check_contains_any(x, _targets=targets):
+                if x is None: return None
+                if not isinstance(x, list): return False
+                return any(t in x for t in _targets)
+
+            mask = series.apply(check_contains_any).astype("boolean")
+            return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+        return (f"{name} is not null", notnull_mask)
+
+    def _gen_arithmetic_oracle_expr(self, name, ftype, series):
+        """
+        【新增】为数值类型生成算术表达式（Oracle 模式）。
+        覆盖: field + const, field - const, field * const, field % const
+        这些操作在 Milvus 内部走不同的执行路径，是 bug 高发区。
+        """
+        if ftype in ALL_INT_TYPES:
+            ops = ["+", "-", "*", "%"]
+        elif ftype in ALL_FLOAT_TYPES:
+            ops = ["+", "-", "*"]
+        else:
+            return None
+
+        op = random.choice(ops)
+        # 使用小操作数避免溢出
+        if op == "%":
+            operand = random.randint(2, 20)
+        elif op == "*":
+            operand = random.randint(1, 5)
+        else:
+            operand = random.randint(1, 50)
+
+        # 从实际数据采样一个值来计算阈值
+        valid_series = series.dropna()
+        if valid_series.empty:
+            return None
+
+        sample_val = valid_series.iloc[random.randint(0, len(valid_series) - 1)]
+        if hasattr(sample_val, 'item'):
+            sample_val = sample_val.item()
+
+        try:
+            if op == "+": expected = sample_val + operand
+            elif op == "-": expected = sample_val - operand
+            elif op == "*": expected = sample_val * operand
+            elif op == "%":
+                if operand == 0: return None
+                # 【关键】使用 C/Go 风格的截断除法取模（而非 Python 的欧几里得取模）
+                # Python: -47 % 20 = 13 (always non-negative)
+                # Go/C++: -47 % 20 = -7 (sign follows dividend)
+                expected = int(np.fmod(sample_val, operand))
+        except:
+            return None
+
+        if ftype in ALL_FLOAT_TYPES:
+            cmp_op = random.choice([">", "<", ">=", "<="])
+            delta = random.uniform(0.01, 1.0)
+            if cmp_op in [">", ">="]:
+                threshold = expected - delta
+            else:
+                threshold = expected + delta
+        else:
+            cmp_op = random.choice([">", "<", "==", ">=", "<="])
+            if cmp_op == "==":
+                threshold = expected
+            elif cmp_op in [">", ">="]:
+                threshold = expected - random.randint(1, 10)
+            else:
+                threshold = expected + random.randint(1, 10)
+
+        expr = f"{name} {op} {operand} {cmp_op} {threshold}"
+
+        def check_arith(x, _op=op, _operand=operand, _cmp_op=cmp_op, _threshold=threshold):
+            if x is None: return None
+            if isinstance(x, float) and np.isnan(x): return None
+            try:
+                if _op == "+": result = x + _operand
+                elif _op == "-": result = x - _operand
+                elif _op == "*": result = x * _operand
+                elif _op == "%":
+                    if _operand == 0: return False
+                    # C/Go 风格取模（截断除法）
+                    result = int(np.fmod(x, _operand))
+                else: return False
+
+                if _cmp_op == "==": return result == _threshold
+                if _cmp_op == ">": return result > _threshold
+                if _cmp_op == "<": return result < _threshold
+                if _cmp_op == ">=": return result >= _threshold
+                if _cmp_op == "<=": return result <= _threshold
+                return False
+            except:
+                return False
+
+        mask = series.apply(check_arith).astype("boolean")
+        notnull_mask = series.notnull().astype("boolean")
+        guarded_mask = mask & notnull_mask
+        guarded_expr = f"({name} is not null and ({expr}))"
+        return (guarded_expr, guarded_mask)
 
     def gen_constant_expr(self):
         """
@@ -1927,6 +2313,12 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                             "metric_type": METRIC_TYPE,
                             "params": {"nlist": 128}
                         }
+                    elif new_index_type == "DISKANN":
+                        create_params = {
+                            "index_type": "DISKANN",
+                            "metric_type": METRIC_TYPE,
+                            "params": {}
+                        }
                     else:
                         # FLAT 不需要额外参数
                         create_params = {
@@ -2249,6 +2641,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                             search_params = {"metric_type": current_metric_type, "params": {"ef": ef_param}}
                         elif CURRENT_INDEX_TYPE.startswith("IVF"):
                             search_params = {"metric_type": current_metric_type, "params": {"nprobe": 16}}
+                        elif CURRENT_INDEX_TYPE == "DISKANN":
+                            search_params = {"metric_type": current_metric_type, "params": {"search_list": max(20, search_k + 8)}}
                         else:  # FLAT 或其他
                             search_params = {"metric_type": current_metric_type, "params": {}}
 
@@ -2555,14 +2949,22 @@ class PQSQueryGenerator(OracleQueryGenerator):
             if valid_items:
                 subset = [random.choice(valid_items)]
                 # 添加一个肯定不存在的值作为噪音
-                subset.append("fake_val" if isinstance(subset[0], str) else 999999)
+                if isinstance(subset[0], bool):
+                    subset.append(not subset[0])
+                elif isinstance(subset[0], str):
+                    subset.append("fake_val")
+                else:
+                    subset.append(999999)
                 strategies.append(f'array_contains_any({fname}, {json.dumps(subset)})')
 
             # 策略 5: [新增] 数组元素直接索引 (Milvus 支持 array[0])
             if length > 0:
                 idx = random.randint(0, length - 1)
                 item = val[idx]
-                if isinstance(item, (int, float)):
+                # 注意: isinstance(True, int) == True, 必须先检查 bool
+                if isinstance(item, bool):
+                    strategies.append(f'{fname}[{idx}] == {str(item).lower()}')
+                elif isinstance(item, (int, float)):
                     strategies.append(f'{fname}[{idx}] == {item}')
                 elif isinstance(item, str):
                     strategies.append(f'{fname}[{idx}] == {json.dumps(item)}')
@@ -2877,12 +3279,12 @@ class PQSQueryGenerator(OracleQueryGenerator):
         else:
             operand = random.randint(1, 100)
 
-        # 计算预期结果 (Python)
+        # 计算预期结果 (使用 C/Go 风格取模，与 Milvus 一致)
         try:
             if op == "+": res = val + operand
             elif op == "-": res = val - operand
             elif op == "*": res = val * operand
-            elif op == "%": res = val % operand
+            elif op == "%": res = int(np.fmod(val, operand))
         except:
             return None
 
@@ -3473,6 +3875,8 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                 idx_params_dict = {"ef": 64}
             elif INDEX_TYPE.startswith("IVF"):
                 idx_params_dict = {"nprobe": 10}
+            elif INDEX_TYPE == "DISKANN":
+                idx_params_dict = {"search_list": 30}
             
             search_params = {
                 "data": [q_vec],
@@ -3609,7 +4013,7 @@ if __name__ == "__main__":
     group.add_argument("--equiv", action="store_true", help="Run Equivalence Mode")
     group.add_argument("--groupby-test", action="store_true", help="Run GroupBy Test Mode")
 
-    parser.add_argument("--pqs-rounds", type=int, default=1000, help="Rounds for PQS mode (implies --pqs if set explicitly, but better to use --pqs)")
+    parser.add_argument("--pqs-rounds", type=int, default=None, help="Override rounds for PQS mode (default: use --rounds)")
 
     args = parser.parse_args()
 
@@ -3638,13 +4042,12 @@ if __name__ == "__main__":
     print(f"   Chaos Rate: {CHAOS_RATE}")
     print(f"   Consistency: {args.consistency if args.consistency else '(Random)'}")
 
-    if args.pqs or (args.pqs_rounds != 1000 and not args.equiv and not args.groupby_test):
-        # Implicitly enable PQS if pqs_rounds is modified from default, or explicit --pqs
-        # Note: The logic 'args.pqs_rounds != 1000' is a heuristic for backward compat if the user just set --pqs-rounds
+    pqs_rounds = args.pqs_rounds if args.pqs_rounds is not None else args.rounds
+    if args.pqs or (args.pqs_rounds is not None and not args.equiv and not args.groupby_test):
         print(f"   Mode: PQS (Predicate Query Search)")
-        print(f"   Rounds: {args.pqs_rounds}")
+        print(f"   Rounds: {pqs_rounds}")
         print("=" * 80)
-        run_pqs_mode(rounds=args.pqs_rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
+        run_pqs_mode(rounds=pqs_rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops)
     
     elif args.equiv:
         print(f"   Mode: Equivalence Test")
