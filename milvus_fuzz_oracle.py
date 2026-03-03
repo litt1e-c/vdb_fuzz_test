@@ -1043,12 +1043,15 @@ class OracleQueryGenerator:
                         if isinstance(target_item, bool):
                             item_str = item_str.lower()
                         expr = f'json_contains({name}["{k}"], {item_str})'
-                        # 【修复】使用默认参数绑定
+                        # 【修复】3VL: NULL / 缺失键 / null值 → UNKNOWN (None → <NA>)
                         def check_list_contains(x, _k=k, _target_item=target_item):
-                            if x is None: return False
-                            if not isinstance(x, dict): return False
-                            if _k not in x or not isinstance(x[_k], list): return False
-                            return _target_item in x[_k]
+                            if x is None: return None           # NULL JSON → UNKNOWN
+                            if not isinstance(x, dict): return None
+                            if _k not in x: return None         # 缺失键 → UNKNOWN
+                            val = x[_k]
+                            if val is None: return None          # 显式 null → UNKNOWN
+                            if not isinstance(val, list): return False  # 非数组 → FALSE
+                            return _target_item in val
                         mask = series.apply(check_list_contains).astype("boolean")
                     else: return (f"{name} is not null", series.notnull().astype("boolean"))
                 else: return (f"{name} is not null", series.notnull().astype("boolean"))
@@ -1348,11 +1351,15 @@ class OracleQueryGenerator:
         # --- 策略 5: array_contains_any ---
         elif strategy == "contains_any":
             target = _sample_element(series, element_type)
-            # 混入一个不存在的值
+            # 混入一个不存在的值 (需要避免溢出窄整型)
             if element_type == DataType.VARCHAR:
                 noise = "zzzz_nonexist"
             elif element_type == DataType.BOOL:
                 noise = not target
+            elif element_type in (DataType.INT8, DataType.INT16):
+                lo, hi = INT_RANGES[element_type]
+                # 取一个在范围内但 ≠ target 的极端值
+                noise = lo if target != lo else hi
             else:
                 noise = 999999
             targets = [target, noise]
@@ -2612,8 +2619,48 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
 
                     # 记录与展示具体数据行，便于一眼确认异常
                     if cl != "Strong":
-                        # 非 Strong: 只记日志, 不深入验证, 不计入 failed_cases
-                        pass
+                        # 非 Strong: 记日志 + 输出遗漏/多余 ID 样本, 不计入 failed_cases
+                        if missing:
+                            missing_rows = sample_rows(missing)
+                            file_log(f"  WARN Missing IDs sample ({len(missing_rows)}/{len(missing)}): {missing_rows}")
+                            print(f"   Missing IDs ({len(missing)}): {missing_rows}{'...' if len(missing) > 10 else ''}")
+                            for r in missing_rows:
+                                print(f"     {r}")
+                        if extra:
+                            extra_rows = sample_rows(extra)
+                            file_log(f"  WARN Extra IDs sample ({len(extra_rows)}/{len(extra)}): {extra_rows}")
+                            print(f"   Extra IDs ({len(extra)}): {extra_rows}{'...' if len(extra) > 10 else ''}")
+                            for r in extra_rows:
+                                print(f"     {r}")
+
+                            print("\n   🔍 Verifying Extra IDs individually:")
+                            for eid in list(extra)[:5]:
+                                try:
+                                    verify_res = mm.col.query(
+                                        f"id == {eid}",
+                                        output_fields=["id"],
+                                        limit=1,
+                                        consistency_level="Strong"
+                                    )
+                                    exists_in_db = len(verify_res) > 0
+
+                                    combined_expr = f"({expr_str}) and (id == {eid})"
+                                    match_res = mm.col.query(
+                                        combined_expr,
+                                        output_fields=["id"],
+                                        limit=1,
+                                        consistency_level="Strong"
+                                    )
+                                    matches_expr = len(match_res) > 0
+
+                                    print(f"     ID {eid}: exists={exists_in_db}, matches_original_expr={matches_expr}")
+                                    file_log(f"  Extra ID {eid} verification: exists={exists_in_db}, matches={matches_expr}")
+
+                                except Exception as ve:
+                                    print(f"     ID {eid}: verification failed - {ve}")
+                                    file_log(f"  Extra ID {eid} verification error: {ve}")
+                        if not missing and not extra:
+                            file_log(f"  WARN: diff_msg empty but sets differ (should not happen)")
                     else:
                         # Strong: 完整的错误分析
                         if missing:
