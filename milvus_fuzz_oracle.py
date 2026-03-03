@@ -641,6 +641,37 @@ class OracleQueryGenerator:
         chars = string.ascii_letters + string.digits
         return ''.join(random.choices(chars, k=random.randint(min_len, max_len)))
 
+    @staticmethod
+    def _float_safe_range(result, is_float32):
+        """
+        生成经过 Milvus FLOAT 字面量隐式降精度后仍然正确的范围边界。
+
+        [BUG WORKAROUND] Milvus 会将表达式中的浮点字面量隐式转换为字段存储类型
+        (FLOAT → float32) 再与运算结果比较。若容差 < float32 ULP，上下界会坍缩
+        到同一个 float32 值，导致范围查询返回空结果。
+
+        解决方案: 对 FLOAT 字段使用 float32 nextafter 边界 (跳过 2 个 ULP)。
+        TODO: Milvus 修复字面量精度处理后移除此 workaround。
+        """
+        if is_float32:
+            f32 = np.float32(result)
+            lo = f32
+            hi = f32
+            for _ in range(2):
+                lo = np.nextafter(lo, np.float32(-np.inf))
+                hi = np.nextafter(hi, np.float32(np.inf))
+            return float(lo), float(hi)
+        else:
+            epsilon = max(0.001, abs(result) * 1e-12)
+            return result - epsilon, result + epsilon
+
+    def _get_field_type(self, fname):
+        """根据字段名查找字段类型（用于 PQS 模式中不直接传递 ftype 的场景）"""
+        for f in self.schema:
+            if f["name"] == fname:
+                return f["type"]
+        return None
+
     def _get_json_val(self, obj, keys):
         try:
             if obj is None: return None
@@ -1384,11 +1415,23 @@ class OracleQueryGenerator:
 
         if ftype in ALL_FLOAT_TYPES:
             cmp_op = random.choice([">", "<", ">=", "<="])
-            delta = random.uniform(0.01, 1.0)
-            if cmp_op in [">", ">="]:
-                threshold = expected - delta
+            if ftype == DataType.FLOAT:
+                # [WORKAROUND] FLOAT 字段: 确保 delta 远大于 float32 ULP，
+                # 并将 threshold 对齐到 float32 以匹配 Milvus 隐式降精度行为
+                f32_expected = np.float32(expected)
+                ulp = float(np.nextafter(np.abs(f32_expected), np.float32(np.inf))) - float(np.abs(f32_expected))
+                min_delta = max(ulp * 4, 0.01)
+                delta = random.uniform(min_delta, min_delta + 1.0)
+                if cmp_op in [">", ">="]:
+                    threshold = float(np.float32(expected - delta))
+                else:
+                    threshold = float(np.float32(expected + delta))
             else:
-                threshold = expected + delta
+                delta = random.uniform(0.01, 1.0)
+                if cmp_op in [">", ">="]:
+                    threshold = expected - delta
+                else:
+                    threshold = expected + delta
         else:
             cmp_op = random.choice([">", "<", "==", ">=", "<="])
             if cmp_op == "==":
@@ -2800,7 +2843,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 elif ftype in ALL_INT_TYPES:
                     exprs.append(self._gen_boundary_int(fname, val))
                 elif ftype in ALL_FLOAT_TYPES:
-                    exprs.append(self._gen_boundary_float(fname, val))
+                    exprs.append(self._gen_boundary_float(fname, val, ftype))
                 elif ftype == DataType.VARCHAR:
                     exprs.append(self._gen_boundary_str(fname, val))
             except:
@@ -2893,16 +2936,16 @@ class PQSQueryGenerator(OracleQueryGenerator):
         elif ftype in ALL_INT_TYPES:
             # 30% 概率生成算术表达式，否则使用边界表达式
             if random.random() < 0.3:
-                res = self.gen_arithmetic_expr(fname, val)
+                res = self.gen_arithmetic_expr(fname, val, ftype)
                 if res: return res
             return self._gen_boundary_int(fname, val)
 
         elif ftype in ALL_FLOAT_TYPES:
             # 30% 概率生成算术表达式，否则使用边界表达式
             if random.random() < 0.3:
-                res = self.gen_arithmetic_expr(fname, val)
+                res = self.gen_arithmetic_expr(fname, val, ftype)
                 if res: return res
-            return self._gen_boundary_float(fname, val)
+            return self._gen_boundary_float(fname, val, ftype)
 
         # --- 集成高级 LIKE 测试 ---
         elif ftype == DataType.VARCHAR:
@@ -3047,16 +3090,19 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         return random.choice(strategies)
 
-    def _gen_boundary_float(self, fname, val):
+    def _gen_boundary_float(self, fname, val, ftype=None):
 
         val = float(val)
         strategies = []
 
         # 1. 基础范围 (浮点数不建议用 ==)
-        epsilon = 1e-5
-        strategies.append(f"({fname} > {val - epsilon} and {fname} < {val + epsilon})")
+        # [WORKAROUND] FLOAT 字段: 使用 float32 ULP-aware 边界
+        is_f32 = (ftype == DataType.FLOAT)
+        lo, hi = self._float_safe_range(val, is_f32)
+        strategies.append(f"({fname} > {lo} and {fname} < {hi})")
 
-        # 2. 宽松范围
+        # 2. 宽松范围 (>= / <= 对 float32 降精度天然安全，使用固定 epsilon 即可)
+        epsilon = 1e-5
         strategies.append(f"{fname} >= {val - epsilon}")
         strategies.append(f"{fname} <= {val + epsilon}")
 
@@ -3256,7 +3302,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         return None
 
-    def gen_arithmetic_expr(self, fname, val):
+    def gen_arithmetic_expr(self, fname, val, ftype=None):
         """
         针对数值类型生成算术运算查询。
         目标：测试 +, -, *, %, ** 是否导致 Crash 或计算错误。
@@ -3290,8 +3336,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         # 构造 Milvus 表达式
         # 注意：浮点数比较需要用范围
+        # [WORKAROUND] FLOAT 字段的字面量会被 Milvus 隐式降精度到 float32
         if isinstance(res, float):
-            return f"({fname} {op} {operand} > {res - 0.001} and {fname} {op} {operand} < {res + 0.001})"
+            is_f32 = (ftype == DataType.FLOAT)
+            lo, hi = self._float_safe_range(res, is_f32)
+            return f"({fname} {op} {operand} > {lo} and {fname} {op} {operand} < {hi})"
         else:
             # 整数可以直接比较，也可以偶尔用 != 混淆
             if random.random() < 0.5:
