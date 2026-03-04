@@ -2050,6 +2050,10 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                         expr = f"id in {del_ids}"
                         mm.col.delete(expr)
                         mm.col.flush()
+                        mm.col.compact()
+                        mm.col.wait_for_compaction_completed()
+                        mm.col.release()
+                        mm.col.load()
                         idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
                         dm.df = dm.df.drop(idx).reset_index(drop=True)
                         dm.vectors = np.delete(dm.vectors, idx, axis=0)
@@ -2077,6 +2081,10 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                     try:
                         mm.col.upsert(rows_with_vec)
                         mm.col.flush()
+                        mm.col.compact()
+                        mm.col.wait_for_compaction_completed()
+                        mm.col.release()
+                        mm.col.load()
                         for row, row_with_vec in zip(upsert_rows, rows_with_vec):
                             rid = row["id"]
                             match_idx = dm.df.index[dm.df["id"] == rid].tolist()
@@ -2458,6 +2466,10 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                             expr = f"id in {del_ids}"
                             mm.col.delete(expr)
                             mm.col.flush()
+                            mm.col.compact()
+                            mm.col.wait_for_compaction_completed()
+                            mm.col.release()
+                            mm.col.load()
                             idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
                             dm.df = dm.df.drop(idx).reset_index(drop=True)
                             dm.vectors = np.delete(dm.vectors, idx, axis=0)
@@ -2502,6 +2514,10 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     try:
                         mm.col.upsert(rows_with_vec)
                         mm.col.flush()
+                        mm.col.compact()
+                        mm.col.wait_for_compaction_completed()
+                        mm.col.release()
+                        mm.col.load()
 
                         for row, row_with_vec in zip(upsert_rows, rows_with_vec):
                             rid = row["id"]
@@ -3650,6 +3666,10 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                         expr = f"id in {del_ids}"
                         mm.col.delete(expr)
                         mm.col.flush()
+                        mm.col.compact()
+                        mm.col.wait_for_compaction_completed()
+                        mm.col.release()
+                        mm.col.load()
                         idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
                         dm.df = dm.df.drop(idx).reset_index(drop=True)
                         dm.vectors = np.delete(dm.vectors, idx, axis=0)
@@ -3679,6 +3699,10 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                     try:
                         mm.col.upsert(rows_with_vec)
                         mm.col.flush()
+                        mm.col.compact()
+                        mm.col.wait_for_compaction_completed()
+                        mm.col.release()
+                        mm.col.load()
                         for row, row_with_vec in zip(upsert_rows, rows_with_vec):
                             rid = row["id"]
                             match_idx = dm.df.index[dm.df["id"] == rid].tolist()
@@ -3736,7 +3760,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
 
             try:
                 start_t = time.time()
-                res = mm.col.query(expr, output_fields=["id"], limit=10000)
+                res = mm.col.query(expr, output_fields=["id"], limit=10000, consistency_level="Strong")
                 cost = (time.time() - start_t) * 1000
                 found_ids = set([r["id"] for r in res])
 
@@ -3881,6 +3905,10 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                         expr = f"id in {del_ids}"
                         mm.col.delete(expr)
                         mm.col.flush()
+                        mm.col.compact()
+                        mm.col.wait_for_compaction_completed()
+                        mm.col.release()
+                        mm.col.load()
                         idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
                         dm.df = dm.df.drop(idx).reset_index(drop=True)
                         dm.vectors = np.delete(dm.vectors, idx, axis=0)
@@ -3909,6 +3937,10 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                     try:
                         mm.col.upsert(rows_with_vec)
                         mm.col.flush()
+                        mm.col.compact()
+                        mm.col.wait_for_compaction_completed()
+                        mm.col.release()
+                        mm.col.load()
                         for row, row_with_vec in zip(upsert_rows, rows_with_vec):
                             rid = row["id"]
                             match_idx = dm.df.index[dm.df["id"] == rid].tolist()
