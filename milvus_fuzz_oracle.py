@@ -110,6 +110,43 @@ def get_type_name(dtype):
     }
     return type_map.get(dtype, str(dtype))
 
+# --- Milvus 空值语义工具 ---
+# Milvus 将空 JSON {} 和空数组 [] 视为 null，pandas 不会。
+# 此工具函数确保 Oracle 模型与 Milvus 行为一致。
+def milvus_is_empty(val):
+    """判断一个值在 Milvus 语义下是否为 null（None / NaN / [] / {}）"""
+    if val is None:
+        return True
+    if isinstance(val, float) and np.isnan(val):
+        return True
+    if isinstance(val, list) and len(val) == 0:
+        return True
+    if isinstance(val, dict) and len(val) == 0:
+        return True
+    return False
+
+def milvus_null_mask(series):
+    """返回一个 boolean mask，True 表示该值在 Milvus 中被视为 null。
+    用于替代 series.isnull()，额外处理 [] 和 {} 的情况。"""
+    return series.apply(milvus_is_empty).astype("boolean")
+
+def milvus_notnull_mask(series):
+    """返回一个 boolean mask，True 表示该值在 Milvus 中被视为非 null。
+    用于替代 series.notnull()，额外处理 [] 和 {} 的情况。"""
+    return (~series.apply(milvus_is_empty)).astype("boolean")
+
+def normalize_empty_to_none(df, schema_config):
+    """将 DataFrame 中的空数组 [] 和空 JSON {} 规范化为 None。
+    这确保 pandas Oracle 与 Milvus 的空值语义一致。"""
+    for fc in schema_config:
+        fname = fc["name"]
+        if fname not in df.columns:
+            continue
+        ftype = fc["type"]
+        if ftype in (DataType.ARRAY, DataType.JSON):
+            df[fname] = df[fname].apply(lambda x: None if milvus_is_empty(x) else x)
+    return df
+
 # 全局 ID 计数器（避免使用 time.time() 导致不可重复）
 _GLOBAL_ID_COUNTER = 0
 
@@ -184,7 +221,10 @@ class DataManager:
                 # 与schema中的array_capacity一致
                 elem_type = field.get("element_type", DataType.INT64)
                 arr_len = rng.integers(1, min(self.array_capacity, 10) + 1)
-                row[fname] = self._gen_array_data(rng, elem_type, arr_len)
+                arr_val = self._gen_array_data(rng, elem_type, arr_len)
+                # Milvus 将 [] 视为 null，不放入 row（同 None 处理）
+                if arr_val:
+                    row[fname] = arr_val
         return row
 
     def generate_single_vector(self):
@@ -355,6 +395,9 @@ class DataManager:
             data[fname] = temp_arr
 
         self.df = pd.DataFrame(data)
+        # 【关键】Milvus 将空数组 [] 和空 JSON {} 视为 null
+        # 规范化 pandas 数据使 Oracle 模型与 Milvus 一致
+        normalize_empty_to_none(self.df, self.schema_config)
         print("✅ Data Generation Complete.")
 
     # --- Schema Evolution Methods ---
@@ -916,11 +959,13 @@ class OracleQueryGenerator:
             # 兜底表达式，永远为真
             return ("id > 0", None)
         field = random.choice(json_fields); name = field["name"]; series = self.df[name]
+        # 【关键】使用 milvus_notnull_mask：Milvus 将 {} 视为 null
         # [WORKAROUND: Milvus NOT(UNKNOWN) Bug]
         # Milvus 对 NULL JSON 字段执行 NOT(UNKNOWN) 时可能错误返回 TRUE
         # 原始代码: 不使用 notnull_mask, 直接 return (expr, mask)
         # 现在: 所有 JSON 表达式包裹 (name is not null and (expr)), mask & notnull_mask
-        notnull_mask = series.notnull().astype("boolean")
+        # 【关键】使用 milvus_notnull_mask：Milvus 将 {} 视为 null
+        notnull_mask = milvus_notnull_mask(series)
         strategy = random.choice(["range", "nested", "index", "multi_key"])
 
         # --- 策略 1: Range ---
@@ -1075,12 +1120,14 @@ class OracleQueryGenerator:
         name, ftype = f["name"], f["type"]
         series = self.df[name]
 
-        # 1. Null Check (保持不变 - 这是绝对安全的)
+        # 1. Null Check
+        # 【关键】使用 milvus_null_mask / milvus_notnull_mask 代替 pandas 原生方法
+        # 因为 Milvus 将 [] 和 {} 视为 null，但 pandas 不会
         if random.random() < 0.15:
             if random.random() < 0.5:
-                return (f"{name} is null", series.isnull().astype("boolean"))
+                return (f"{name} is null", milvus_null_mask(series))
             else:
-                return (f"{name} is not null", series.notnull().astype("boolean"))
+                return (f"{name} is not null", milvus_notnull_mask(series))
 
         # 获取查询值
         val = self.get_value_for_query(name, ftype)
@@ -1269,8 +1316,8 @@ class OracleQueryGenerator:
                             if not isinstance(val, list): return False  # 非数组 → FALSE
                             return _target_item in val
                         mask = series.apply(check_list_contains).astype("boolean")
-                    else: return (f"{name} is not null", series.notnull().astype("boolean"))
-                else: return (f"{name} is not null", series.notnull().astype("boolean"))
+                    else: return (f"{name} is not null", milvus_notnull_mask(series))
+                else: return (f"{name} is not null", milvus_notnull_mask(series))
 
             # --- 策略 C: 下钻 (Drill-down) ---
             else:
@@ -1355,7 +1402,7 @@ class OracleQueryGenerator:
 
                     mask = series.apply(safe_check_json).astype("boolean")
                 else:
-                    return (f"{name} is not null", series.notnull().astype("boolean"))
+                    return (f"{name} is not null", milvus_notnull_mask(series))
 
         elif ftype == DataType.ARRAY:
             # 【新增】ARRAY 表达式处理（从官方测试脚本借鉴）
@@ -1370,19 +1417,19 @@ class OracleQueryGenerator:
             arr_result = self._gen_array_oracle_expr(name, series, elem_type)
             if arr_result and arr_result[0]:
                 return arr_result
-            return (f"{name} is not null", series.notnull().astype("boolean"))
+            return (f"{name} is not null", milvus_notnull_mask(series))
 
         if mask is not None:
             # 对原子比较统一加非空护栏，规避 Milvus 的 NULL 比较歧义
             if ftype in [DataType.BOOL] + ALL_INT_TYPES + ALL_FLOAT_TYPES + [DataType.VARCHAR]:
-                notnull_mask = series.notnull().astype("boolean")
+                notnull_mask = milvus_notnull_mask(series)
                 guarded_mask = mask.astype("boolean") & notnull_mask
                 guarded_expr = f"({name} is not null and ({expr}))"
                 return (guarded_expr, guarded_mask)
 
             if ftype == DataType.JSON:
                 if expr and not expr.startswith("exists(") and not expr.startswith("json_contains("):
-                    notnull_mask = series.notnull().astype("boolean")
+                    notnull_mask = milvus_notnull_mask(series)
                     guarded_mask = mask.astype("boolean") & notnull_mask
                     guarded_expr = f"({name} is not null and ({expr}))"
                     return (guarded_expr, guarded_mask)
@@ -1401,7 +1448,8 @@ class OracleQueryGenerator:
         strategy = random.choice([
             "contains", "length", "subscript", "contains_all", "contains_any"
         ])
-        notnull_mask = series.notnull().astype("boolean")
+        # 【关键】使用 milvus_notnull_mask：Milvus 将 [] 视为 null
+        notnull_mask = milvus_notnull_mask(series)
 
         def _sample_element(s, etype):
             """从现有数据中采样一个数组元素值"""
@@ -1689,7 +1737,7 @@ class OracleQueryGenerator:
                 return False
 
         mask = series.apply(check_arith).astype("boolean")
-        notnull_mask = series.notnull().astype("boolean")
+        notnull_mask = milvus_notnull_mask(series)
         guarded_mask = mask & notnull_mask
         guarded_expr = f"({name} is not null and ({expr}))"
         return (guarded_expr, guarded_mask)
@@ -1763,7 +1811,7 @@ class OracleQueryGenerator:
             if ftype in ALL_INT_TYPES + ALL_FLOAT_TYPES:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
+                    return (f"not ({name} is null)", milvus_notnull_mask(series))
                 op = random.choice([">", "<", ">=", "<="])
                 inner_expr = f"{name} {op} {val}"
                 expr = f"not ({inner_expr})"
@@ -1787,7 +1835,7 @@ class OracleQueryGenerator:
             elif ftype == DataType.VARCHAR:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
+                    return (f"not ({name} is null)", milvus_notnull_mask(series))
                 inner_expr = f'{name} == "{val}"'
                 expr = f"not ({inner_expr})"
                 def safe_eq(x, _val=val):
@@ -1831,20 +1879,20 @@ class OracleQueryGenerator:
                     except: return False  # JSON访问异常 → Milvus返回FALSE
                 inner_mask = series.apply(check_json_gt).astype("boolean")
                 # [WORKAROUND: NOT(UNKNOWN)] 原始: mask = ~inner_mask; return (expr, mask)
-                notnull_mask = series.notnull().astype("boolean")
+                notnull_mask = milvus_notnull_mask(series)
                 inner_mask_guarded = inner_mask & notnull_mask
                 mask = ~inner_mask_guarded
                 return (expr, mask)
 
             # 兜底
-            return (f"not ({name} is null)", series.notnull().astype("boolean"))
+            return (f"not ({name} is null)", milvus_notnull_mask(series))
 
         # --- 策略 2: NOT + 等值 ---
         elif strategy == "not_eq":
             if ftype in ALL_INT_TYPES:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
+                    return (f"not ({name} is null)", milvus_notnull_mask(series))
                 val_int = int(val)
                 expr = f"not ({name} == {val_int})"
                 def safe_eq_int(x, _val=val_int):
@@ -1856,18 +1904,18 @@ class OracleQueryGenerator:
                 mask = ~inner_mask
                 return (expr, mask)
             # 其他类型 fallthrough
-            return (f"not ({name} is null)", series.notnull().astype("boolean"))
+            return (f"not ({name} is null)", milvus_notnull_mask(series))
 
         # --- 策略 3: NOT (is null) ↔ is not null ---
         elif strategy == "not_is_null":
             expr = f"not ({name} is null)"
-            mask = series.notnull().astype("boolean")
+            mask = milvus_notnull_mask(series)
             return (expr, mask)
 
         # --- 策略 4: NOT (is not null) ↔ is null ---
         elif strategy == "not_is_not_null":
             expr = f"not ({name} is not null)"
-            mask = series.isnull().astype("boolean")
+            mask = milvus_null_mask(series)
             return (expr, mask)
 
         # --- 策略 5: NOT + AND (德摩根定律测试核心) ---
@@ -1875,7 +1923,7 @@ class OracleQueryGenerator:
             if ftype in ALL_INT_TYPES:
                 val = self.get_value_for_query(name, ftype)
                 if val is None:
-                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
+                    return (f"not ({name} is null)", milvus_notnull_mask(series))
                 val_int = int(val)
                 low = val_int - random.randint(10, 100)
                 high = val_int + random.randint(10, 100)
@@ -1894,7 +1942,7 @@ class OracleQueryGenerator:
                 inner_mask = series.apply(check_range).astype("boolean")
                 mask = ~inner_mask
                 return (expr, mask)
-            return (f"not ({name} is null)", series.notnull().astype("boolean"))
+            return (f"not ({name} is null)", milvus_notnull_mask(series))
 
         # --- 策略 6: NOT + OR ---
         elif strategy == "not_or":
@@ -1902,7 +1950,7 @@ class OracleQueryGenerator:
                 val1 = self.get_value_for_query(name, ftype)
                 val2 = self.get_value_for_query(name, ftype)
                 if val1 is None or val2 is None:
-                    return (f"not ({name} is null)", series.notnull().astype("boolean"))
+                    return (f"not ({name} is null)", milvus_notnull_mask(series))
                 val1_int, val2_int = int(val1), int(val2)
                 inner_expr = f"({name} == {val1_int} or {name} == {val2_int})"
                 expr = f"not {inner_expr}"
@@ -1914,10 +1962,10 @@ class OracleQueryGenerator:
                 inner_mask = series.apply(check_or).astype("boolean")
                 mask = ~inner_mask
                 return (expr, mask)
-            return (f"not ({name} is null)", series.notnull().astype("boolean"))
+            return (f"not ({name} is null)", milvus_notnull_mask(series))
 
         # 终极兜底
-        return (f"not ({name} is null)", series.notnull().astype("boolean"))
+        return (f"not ({name} is null)", milvus_notnull_mask(series))
 
 
     def gen_complex_expr(self, depth):
@@ -2411,52 +2459,91 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                         print(f"   Diff: {diff_msg}")
                         print("-" * 50)
                         
-                        # ==================== [新增代码开始] ====================
-                        # 🔍 深度取证：打印出问题行的实际数据
-                        def print_evidence(ids, label):
+                        # ==================== [数据对比取证] ====================
+                        # 🔍 深度取证：展示 Pandas 数据 + Milvus 实际数据，便于判断 bug 来源
+                        def print_evidence(ids, label, ref_expr):
                             if not ids: return
-                            print(f"   🕵️‍♀️ {label} Row Analysis (Top 3):")
-                            # 从 DataManager 的 DataFrame 中提取行
-                            subset = dm.df[dm.df["id"].isin(list(ids)[:3])]
-                            
-                            for _, row in subset.iterrows():
-                                row_id = row["id"]
-                                print(f"      👉 ID: {row_id}")
-                                
-                                # 智能提取表达式中涉及的字段 (简化版：打印所有非空字段，重点关注 JSON)
-                                # 1. 打印标量中 None 的情况
-                                null_fields = [k for k, v in row.items() if v is None and k != "vector"]
-                                if null_fields:
-                                    print(f"         ⚠️ Null Fields: {null_fields}")
-                                
-                                # 2. 打印 JSON 内容 (如果表达式里涉及)
-                                if "meta_json" in base_expr:
-                                    import json
-                                    # 格式化打印 JSON
-                                    js_val = row.get("meta_json")
-                                    if js_val:
-                                        print(f"         📄 meta_json: {json.dumps(js_val, ensure_ascii=False)}")
-                                    else:
-                                        print(f"         📄 meta_json: None")
+                            ids_sample = list(ids)[:5]
+                            print(f"   🕵️ {label} 数据对比 (共{len(ids)}条, 展示{len(ids_sample)}条):")
+                            file_log(f"  {label} 数据对比 (共{len(ids)}条, 展示{len(ids_sample)}条):")
 
-                                # 3. 打印其他关键标量 (为了不刷屏，只打印 String/Int/Array)
-                                for k, v in row.items():
-                                    if k in ["id", "vector", "meta_json"]: continue
-                                    # 简单的启发式：如果字段名出现在表达式里，就打印
-                                    if k in base_expr: 
-                                        print(f"         🔹 {k}: {v}")
-                                print("      " + "-"*30)
+                            # Pandas 数据
+                            pandas_subset = dm.df[dm.df["id"].isin(ids_sample)].to_dict(orient="records")
+                            # Milvus 数据
+                            all_output_fields = ["id"] + [fc["name"] for fc in dm.schema_config]
+                            try:
+                                milvus_rows = mm.col.query(
+                                    f"id in {ids_sample}",
+                                    output_fields=all_output_fields,
+                                    limit=len(ids_sample),
+                                    consistency_level="Strong"
+                                )
+                            except Exception:
+                                milvus_rows = []
+                            milvus_by_id = {r["id"]: r for r in milvus_rows}
 
-                        print_evidence(missing, "MISSING (Base hit, Mut missed)")
-                        print_evidence(extra, "EXTRA (Base missed, Mut hit)")
-                        # ==================== [新增代码结束] ====================
+                            for rid in ids_sample:
+                                print(f"      ─── ID: {rid} ───")
+                                file_log(f"    ─── ID: {rid} ───")
 
-                        file_log(f"  ❌ [{m_type}] FAIL! {diff_msg}")
-                        print(f"   Diff: {diff_msg}")
-                        print("-" * 50)
+                                # Pandas 侧
+                                p_rows = [r for r in pandas_subset if r.get("id") == rid]
+                                if p_rows:
+                                    p_data = {k: (None if (isinstance(v, float) and np.isnan(v)) else (v.item() if hasattr(v, 'item') else v))
+                                              for k, v in p_rows[0].items() if k != "vector"}
+                                    null_fields = [k for k, v in p_data.items() if v is None and k != "id"]
+                                    print(f"        [Pandas Oracle]")
+                                    if null_fields:
+                                        print(f"          ⚠️ Null 字段: {null_fields}")
+                                    for k, v in p_data.items():
+                                        if k == "id": continue
+                                        if k in ref_expr or v is None or isinstance(v, (dict, list)):
+                                            v_str = json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list)) else str(v)
+                                            if len(v_str) > 200: v_str = v_str[:200] + "..."
+                                            print(f"          {k}: {v_str}")
+                                    file_log(f"      [Pandas] {json.dumps(p_data, ensure_ascii=False, default=str)}")
+                                else:
+                                    print(f"        [Pandas Oracle] ❌ 不存在")
+                                    file_log(f"      [Pandas] NOT FOUND")
+
+                                # Milvus 侧
+                                if rid in milvus_by_id:
+                                    m_data = {k: v for k, v in milvus_by_id[rid].items() if k != "vector"}
+                                    null_fields_m = [k for k, v in m_data.items() if v is None and k != "id"]
+                                    print(f"        [Milvus 实际]")
+                                    if null_fields_m:
+                                        print(f"          ⚠️ Null 字段: {null_fields_m}")
+                                    for k, v in m_data.items():
+                                        if k == "id": continue
+                                        if k in ref_expr or v is None or isinstance(v, (dict, list)):
+                                            v_str = json.dumps(v, ensure_ascii=False, default=str) if isinstance(v, (dict, list)) else str(v)
+                                            if len(v_str) > 200: v_str = v_str[:200] + "..."
+                                            print(f"          {k}: {v_str}")
+                                    file_log(f"      [Milvus] {json.dumps(m_data, ensure_ascii=False, default=str)}")
+
+                                    # Null 不一致高亮
+                                    if p_rows:
+                                        diffs = []
+                                        for k in set(list(p_data.keys()) + list(m_data.keys())):
+                                            if k in ("id", "vector"): continue
+                                            pv, mv = p_data.get(k), m_data.get(k)
+                                            if (pv is None) != (mv is None):
+                                                diffs.append(f"{k}: Pandas={'null' if pv is None else repr(pv)[:50]}, Milvus={'null' if mv is None else repr(mv)[:50]}")
+                                        if diffs:
+                                            print(f"        🔴 Null 不一致: {'; '.join(diffs)}")
+                                            file_log(f"      NULL_MISMATCH: {'; '.join(diffs)}")
+                                else:
+                                    print(f"        [Milvus 实际] ❌ 查询未返回")
+                                    file_log(f"      [Milvus] NOT FOUND")
+
+                        print_evidence(missing, "MISSING (Base hit, Mut missed)", base_expr)
+                        print_evidence(extra, "EXTRA (Base missed, Mut hit)", base_expr)
+                        # ==================== [数据对比取证结束] ====================
 
                         file_log(f"  ❌ [{m_type}] FAIL! {diff_msg}")
                         file_log(f"     Mut Expr: {m_expr}")
+                        print(f"   Diff: {diff_msg}")
+                        print("-" * 50)
 
                         failed_cases.append({
                             "id": i,
@@ -2559,13 +2646,125 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
             f.write(msg + "\n")
             f.flush()
 
-        # 辅助：提取指定 ID 的行，避免控制台输出过大
+        # 辅助：提取指定 ID 的 Pandas 行
         def sample_rows(id_set, limit=5):
             if not id_set:
                 return []
             subset = dm.df[dm.df["id"].isin(list(id_set))]
             rows = subset.to_dict(orient="records")
             return rows[:limit]
+
+        # 辅助：从 Milvus 查询完整行数据（用于差异对比）
+        def query_milvus_rows(id_list, limit=5):
+            """查询 Milvus 中指定 ID 的完整行数据，返回 [{field: value, ...}, ...]"""
+            if not id_list:
+                return []
+            ids = list(id_list)[:limit]
+            all_output_fields = ["id"] + [fc["name"] for fc in dm.schema_config]
+            try:
+                res = mm.col.query(
+                    f"id in {ids}",
+                    output_fields=all_output_fields,
+                    limit=limit,
+                    consistency_level="Strong"
+                )
+                return res
+            except Exception as e:
+                file_log(f"  [query_milvus_rows] Failed: {e}")
+                return []
+
+        # 辅助：格式化行数据（去向量、处理 numpy 类型）
+        def format_row_for_display(row_dict):
+            """格式化单行数据，去掉向量、处理 numpy/NaN"""
+            out = {}
+            for k, v in row_dict.items():
+                if k == "vector":
+                    continue
+                if hasattr(v, "item"):
+                    v = v.item()
+                if isinstance(v, float) and np.isnan(v):
+                    v = None
+                out[k] = v
+            return out
+
+        # 辅助：打印 Pandas vs Milvus 对比数据
+        def print_diff_evidence(diff_ids, label, expr_str):
+            """对差异 ID 展示 Pandas Oracle 数据 + Milvus 实际数据，便于判断 bug 来源"""
+            if not diff_ids:
+                return
+            ids_sample = list(diff_ids)[:5]
+            # 1. Pandas 数据
+            pandas_rows = dm.df[dm.df["id"].isin(ids_sample)].to_dict(orient="records")
+            # 2. Milvus 数据
+            milvus_rows = query_milvus_rows(ids_sample)
+            milvus_by_id = {r["id"]: r for r in milvus_rows}
+
+            print(f"\n   📊 {label} 数据对比 (共{len(diff_ids)}条, 展示{len(ids_sample)}条):")
+            file_log(f"  {label} 数据对比 (共{len(diff_ids)}条, 展示{len(ids_sample)}条):")
+
+            for rid in ids_sample:
+                print(f"   ─── ID: {rid} ───")
+                file_log(f"  ─── ID: {rid} ───")
+
+                # Pandas 侧
+                p_rows = [r for r in pandas_rows if r.get("id") == rid]
+                if p_rows:
+                    p_data = format_row_for_display(p_rows[0])
+                    # 提取与表达式相关的字段（启发式）
+                    null_fields = [k for k, v in p_data.items() if v is None and k != "id"]
+                    print(f"     [Pandas Oracle]")
+                    if null_fields:
+                        print(f"       ⚠️ Null 字段: {null_fields}")
+                    for k, v in p_data.items():
+                        if k == "id":
+                            continue
+                        # 只打印在表达式中出现的字段 + null 字段 + JSON/Array 字段
+                        if k in expr_str or v is None or isinstance(v, (dict, list)):
+                            v_str = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+                            if len(v_str) > 200:
+                                v_str = v_str[:200] + "..."
+                            print(f"       {k}: {v_str}")
+                    file_log(f"    [Pandas] {json.dumps(p_data, ensure_ascii=False, default=str)}")
+                else:
+                    print(f"     [Pandas Oracle] ❌ 不存在 (ID {rid} 不在 DataFrame 中)")
+                    file_log(f"    [Pandas] NOT FOUND")
+
+                # Milvus 侧
+                if rid in milvus_by_id:
+                    m_data = format_row_for_display(milvus_by_id[rid])
+                    null_fields_m = [k for k, v in m_data.items() if v is None and k != "id"]
+                    print(f"     [Milvus 实际]")
+                    if null_fields_m:
+                        print(f"       ⚠️ Null 字段: {null_fields_m}")
+                    for k, v in m_data.items():
+                        if k == "id":
+                            continue
+                        if k in expr_str or v is None or isinstance(v, (dict, list)):
+                            v_str = json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list)) else str(v)
+                            if len(v_str) > 200:
+                                v_str = v_str[:200] + "..."
+                            print(f"       {k}: {v_str}")
+                    file_log(f"    [Milvus] {json.dumps(m_data, ensure_ascii=False, default=str)}")
+
+                    # 关键差异高亮: 比较 Pandas vs Milvus 中 null/非null 不一致的字段
+                    if p_rows:
+                        p_data = format_row_for_display(p_rows[0])
+                        diffs = []
+                        for k in set(list(p_data.keys()) + list(m_data.keys())):
+                            if k in ("id", "vector"):
+                                continue
+                            pv = p_data.get(k)
+                            mv = m_data.get(k)
+                            p_null = pv is None
+                            m_null = mv is None
+                            if p_null != m_null:
+                                diffs.append(f"{k}: Pandas={'null' if p_null else repr(pv)}, Milvus={'null' if m_null else repr(mv)}")
+                        if diffs:
+                            print(f"     🔴 Null 不一致: {'; '.join(diffs)}")
+                            file_log(f"    NULL_MISMATCH: {'; '.join(diffs)}")
+                else:
+                    print(f"     [Milvus 实际] ❌ 不存在 (查询未返回)")
+                    file_log(f"    [Milvus] NOT FOUND")
 
         file_log(f"Start Testing: {total_test} rounds,seed : {current_seed}")
         file_log("=" * 50)
@@ -2948,19 +3147,11 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
 
                     # 记录与展示具体数据行，便于一眼确认异常
                     if cl != "Strong":
-                        # 非 Strong: 记日志 + 输出遗漏/多余 ID 样本, 不计入 failed_cases
+                        # 非 Strong: 记日志 + 展示 Pandas vs Milvus 对比数据
                         if missing:
-                            missing_rows = sample_rows(missing)
-                            file_log(f"  WARN Missing IDs sample ({len(missing_rows)}/{len(missing)}): {missing_rows}")
-                            print(f"   Missing IDs ({len(missing)}): {missing_rows}{'...' if len(missing) > 10 else ''}")
-                            for r in missing_rows:
-                                print(f"     {r}")
+                            print_diff_evidence(missing, "Missing (Pandas有/Milvus无)", expr_str)
                         if extra:
-                            extra_rows = sample_rows(extra)
-                            file_log(f"  WARN Extra IDs sample ({len(extra_rows)}/{len(extra)}): {extra_rows}")
-                            print(f"   Extra IDs ({len(extra)}): {extra_rows}{'...' if len(extra) > 10 else ''}")
-                            for r in extra_rows:
-                                print(f"     {r}")
+                            print_diff_evidence(extra, "Extra (Milvus有/Pandas无)", expr_str)
 
                             print("\n   🔍 Verifying Extra IDs individually:")
                             for eid in list(extra)[:5]:
@@ -2988,22 +3179,12 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 except Exception as ve:
                                     print(f"     ID {eid}: verification failed - {ve}")
                                     file_log(f"  Extra ID {eid} verification error: {ve}")
-                        if not missing and not extra:
-                            file_log(f"  WARN: diff_msg empty but sets differ (should not happen)")
                     else:
-                        # Strong: 完整的错误分析
+                        # Strong: 完整的错误分析 + Pandas vs Milvus 数据对比
                         if missing:
-                            missing_rows = sample_rows(missing)
-                            file_log(f"  Missing rows sample ({len(missing_rows)}/{len(missing)}): {missing_rows}")
-                            print("   Missing rows (sample):")
-                            for r in missing_rows:
-                                print(f"     {r}")
+                            print_diff_evidence(missing, "Missing (Pandas有/Milvus无)", expr_str)
                         if extra:
-                            extra_rows = sample_rows(extra)
-                            file_log(f"  Extra rows sample ({len(extra_rows)}/{len(extra)}): {extra_rows}")
-                            print("   Extra rows (sample):")
-                            for r in extra_rows:
-                                print(f"     {r}")
+                            print_diff_evidence(extra, "Extra (Milvus有/Pandas无)", expr_str)
 
                             # 【验证】单独查询 Extra IDs，确认它们是否真的被 Milvus 返回
                             print("\n   🔍 Verifying Extra IDs individually:")
@@ -4119,21 +4300,56 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                     print(f"   Expression: {expr}")
                     print(f"   Found Count: {len(found_ids)} (Target NOT found)")
                     print("-" * 50)
-                    print(f"   🔎 EVIDENCE (Target Row Data):")
+                    print(f"   🔎 EVIDENCE (Pandas Oracle vs Milvus 数据对比):")
 
-                    # 漂亮地打印 JSON 字段 (通常是问题核心)
-                    print(f"   [meta_json]:")
-                    print(json.dumps(json_data, indent=4, ensure_ascii=False))
-
-                    # 打印其他标量字段
-                    print(f"   [Scalars]:")
+                    # --- Pandas 侧 ---
+                    print(f"   [Pandas Oracle]:")
+                    print(f"     [meta_json]: {json.dumps(json_data, indent=4, ensure_ascii=False)}")
                     for k, v in scalar_data.items():
                         print(f"     {k:<10}: {v}")
+
+                    # --- Milvus 侧 ---
+                    all_output_fields = ["id"] + [fc["name"] for fc in dm.schema_config]
+                    try:
+                        milvus_rows = mm.col.query(
+                            f"id in [{pivot_id}]",
+                            output_fields=all_output_fields,
+                            limit=1,
+                            consistency_level="Strong"
+                        )
+                    except Exception as mq_e:
+                        milvus_rows = []
+                        print(f"     ⚠️ Milvus 查询失败: {mq_e}")
+
+                    if milvus_rows:
+                        m_row = milvus_rows[0]
+                        m_data = {k: v for k, v in m_row.items() if k != "vector"}
+                        m_json = m_data.pop("meta_json", {})
+                        print(f"   [Milvus 实际]:")
+                        print(f"     [meta_json]: {json.dumps(m_json, indent=4, ensure_ascii=False, default=str)}")
+                        for k, v in m_data.items():
+                            v_str = str(v)
+                            if len(v_str) > 200: v_str = v_str[:200] + "..."
+                            print(f"     {k:<10}: {v_str}")
+                        # Null 差异高亮
+                        diffs = []
+                        for k in set(list(scalar_data.keys()) + list(m_data.keys())):
+                            if k in ("id", "vector"): continue
+                            pv, mv = scalar_data.get(k), m_data.get(k)
+                            if (pv is None) != (mv is None):
+                                diffs.append(f"{k}: Pandas={'null' if pv is None else repr(pv)[:50]}, Milvus={'null' if mv is None else repr(mv)[:50]}")
+                        if diffs:
+                            print(f"   🔴 Null 不一致: {'; '.join(diffs)}")
+                            file_log(f"  NULL_MISMATCH: {'; '.join(diffs)}")
+                    else:
+                        print(f"   [Milvus 实际] ❌ 查询未返回该行")
                     print("-" * 50)
 
                     # 3. 记录日志
                     file_log(f"  -> ❌ FAIL! Target ID {pivot_id} NOT found.")
-                    file_log(f"  -> Row Data: {safe_row}")
+                    file_log(f"  -> Pandas Row Data: {safe_row}")
+                    if milvus_rows:
+                        file_log(f"  -> Milvus Row Data: {m_data}")
 
                     errors.append({"id": pivot_id, "expr": expr})
 
