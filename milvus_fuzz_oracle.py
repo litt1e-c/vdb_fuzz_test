@@ -139,10 +139,13 @@ class DataManager:
             fname = field["name"]
             ftype = field["type"]
             
-            # 演进字段: 不包含在插入数据中，让 Milvus 自动设为 null
-            # 这样避免 pymilvus ORM 将新字段误判为 dynamic field 导致插入失败
-            # pandas 中通过 pd.concat 自动填充 NaN (相当于 None)
+            # 演进字段: 随机生成值（含一定比例的 null）
+            # 在 schema 演进后新插入的数据会携带该字段值
+            # null 时不传该字段: Milvus 自动设为 null, pandas 通过 pd.concat 补 NaN
             if fname.startswith("evo_"):
+                if random.random() >= 0.3:  # 70% 概率生成真实值
+                    row[fname] = self.generate_field_value(field)
+                # else: 不放入 row, Milvus 自动 null, pandas NaN
                 continue
             
             if ftype in ALL_INT_TYPES:
@@ -357,39 +360,35 @@ class DataManager:
     # --- Schema Evolution Methods ---
 
     def generate_field_value(self, field_config):
-        """为指定字段配置生成一个随机值（不含 None）。"""
-        rng = np.random.default_rng(np.random.randint(0, 2**31))
+        """为指定字段配置生成一个随机值（不含 None）。使用全局 random 状态保证可重复性。"""
         ftype = field_config["type"]
 
         if ftype in ALL_INT_TYPES:
             lo, hi = INT_RANGES[ftype]
             effective_lo = max(lo, -self.int_range)
             effective_hi = min(hi, self.int_range)
-            return int(rng.integers(effective_lo, effective_hi))
+            return random.randint(effective_lo, effective_hi)
         elif ftype in ALL_FLOAT_TYPES:
-            val = float(rng.random() * self.double_scale)
+            val = random.random() * self.double_scale
             if ftype == DataType.FLOAT:
                 val = float(np.float32(val))
-            return val
+            return float(val)
         elif ftype == DataType.BOOL:
-            return bool(rng.choice([True, False]))
+            return random.choice([True, False])
         elif ftype == DataType.VARCHAR:
             return self._random_string(0, random.randint(5, 50))
         elif ftype == DataType.JSON:
+            # 演进字段使用简单 JSON 结构，避免复杂嵌套
             base_obj = {
-                "price": int(rng.integers(0, 1000)),
-                "color": rng.choice(["Red", "Blue", "Green"]),
-                "active": bool(rng.choice([True, False])),
+                "evo_val": random.randint(0, 1000),
+                "evo_tag": random.choice(["alpha", "beta", "gamma", "delta"]),
+                "evo_flag": random.choice([True, False]),
             }
-            random_part = self._gen_random_json_structure(rng, depth=self.json_max_depth)
-            if isinstance(random_part, dict):
-                base_obj.update(random_part)
-            else:
-                base_obj["random_payload"] = random_part
             return base_obj
         elif ftype == DataType.ARRAY:
             elem_type = field_config.get("element_type", DataType.INT64)
-            arr_len = rng.integers(1, min(self.array_capacity, 10) + 1)
+            rng = np.random.default_rng(random.randint(0, 2**31))
+            arr_len = random.randint(1, min(self.array_capacity, 10))
             return self._gen_array_data(rng, elem_type, int(arr_len))
         return None
 
@@ -406,15 +405,18 @@ class DataManager:
         if evolved_count >= MAX_EVOLVED_FIELDS:
             return None
 
-        # 选择随机类型（标量为主，ARRAY 概率较低，暂不产生 JSON 避免复杂性爆炸）
+        # 选择随机类型（标量为主，ARRAY 和 JSON 概率较低）
         type_choices = list(ALL_INT_TYPES) + list(ALL_FLOAT_TYPES) + [DataType.BOOL, DataType.VARCHAR]
         ftype = random.choice(type_choices)
 
-        # 20% 概率改为 ARRAY
+        # 15% 概率改为 ARRAY，10% 概率改为 JSON（简单结构）
         elem_type = None
-        if random.random() < 0.2:
+        roll = random.random()
+        if roll < 0.15:
             ftype = DataType.ARRAY
             elem_type = random.choice(ALL_ARRAY_ELEMENT_TYPES)
+        elif roll < 0.25:
+            ftype = DataType.JSON
 
         type_name = get_type_name(ftype).lower()
         field_name = f"evo_{evolved_count}_{type_name}"
@@ -711,6 +713,8 @@ class MilvusManager:
 
         if ftype == DataType.VARCHAR:
             kwargs["max_length"] = 512
+        elif ftype == DataType.JSON:
+            pass  # JSON 不需要额外参数
         elif ftype == DataType.ARRAY:
             kwargs["element_type"] = field_config["element_type"]
             kwargs["max_capacity"] = field_config["max_capacity"]
@@ -737,7 +741,8 @@ class MilvusManager:
 
     def backfill_field_data(self, dm, field_config, backfill_data):
         """
-        通过 upsert 回填部分现有行的新字段值。
+        通过 MilvusClient.upsert(partial_update=True) 回填部分现有行的新字段值。
+        只需传递 主键ID + 新字段值，无需向量和其他字段。
         pandas DataFrame 已由 dm.backfill_evolved_field() 提前同步更新。
 
         Args:
@@ -749,38 +754,28 @@ class MilvusManager:
             return 0
 
         field_name = field_config["name"]
+        client = MilvusClient(uri=f"http://{HOST}:{PORT}")
         success_count = 0
 
-        # 逐批 upsert
+        # 逐批 partial upsert
         for start in range(0, len(backfill_data), BATCH_SIZE):
             batch = backfill_data[start:start + BATCH_SIZE]
             rows_to_upsert = []
 
             for pandas_idx, row_id, value in batch:
-                # 构造完整的行（upsert 需要所有字段 + 向量）
-                row_with_vec = {"id": int(row_id)}
-                row_with_vec["vector"] = dm.vectors[pandas_idx].tolist()
-
-                for field in dm.schema_config:
-                    fname = field["name"]
-                    val = dm.df.at[pandas_idx, fname]
-                    # 处理 numpy 标量
-                    if hasattr(val, "item"):
-                        val = val.item()
-                    # 处理 NaN -> None
-                    if isinstance(val, float) and np.isnan(val):
-                        val = None
-                    if val is not None:
-                        row_with_vec[fname] = val
-                    # None 值: nullable=True 时不传即可
-
-                rows_to_upsert.append(row_with_vec)
+                # partial_update=True: 只需要主键 + 要更新的字段
+                row = {"id": int(row_id), field_name: value}
+                rows_to_upsert.append(row)
 
             try:
-                self.col.upsert(rows_to_upsert)
+                client.upsert(
+                    collection_name=COLLECTION_NAME,
+                    data=rows_to_upsert,
+                    partial_update=True
+                )
                 success_count += len(rows_to_upsert)
             except Exception as e:
-                print(f"   ⚠️ Backfill upsert failed: {e}")
+                print(f"   ⚠️ Backfill partial upsert failed: {e}")
 
         if success_count > 0:
             self.col.flush()
@@ -2351,7 +2346,14 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                         file_log(f"[SchemaEvolution] Adding field '{field_config['name']}' ({ftype_name}) at round {i}")
                         mm.add_evolved_field(field_config)
                         file_log(f"[SchemaEvolution] Field '{field_config['name']}' added to Milvus successfully")
-                        # 不做回填: 现有数据新字段均为 null, pandas 同步为 None
+
+                        # 回填: 使用 partial_update=True 为部分现有行填充新字段值
+                        backfill_data = dm.backfill_evolved_field(field_config)
+                        if backfill_data:
+                            fill_count = mm.backfill_field_data(dm, field_config, backfill_data)
+                            file_log(f"[SchemaEvolution] Backfilled {fill_count}/{len(backfill_data)} rows for '{field_config['name']}'")
+                        else:
+                            file_log(f"[SchemaEvolution] No rows selected for backfill of '{field_config['name']}'")
                 except Exception as e:
                     file_log(f"[SchemaEvolution] Failed at round {i}: {e}")
                     try:
@@ -2825,11 +2827,16 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                         # 1. 向 Milvus 添加新字段（现有数据的新字段值均为 null）
                         mm.add_evolved_field(field_config)
                         file_log(f"[SchemaEvolution] Field '{field_config['name']}' added to Milvus successfully")
-                        # pandas 模型已在 evolve_schema_add_field() 中同步（所有现有行 = None）
-                        # 不做回填: Milvus add_collection_field 后已有数据该字段均为 null,
-                        # pandas 同步为 None, 保证两侧一致。后续新插入的数据会携带新字段值。
 
-                        # 2. 验证: 查询新字段的 is null / is not null
+                        # 回填: 使用 partial_update=True 为部分现有行填充新字段值
+                        backfill_data = dm.backfill_evolved_field(field_config)
+                        if backfill_data:
+                            fill_count = mm.backfill_field_data(dm, field_config, backfill_data)
+                            file_log(f"[SchemaEvolution] Backfilled {fill_count}/{len(backfill_data)} rows for '{field_config['name']}'")
+                        else:
+                            file_log(f"[SchemaEvolution] No rows selected for backfill of '{field_config['name']}'")
+
+                        # 验证: 查询新字段的 is null / is not null
                         time.sleep(0.5)  # 等待新 schema 生效
                         try:
                             null_res = mm.col.query(
@@ -2925,6 +2932,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     # 非 Strong 一致性允许暂时不一致, 降级为警告
                     if cl != "Strong":
                         file_log(f"  -> WARN (non-Strong CL={cl}): {diff_msg}")
+                        file_log(f"   Expr: {expr_str}")
+                        print(f"   Expr: {expr_str}")
                         print(f"\n⚠️  [Test {i}] WARN (CL={cl}): Expected {len(expected_ids)} vs Actual {len(actual_ids)}")
                     else:
                         # --- Strong 级别: 真正的 MISMATCH ---
@@ -4052,7 +4061,14 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                         file_log(f"[SchemaEvolution] Adding field '{field_config['name']}' ({ftype_name}) at round {i}")
                         mm.add_evolved_field(field_config)
                         file_log(f"[SchemaEvolution] Field '{field_config['name']}' added to Milvus successfully")
-                        # 不做回填: 现有数据新字段均为 null, pandas 同步为 None
+
+                        # 回填: 使用 partial_update=True 为部分现有行填充新字段值
+                        backfill_data = dm.backfill_evolved_field(field_config)
+                        if backfill_data:
+                            fill_count = mm.backfill_field_data(dm, field_config, backfill_data)
+                            file_log(f"[SchemaEvolution] Backfilled {fill_count}/{len(backfill_data)} rows for '{field_config['name']}'")
+                        else:
+                            file_log(f"[SchemaEvolution] No rows selected for backfill of '{field_config['name']}'")
                 except Exception as e:
                     file_log(f"[SchemaEvolution] Failed at round {i}: {e}")
                     try:
@@ -4309,7 +4325,14 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                         file_log(f"[SchemaEvolution] Adding field '{field_config['name']}' ({ftype_name}) at round {i}")
                         mm.add_evolved_field(field_config)
                         file_log(f"[SchemaEvolution] Field '{field_config['name']}' added to Milvus successfully")
-                        # 不做回填: 现有数据新字段均为 null, pandas 同步为 None
+
+                        # 回填: 使用 partial_update=True 为部分现有行填充新字段值
+                        backfill_data = dm.backfill_evolved_field(field_config)
+                        if backfill_data:
+                            fill_count = mm.backfill_field_data(dm, field_config, backfill_data)
+                            file_log(f"[SchemaEvolution] Backfilled {fill_count}/{len(backfill_data)} rows for '{field_config['name']}'")
+                        else:
+                            file_log(f"[SchemaEvolution] No rows selected for backfill of '{field_config['name']}'")
                 except Exception as e:
                     file_log(f"[SchemaEvolution] Failed at round {i}: {e}")
                     try:
