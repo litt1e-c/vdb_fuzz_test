@@ -58,6 +58,9 @@ def _init_vector_check_config():
 # 混淆开关（默认关闭）
 CHAOS_RATE = 0.0
 
+# Schema Evolution 最大演进字段数
+MAX_EVOLVED_FIELDS = 5
+
 # 唯一 ID 计数器（用于动态插入）
 _global_id_counter = N * 10
 
@@ -344,6 +347,118 @@ class DataManager:
         vec /= np.linalg.norm(vec)
         return vec.tolist()
 
+    def generate_field_value(self, field_config):
+        """为给定字段配置生成一个随机值（用于 schema evolution 回填）"""
+        rng = np.random.default_rng(np.random.randint(0, 2**31))
+        ftype = field_config["type"]
+
+        if ftype == FieldType.INT:
+            return int(rng.integers(-self.int_range, self.int_range))
+        elif ftype == FieldType.FLOAT:
+            return float(rng.random() * self.double_scale)
+        elif ftype == FieldType.BOOL:
+            return bool(rng.choice([True, False]))
+        elif ftype == FieldType.STRING:
+            return self._random_string(0, random.randint(5, 50))
+        elif ftype == FieldType.DATETIME:
+            epoch_2020 = int(datetime(2020, 1, 1).timestamp())
+            epoch_2025 = int(datetime(2025, 1, 1).timestamp())
+            return int(rng.integers(epoch_2020, epoch_2025))
+        elif ftype == FieldType.JSON:
+            base_obj = {
+                "price": int(rng.integers(0, 1000)),
+                "color": rng.choice(["Red", "Blue", "Green"]),
+                "active": bool(rng.choice([True, False])),
+            }
+            if rng.random() < 0.8:
+                base_obj["config"] = {"version": int(rng.integers(1, 10))}
+            if rng.random() < 0.8:
+                base_obj["history"] = [int(x) for x in rng.integers(0, 100, size=3)]
+            random_part = self._gen_random_json_structure(rng, depth=self.json_max_depth)
+            if isinstance(random_part, dict):
+                base_obj.update(random_part)
+            else:
+                base_obj["random_payload"] = random_part
+            return base_obj
+        elif ftype == FieldType.ARRAY_INT:
+            arr_len = rng.integers(0, 6)
+            return [int(x) for x in rng.integers(0, 100, size=arr_len)]
+        elif ftype == FieldType.ARRAY_STR:
+            arr_len = rng.integers(0, 6)
+            return [self._random_string(2, 8) for _ in range(arr_len)]
+        elif ftype == FieldType.ARRAY_FLOAT:
+            arr_len = rng.integers(0, 6)
+            return [round(float(rng.random() * 1000), 2) for _ in range(arr_len)]
+        elif ftype == FieldType.GEO:
+            return {
+                "lat": round(float(rng.uniform(-90, 90)), 6),
+                "lon": round(float(rng.uniform(-180, 180)), 6)
+            }
+        return None
+
+    def evolve_schema_add_field(self):
+        """
+        Schema Evolution: 随机添加一个新字段到 schema 配置和 pandas DataFrame。
+        新字段对所有现有数据默认为 None。
+
+        Returns:
+            field_config dict if successful, None if limit reached.
+        """
+        evolved_count = sum(1 for f in self.schema_config if f["name"].startswith("evo_"))
+        if evolved_count >= MAX_EVOLVED_FIELDS:
+            return None
+
+        # 选择随机类型（标量为主，保持简单）
+        type_choices = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.DATETIME]
+        ftype = random.choice(type_choices)
+
+        type_name = get_type_name(ftype).lower()
+        field_name = f"evo_{evolved_count}_{type_name}"
+
+        field_config = {"name": field_name, "type": ftype}
+
+        # 添加到 schema_config（OracleQueryGenerator 通过引用自动可见）
+        self.schema_config.append(field_config)
+
+        # 更新 pandas DataFrame: 所有现有行设为 None
+        self.df[field_name] = None
+
+        return field_config
+
+    def backfill_evolved_field(self, field_config, fill_ratio=None):
+        """
+        为现有数据的新演进字段生成回填值，并同步更新 pandas DataFrame。
+
+        Args:
+            field_config: 字段配置 dict
+            fill_ratio: 填充比例 (0.0 - 1.0)，None 则随机选取
+
+        Returns:
+            list of (pandas_index, row_id, value) tuples
+        """
+        if fill_ratio is None:
+            fill_ratio = random.uniform(0.1, 0.4)
+
+        n_rows = len(self.df)
+        if n_rows == 0:
+            return []
+
+        field_name = field_config["name"]
+
+        # 确定哪些行被填充
+        fill_mask = np.random.random(n_rows) < fill_ratio
+        fill_indices = np.where(fill_mask)[0]
+
+        backfill_data = []
+        for idx in fill_indices:
+            value = self.generate_field_value(field_config)
+            row_id = int(self.df.at[idx, "id"])
+            backfill_data.append((int(idx), row_id, value))
+            # 同步更新 pandas DataFrame
+            self.df.at[idx, field_name] = value
+
+        return backfill_data
+
 # --- 2. Qdrant Manager ---
 
 class QdrantManager:
@@ -526,6 +641,115 @@ class QdrantManager:
                 pass
         print("✅ Index creation complete.")
 
+    def backfill_field_data(self, field_name, backfill_data):
+        """
+        通过 set_payload 为现有数据的新字段回填值。
+
+        Args:
+            field_name: 字段名
+            backfill_data: list of (pandas_idx, row_id, value) tuples
+
+        Returns:
+            成功回填的行数
+        """
+        if not backfill_data:
+            return 0
+
+        success_count = 0
+        for start in range(0, len(backfill_data), BATCH_SIZE):
+            batch = backfill_data[start:start + BATCH_SIZE]
+            for _, row_id, value in batch:
+                try:
+                    self.client.set_payload(
+                        collection_name=COLLECTION_NAME,
+                        payload={field_name: value},
+                        points=[row_id],
+                        wait=True
+                    )
+                    success_count += 1
+                except Exception as e:
+                    pass  # 回填单条失败不是致命错误
+        return success_count
+
+    def create_evolved_field_index(self, field_config):
+        """为演进字段创建 payload 索引"""
+        fname = field_config["name"]
+        ftype = field_config["type"]
+        type_to_schema = {
+            FieldType.INT: PayloadSchemaType.INTEGER,
+            FieldType.FLOAT: PayloadSchemaType.FLOAT,
+            FieldType.STRING: PayloadSchemaType.KEYWORD,
+            FieldType.BOOL: PayloadSchemaType.BOOL,
+            FieldType.DATETIME: PayloadSchemaType.INTEGER,
+            FieldType.GEO: PayloadSchemaType.GEO,
+        }
+        schema_type = type_to_schema.get(ftype)
+        if schema_type:
+            try:
+                self.client.create_payload_index(
+                    collection_name=COLLECTION_NAME,
+                    field_name=fname,
+                    field_schema=schema_type,
+                    wait=True
+                )
+            except Exception:
+                pass  # 索引创建失败不致命
+
+    def set_null_for_points(self, field_name, point_ids):
+        """
+        为指定批量 point 的某字段显式设置为 None。
+        解决 Qdrant 中“字段不存在”≠“字段为 null”的语义差异。
+        """
+        if not point_ids:
+            return 0
+        success = 0
+        ids = [int(x) for x in point_ids]
+
+        # set_payload(field=None) 在 Qdrant 中不会持久化显式 null；
+        # 使用“读取原向量+payload，再 upsert 合并写回”来确保 null 被显式保存。
+        for start in range(0, len(ids), BATCH_SIZE):
+            batch = ids[start:start + BATCH_SIZE]
+            try:
+                points = self.client.retrieve(
+                    collection_name=COLLECTION_NAME,
+                    ids=batch,
+                    with_payload=True,
+                    with_vectors=True,
+                )
+                points_by_id = {int(p.id): p for p in points}
+            except Exception:
+                points_by_id = {}
+
+            for pid in batch:
+                try:
+                    p = points_by_id.get(pid)
+                    if p is None:
+                        continue
+
+                    current_payload = dict(p.payload or {})
+                    if current_payload.get(field_name, "__MISSING__") is None:
+                        success += 1
+                        continue
+
+                    current_payload[field_name] = None
+
+                    vec = p.vector
+                    # 命名向量场景下，取第一个向量值
+                    if isinstance(vec, dict):
+                        if not vec:
+                            continue
+                        vec = next(iter(vec.values()))
+
+                    self.client.upsert(
+                        collection_name=COLLECTION_NAME,
+                        points=[PointStruct(id=pid, vector=vec, payload=current_payload)],
+                        wait=True,
+                    )
+                    success += 1
+                except Exception:
+                    pass
+        return success
+
     def rebuild_payload_indexes(self, schema_config):
         """
         随机删除并重建 payload 索引，测试索引重建后的数据一致性。
@@ -619,6 +843,11 @@ class OracleQueryGenerator:
 
     def _is_empty_condition(self, key):
         return IsEmptyCondition(is_empty=self._payload_field(key))
+
+    def _is_evolved_field(self, name):
+        """判断字段是否为 Schema Evolution 新增字段（evo_ 前缀）。
+        演化字段未回填的行在 Qdrant 里"字段不存在"，需用 IsEmptyCondition 而非 IsNullCondition。"""
+        return name.startswith("evo_")
 
     def _empty_or_null_filter(self, key):
         """Treat null payloads as empty when checking array emptiness"""
@@ -717,24 +946,39 @@ class OracleQueryGenerator:
         # 1. Null/Empty Check
         if random.random() < 0.15:
             if random.random() < 0.5:
-                # is_null - 直接传布尔值
-                filter_cond = self._null_filter(name)
-                return (filter_cond, series.isnull(), f"{name} is null")
+                # is_null
+                # 演化字段未回填的行在 Qdrant 里是"字段不存在"（Qdrant 不存 None），
+                # 需用 IsEmptyCondition（覆盖"字段不存在 or null or []"）以匹配 Pandas 的 None。
+                if self._is_evolved_field(name):
+                    filter_cond = Filter(must=[self._is_empty_condition(name)])
+                    return (filter_cond, series.isna(), f"{name} is null")
+                else:
+                    filter_cond = self._null_filter(name)
+                    return (filter_cond, series.isnull(), f"{name} is null")
             else:
-                # is_empty (for arrays) - 直接传布尔值
+                # is_not_null / is_empty
                 if ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR]:
                     filter_cond = self._empty_or_null_filter(name)
                     mask = series.apply(lambda x: x is None or (isinstance(x, list) and len(x) == 0))
                     return (filter_cond, mask, f"{name} is empty")
                 else:
-                    # Qdrant 不支持 is_null=False，需要用 must_not 包装
-                    filter_cond = Filter(must_not=[self._is_null_condition(name)])
-                    return (filter_cond, series.notnull(), f"{name} is not null")
+                    # 演化字段：NOT IsEmpty (字段存在且有非 None/[] 值)
+                    if self._is_evolved_field(name):
+                        filter_cond = Filter(must_not=[self._is_empty_condition(name)])
+                        return (filter_cond, series.notna(), f"{name} is not null")
+                    else:
+                        # 普通字段：NOT IsNull
+                        filter_cond = Filter(must_not=[self._is_null_condition(name)])
+                        return (filter_cond, series.notnull(), f"{name} is not null")
 
         val = self.get_value_for_query(name, ftype)
         if val is None:
-            filter_cond = self._null_filter(name)
-            return (filter_cond, series.isnull(), f"{name} is null")
+            if self._is_evolved_field(name):
+                filter_cond = Filter(must=[self._is_empty_condition(name)])
+                return (filter_cond, series.isna(), f"{name} is null")
+            else:
+                filter_cond = self._null_filter(name)
+                return (filter_cond, series.isnull(), f"{name} is null")
 
         # 安全比较函数 - 处理 None 和 NaN
         def safe_compare_scalar(op, target_val):
@@ -1134,6 +1378,24 @@ class OracleQueryGenerator:
 
         return filter_obj, mask, expr_str
 
+    def _qdrant_is_null_filter(self, name):
+        """为字段生成 is_null 的 Qdrant filter（自动适配演化字段）。
+        - 演化字段（evo_）: 用 IsEmptyCondition（字段不存在 or null or []）
+        - 普通字段:         用 IsNullCondition（字段存在且值为 null）
+        """
+        if self._is_evolved_field(name):
+            return Filter(must=[self._is_empty_condition(name)])
+        return Filter(must=[self._is_null_condition(name)])
+
+    def _qdrant_not_null_filter(self, name):
+        """为字段生成 is_not_null 的 Qdrant filter（自动适配演化字段）。
+        - 演化字段（evo_）: NOT IsEmpty（字段存在且有非 null/[] 值）
+        - 普通字段:         NOT IsNull
+        """
+        if self._is_evolved_field(name):
+            return Filter(must_not=[self._is_empty_condition(name)])
+        return Filter(must_not=[self._is_null_condition(name)])
+
     def gen_not_atomic_expr(self):
         """
         专项 NOT 原子表达式生成器（6种策略）。
@@ -1158,9 +1420,7 @@ class OracleQueryGenerator:
             if ftype in [FieldType.INT, FieldType.FLOAT, FieldType.DATETIME]:
                 valid = series.dropna()
                 if valid.empty:
-                    # fallback: NOT (is null)
-                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 val = self._convert_to_native(random.choice(valid.values))
                 if ftype == FieldType.INT or ftype == FieldType.DATETIME:
                     val = int(val)
@@ -1188,8 +1448,7 @@ class OracleQueryGenerator:
             elif ftype == FieldType.STRING:
                 valid = series.dropna()
                 if valid.empty:
-                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 val = str(random.choice(valid.values))
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
                 f_obj = Filter(must_not=[inner_cond])
@@ -1204,36 +1463,34 @@ class OracleQueryGenerator:
                 return f_obj, mask, f"NOT ({name} == {val_bool})"
 
             # fallback
-            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-            return f_obj, series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
         # --- 策略 2: NOT + 等值 ---
         elif strategy == "not_eq":
             if ftype == FieldType.INT:
                 valid = series.dropna()
                 if valid.empty:
-                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 val = int(self._convert_to_native(random.choice(valid.values)))
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
                 f_obj = Filter(must_not=[inner_cond])
                 mask = series.apply(lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else int(x) != val)
                 return f_obj, mask, f"NOT ({name} == {val})"
-            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-            return f_obj, series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
         # --- 策略 3: NOT (is null) → 非空行 ---
         elif strategy == "not_is_null":
-            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-            mask = series.notna()
-            return f_obj, mask, f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
         # --- 策略 4: NOT (is not null) → 空行 ---
         elif strategy == "not_is_not_null":
-            # is not null = must_not[IsNull], 再取 NOT → 双重否定 → IsNull
-            inner = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
+            # NOT(NOT(is_null)) = is_null
+            inner = self._qdrant_not_null_filter(name)
             f_obj = Filter(must_not=[inner])
-            mask = series.isna()
+            if self._is_evolved_field(name):
+                mask = series.isna()  # 演化字段：field 不存在 = Pandas None
+            else:
+                mask = series.isna()
             return f_obj, mask, f"NOT (NOT ({name} is null))"
 
         # --- 策略 5: NOT + AND (德摩根定律) ---
@@ -1241,8 +1498,7 @@ class OracleQueryGenerator:
             if ftype in [FieldType.INT, FieldType.DATETIME]:
                 valid = series.dropna()
                 if valid.empty:
-                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 val = int(self._convert_to_native(random.choice(valid.values)))
                 low = val - random.randint(10, 100)
                 high = val + random.randint(10, 100)
@@ -1261,16 +1517,14 @@ class OracleQueryGenerator:
                     except: return True
                 mask = series.apply(_and_mask)
                 return f_obj, mask, f"NOT ({name} > {low} AND {name} < {high})"
-            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-            return f_obj, series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
         # --- 策略 6: NOT + OR (德摩根延伸) ---
         elif strategy == "not_or":
             if ftype == FieldType.INT:
                 valid = series.dropna()
                 if len(valid) < 2:
-                    f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-                    return f_obj, series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 vals = [int(self._convert_to_native(v)) for v in random.sample(list(valid.values), min(2, len(valid)))]
                 v1, v2 = vals[0], vals[-1]
                 inner = Filter(should=[
@@ -1287,14 +1541,13 @@ class OracleQueryGenerator:
                     except: return True
                 mask = series.apply(_or_mask)
                 return f_obj, mask, f"NOT ({name} == {v1} OR {name} == {v2})"
-            f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-            return f_obj, series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
         # 终极兜底
-        f_obj = Filter(must_not=[IsNullCondition(is_null=PayloadField(key=name))])
-        return f_obj, series.notna(), f"NOT ({name} is null)"
+        return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
     def gen_constant_expr(self):
+
         """生成常量表达式（Qdrant 支持有限）"""
         # Qdrant 中 id 是点 ID，不能用于 FieldCondition 过滤
         # 使用一个实际存在的 INT 字段来实现恒真/恒假条件
@@ -2399,7 +2652,142 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return self._gen_fallback_tautology()
 
 
-# --- 6. Dynamic Data Operations Helper ---
+# --- 6. Dynamic Data Operations & Schema Evolution Helpers ---
+
+def query_qdrant_rows(qm, id_list, limit=5):
+    """查询 Qdrant 中指定 ID 的完整 payload 数据，用于调试对比"""
+    ids = list(id_list)[:limit]
+    if not ids:
+        return {}
+    try:
+        result = qm.client.retrieve(
+            collection_name=COLLECTION_NAME,
+            ids=ids,
+            with_payload=True,
+            with_vectors=False
+        )
+        return {p.id: p.payload for p in result}
+    except Exception:
+        return {}
+
+
+def format_row_for_display(row_dict):
+    """清理行数据用于显示：移除向量、转换 numpy 类型、NaN 转 None"""
+    clean = {}
+    for k, v in row_dict.items():
+        if k == "vector":
+            continue
+        if isinstance(v, (np.integer,)):
+            clean[k] = int(v)
+        elif isinstance(v, (np.floating,)):
+            clean[k] = None if np.isnan(v) else float(v)
+        elif isinstance(v, np.bool_):
+            clean[k] = bool(v)
+        elif isinstance(v, float) and (v != v):  # NaN check
+            clean[k] = None
+        else:
+            clean[k] = v
+    return clean
+
+
+def print_diff_evidence(dm, qm, diff_ids, label, expr_str, file_log):
+    """
+    详细比对 Pandas Oracle 与 Qdrant 实际数据，高亮 NULL 不一致。
+    用于调试 mismatch 根因。
+    """
+    if not diff_ids:
+        return
+
+    sample_ids = list(diff_ids)[:5]
+    file_log(f"\n  === {label} Evidence (up to {len(sample_ids)} IDs) ===")
+
+    # 获取 Qdrant 实际数据
+    qdrant_data = query_qdrant_rows(qm, sample_ids, limit=5)
+
+    for sid in sample_ids:
+        file_log(f"  --- ID: {sid} ---")
+
+        # Pandas 侧数据
+        pdf_row = dm.df[dm.df["id"] == sid]
+        if pdf_row.empty:
+            file_log(f"    [Pandas] NOT FOUND (deleted?)")
+        else:
+            row_data = format_row_for_display(pdf_row.iloc[0].to_dict())
+            null_fields = [k for k, v in row_data.items() if v is None and k != "id"]
+            file_log(f"    [Pandas] {json.dumps(row_data, default=str, ensure_ascii=False)}")
+            if null_fields:
+                file_log(f"    [Pandas NULL fields] {null_fields}")
+
+        # Qdrant 侧数据
+        if sid in qdrant_data:
+            qd = qdrant_data[sid]
+            q_null_fields = [k for k, v in qd.items() if v is None]
+            file_log(f"    [Qdrant] {json.dumps(qd, default=str, ensure_ascii=False)}")
+            if q_null_fields:
+                file_log(f"    [Qdrant NULL fields] {q_null_fields}")
+
+            # NULL 不一致检测
+            if not pdf_row.empty:
+                row_data = format_row_for_display(pdf_row.iloc[0].to_dict())
+                for field in row_data:
+                    if field == "id":
+                        continue
+                    pd_val = row_data.get(field)
+                    qd_val = qd.get(field)
+                    pd_is_null = pd_val is None
+                    qd_is_null = qd_val is None
+                    if pd_is_null != qd_is_null:
+                        file_log(f"    ⚠️ NULL MISMATCH on '{field}': Pandas={pd_val} vs Qdrant={qd_val}")
+        else:
+            file_log(f"    [Qdrant] NOT FOUND")
+
+
+def _do_schema_evolution(dm, qm, file_log):
+    """
+    Schema Evolution 操作：随机添加新字段并回填部分数据。
+    关键：对未回填的行显式设置字段为 None，
+    避免 Qdrant “字段不存在” ≠ “字段为 null” 的语义差异。
+    """
+    try:
+        field_config = dm.evolve_schema_add_field()
+        if field_config is None:
+            file_log("[SchemaEvolution] Max evolved fields reached, skipping.")
+            return False
+
+        field_name = field_config["name"]
+        field_type = get_type_name(field_config["type"])
+        file_log(f"[SchemaEvolution] Adding field '{field_name}' (type={field_type})...")
+        print(f"\n🧩 Schema Evolution: Adding '{field_name}' ({field_type})")
+
+        # 回填部分数据
+        backfill_data = dm.backfill_evolved_field(field_config)
+        backfilled_ids = set()
+        if backfill_data:
+            fill_count = qm.backfill_field_data(field_name, backfill_data)
+            backfilled_ids = {row_id for _, row_id, _ in backfill_data}
+            file_log(f"[SchemaEvolution] Backfilled {fill_count}/{len(backfill_data)} rows for '{field_name}'")
+            print(f"   ✔️ Backfilled {fill_count}/{len(backfill_data)} rows")
+        else:
+            file_log(f"[SchemaEvolution] No rows to backfill for '{field_name}'")
+
+        # 对未回填行显式设置为 null，避免“字段不存在”与“字段为 null”语义差异
+        all_ids = set(int(x) for x in dm.df["id"].tolist())
+        unfilled_ids = list(all_ids - backfilled_ids)
+        if unfilled_ids:
+            null_count = qm.set_null_for_points(field_name, unfilled_ids)
+            file_log(
+                f"[SchemaEvolution] Explicitly set NULL for {null_count}/{len(unfilled_ids)} rows on '{field_name}'"
+            )
+
+        # 创建索引
+        qm.create_evolved_field_index(field_config)
+        file_log(f"[SchemaEvolution] Index created for '{field_name}'")
+
+        return True
+    except Exception as e:
+        file_log(f"[SchemaEvolution] Failed: {e}")
+        print(f"   ⚠️ Schema Evolution failed: {e}")
+        return False
 
 def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
     """
@@ -2408,6 +2796,28 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
     """
     op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
     batch_count = random.randint(1, 5)
+
+    def _sync_explicit_nulls(rows, row_ids):
+        """对本批次写入行中的 None 字段显式 set_payload(None)，避免字段缺失语义漂移。"""
+        if not rows or not row_ids:
+            return
+
+        null_field_to_ids = {}
+        for row in rows:
+            rid = row.get("id")
+            if rid is None:
+                continue
+            for k, v in row.items():
+                if k == "id":
+                    continue
+                if v is None:
+                    null_field_to_ids.setdefault(k, []).append(int(rid))
+
+        for field_name, ids in null_field_to_ids.items():
+            synced = qm.set_null_for_points(field_name, ids)
+            file_log(
+                f"[Dynamic] Explicit NULL sync field='{field_name}': {synced}/{len(ids)} rows"
+            )
 
     if op == "insert":
         new_rows = []
@@ -2427,9 +2837,12 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 points=points,
                 wait=True
             )
-            dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+            new_df = pd.DataFrame(new_rows)
+            new_df = new_df.dropna(axis=1, how='all')  # 避免全NA列的 FutureWarning
+            dm.df = pd.concat([dm.df, new_df], ignore_index=True)
             dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
             inserted_ids = [r["id"] for r in new_rows]
+            _sync_explicit_nulls(new_rows, inserted_ids)
             file_log(f"[Dynamic] Inserted {len(new_rows)} rows: ids={inserted_ids}")
         except Exception as e:
             file_log(f"[Dynamic] Insert failed: {e}")
@@ -2502,9 +2915,12 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                     new_rows.append(row)
                     new_vectors.append(vec)
             if new_rows:
-                dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                new_df = pd.DataFrame(new_rows)
+                new_df = new_df.dropna(axis=1, how='all')  # 避免全NA列的 FutureWarning
+                dm.df = pd.concat([dm.df, new_df], ignore_index=True)
                 dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
             upsert_ids = [r["id"] for r in upsert_rows]
+            _sync_explicit_nulls(upsert_rows, upsert_ids)
             file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows: ids={upsert_ids}")
 
             # Upsert 后数据同步验证：回查 Qdrant 确认数据一致
@@ -2607,6 +3023,10 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
             if enable_dynamic_ops and i > 0 and i % 10 == 0:
                 _do_dynamic_op(dm, qm, file_log)
 
+            # --- Schema Evolution (每30轮) ---
+            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+                _do_schema_evolution(dm, qm, file_log)
+
             # 生成查询
             depth = random.randint(1, 15)
             filter_obj = None
@@ -2668,12 +3088,14 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                         print("   Missing rows (sample):")
                         for r in missing_rows[:3]:
                             print(f"     {r}")
+                        print_diff_evidence(dm, qm, missing, "MISSING (in Pandas but not Qdrant)", expr_str, file_log)
                     if extra:
                         extra_rows = sample_rows(extra)
                         file_log(f"  Extra rows sample: {extra_rows}")
                         print("   Extra rows (sample):")
                         for r in extra_rows[:3]:
                             print(f"     {r}")
+                        print_diff_evidence(dm, qm, extra, "EXTRA (in Qdrant but not Pandas)", expr_str, file_log)
 
                     failed_cases.append({
                         "id": i,
@@ -2811,6 +3233,10 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             if enable_dynamic_ops and i > 0 and random.random() < 0.2:
                 _do_dynamic_op(dm, qm, file_log)
 
+            # --- Schema Evolution (每30轮) ---
+            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+                _do_schema_evolution(dm, qm, file_log)
+
             # 生成基础查询
             base_filter = None
             for _ in range(10):
@@ -2874,6 +3300,12 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
                         file_log(f"  ❌ [{m_type}] FAIL! {diff_msg}")
                         file_log(f"     Mut Expr: {m_expr}")
+
+                        # 详细证据对比
+                        if missing:
+                            print_diff_evidence(dm, qm, missing, f"Mutation MISSING [{m_type}]", m_expr, file_log)
+                        if extra:
+                            print_diff_evidence(dm, qm, extra, f"Mutation EXTRA [{m_type}]", m_expr, file_log)
 
                         failed_cases.append({
                             "id": i,
@@ -2974,6 +3406,10 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             if enable_dynamic_ops and i > 0 and random.random() < 0.2:
                 _do_dynamic_op(dm, qm, file_log)
 
+            # --- Schema Evolution (每30轮) ---
+            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+                _do_schema_evolution(dm, qm, file_log)
+
             random_idx = random.randint(0, len(dm.df) - 1)
             pivot_row = dm.df.iloc[random_idx]
             pivot_id = int(pivot_row["id"])
@@ -3036,6 +3472,9 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
                     file_log(f"  -> ❌ FAIL! Target ID {pivot_id} NOT found.")
                     file_log(f"  -> Row Data: {safe_row}")
+
+                    # 获取 Qdrant 侧数据对比
+                    print_diff_evidence(dm, qm, {pivot_id}, "PQS MISSING PIVOT", expr, file_log)
 
                     errors.append({"id": pivot_id, "expr": expr})
 
@@ -3131,6 +3570,10 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
             # --- 动态操作（20% 概率）---
             if enable_dynamic_ops and i > 0 and random.random() < 0.2:
                 _do_dynamic_op(dm, qm, file_log)
+
+            # --- Schema Evolution (每30轮) ---
+            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+                _do_schema_evolution(dm, qm, file_log)
 
             group_field = random.choice(potential_group_fields)
             group_size = random.randint(1, 5)
