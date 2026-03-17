@@ -4095,6 +4095,8 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
 
     pqs_gen = PQSQueryGenerator(dm)
     errors = []
+    vector_checks = 0
+    vector_failures = 0
 
     # 定义一个辅助函数：安全地转换数据用于打印（处理 Numpy 和截断长数组）
     def safe_format_row(row_series):
@@ -4119,6 +4121,20 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
             else:
                 safe_data[k] = v
         return safe_data
+
+    def build_vector_search_params(search_k):
+        """根据当前向量索引类型构建检索参数，尽量提高召回稳定性。"""
+        metric = METRIC_TYPE
+        if CURRENT_INDEX_TYPE == "HNSW":
+            ef_param = max(128, search_k * 2)
+            return {"metric_type": metric, "params": {"ef": ef_param}}
+        if CURRENT_INDEX_TYPE and CURRENT_INDEX_TYPE.startswith("IVF"):
+            nprobe = min(128, max(16, search_k // 2))
+            return {"metric_type": metric, "params": {"nprobe": nprobe}}
+        if CURRENT_INDEX_TYPE == "DISKANN":
+            search_list = max(40, search_k * 2)
+            return {"metric_type": metric, "params": {"search_list": search_list}}
+        return {"metric_type": metric, "params": {}}
 
     with open(log_filename, "w", encoding="utf-8") as f:
         def file_log(msg):
@@ -4353,11 +4369,62 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
 
                     errors.append({"id": pivot_id, "expr": expr})
 
+                # --- PQS 向量检验 ---
+                # 用 pivot 对应向量做 ANN 检索，期望结果中至少包含 pivot_id。
+                # 为控制负载，按 VECTOR_CHECK_RATIO 比例抽样执行。
+                if random.random() < VECTOR_CHECK_RATIO and len(dm.vectors) > random_idx:
+                    vector_checks += 1
+                    try:
+                        pivot_vec = dm.vectors[random_idx].tolist()
+                        search_k = min(VECTOR_TOPK, len(dm.df))
+                        search_params = build_vector_search_params(search_k)
+                        vector_res = mm.col.search(
+                            data=[pivot_vec],
+                            anns_field="vector",
+                            param=search_params,
+                            limit=search_k,
+                            output_fields=["id"],
+                        )
+
+                        vector_ids = set()
+                        if vector_res and len(vector_res) > 0:
+                            for hit in vector_res[0]:
+                                vector_ids.add(hit.get("id") if isinstance(hit, dict) else hit.id)
+
+                        if pivot_id in vector_ids:
+                            file_log(
+                                f"  -> VectorSelfCheck PASS | k={search_k} | found={len(vector_ids)}"
+                            )
+                        else:
+                            vector_failures += 1
+                            top_ids = list(vector_ids)[:5]
+                            print(f"\n⚠️ PQS Vector SelfCheck FAIL [Round {i}] | Target ID: {pivot_id} | TopIDs: {top_ids}")
+                            file_log(
+                                f"  -> VectorSelfCheck FAIL | target={pivot_id} | top_ids={top_ids} | params={search_params}"
+                            )
+                            errors.append({
+                                "id": pivot_id,
+                                "expr": expr,
+                                "vector_check": True,
+                                "detail": f"Vector self-check miss, top_ids={top_ids}",
+                            })
+                    except Exception as ve:
+                        vector_failures += 1
+                        print(f"\n⚠️ PQS Vector Check Error [Round {i}]: {ve}")
+                        file_log(f"  -> VectorSelfCheck ERROR: {ve}")
+                        errors.append({
+                            "id": pivot_id,
+                            "expr": expr,
+                            "vector_check": True,
+                            "detail": f"Vector check error: {ve}",
+                        })
+
             except Exception as e:
                 print(f"\n\n⚠️ Execution Error [Round {i}]: {e}")
                 file_log(f"  -> EXECUTION ERROR: {e}")
 
     print("\n" + "="*60)
+    print(f"📊 向量自检统计: {vector_checks} 次, 失败 {vector_failures} 次")
     if not errors:
         print(f"✅ PQS 测试完成。未发现错误。")
     else:
