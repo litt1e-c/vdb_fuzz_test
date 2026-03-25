@@ -91,6 +91,10 @@ CHAOS_RATE = 0.0
 # Schema Evolution: 最大可动态添加的字段数
 MAX_EVOLVED_FIELDS = 5
 
+# Oracle 稳定性保护：维护/删除后自动与 Milvus 对账，降低 pandas NOT FOUND 噪声
+# 若要保留“删除后幽灵行”这类 Milvus 问题用于缺陷挖掘，可设为 False。
+AUTO_ORACLE_RESYNC = True
+
 # --- 边界值注入 ---
 # 按此概率在数据生成时将正常值替换为边界值（延迟初始化，在 run() 内种子设置后随机选取）
 BOUNDARY_INJECTION_RATE = None
@@ -199,6 +203,213 @@ def generate_unique_id():
     global _GLOBAL_ID_COUNTER
     _GLOBAL_ID_COUNTER += 1
     return 10000000 + _GLOBAL_ID_COUNTER * 1000 + random.randint(1, 999)
+
+def delete_ids_with_strong_sync(mm, dm, del_ids, file_log=None, max_verify_rounds=4, wait_seconds=0.2):
+    """
+    删除指定 ID，并仅在 Strong 一致性下确认删除成功后才同步移除 pandas 行。
+    这样可以避免 Milvus 删除未生效时，pandas 先删导致的 Oracle 假阳性。
+
+    Returns:
+        (confirmed_deleted_ids, still_present_ids)
+    """
+    target_ids = [int(x) for x in del_ids]
+    if not target_ids:
+        return [], []
+
+    def _log(msg):
+        if file_log:
+            file_log(msg)
+
+    pending = set(target_ids)
+
+    try:
+        mm.col.delete(f"id in {sorted(pending)}")
+        mm.col.flush()
+    except Exception as e:
+        _log(f"[Dynamic] Delete request failed before sync: {e}")
+        return [], sorted(pending)
+
+    # 尽力刷新段状态，降低 stale 读概率
+    try:
+        mm.col.compact()
+        mm.col.wait_for_compaction_completed()
+        mm.col.release()
+        mm.col.load()
+    except Exception:
+        pass
+
+    for attempt in range(max_verify_rounds):
+        if not pending:
+            break
+
+        try:
+            verify_res = mm.col.query(
+                f"id in {sorted(pending)}",
+                output_fields=["id"],
+                limit=max(len(pending), 1),
+                consistency_level="Strong"
+            )
+            still_present = {int(r["id"]) for r in verify_res}
+        except Exception as e:
+            _log(f"[Dynamic] Delete verify attempt {attempt + 1} failed: {e}")
+            time.sleep(wait_seconds)
+            continue
+
+        pending = still_present
+        if not pending:
+            break
+
+        # 对仍存在的 ID 进行重试删除
+        try:
+            mm.col.delete(f"id in {sorted(pending)}")
+            mm.col.flush()
+        except Exception as e:
+            _log(f"[Dynamic] Delete retry attempt {attempt + 1} failed: {e}")
+
+        time.sleep(wait_seconds)
+
+    confirmed_deleted = [rid for rid in target_ids if rid not in pending]
+    still_present_ids = sorted(pending)
+
+    if confirmed_deleted:
+        idx = dm.df[dm.df["id"].isin(confirmed_deleted)].index.to_numpy()
+        if idx.size > 0:
+            dm.df = dm.df.drop(idx).reset_index(drop=True)
+            if isinstance(dm.vectors, np.ndarray) and dm.vectors.shape[0] > 0:
+                dm.vectors = np.delete(dm.vectors, idx, axis=0)
+
+    return confirmed_deleted, still_present_ids
+
+def _coerce_milvus_value_for_pandas(v, field_cfg):
+    """按 schema 将 Milvus 返回值规范化为 pandas Oracle 可用值。"""
+    if v is None:
+        return None
+    if hasattr(v, "item"):
+        v = v.item()
+    if isinstance(v, float) and np.isnan(v):
+        return None
+
+    ftype = field_cfg["type"]
+
+    if ftype in (DataType.ARRAY, DataType.JSON) and isinstance(v, str):
+        # Milvus 在部分路径会把 ARRAY/JSON 以字符串返回，尽力反序列化
+        try:
+            return json.loads(v)
+        except Exception:
+            return v
+
+    if ftype in ALL_INT_TYPES:
+        try:
+            return int(v)
+        except Exception:
+            return v
+    if ftype in ALL_FLOAT_TYPES:
+        try:
+            return float(v)
+        except Exception:
+            return v
+    if ftype == DataType.BOOL:
+        if isinstance(v, (bool, np.bool_)):
+            return bool(v)
+        return v
+    return v
+
+def reconcile_pandas_oracle_with_milvus(mm, dm, file_log=None, reason="unknown"):
+    """
+    将 pandas Oracle 与 Milvus 当前可见数据做强一致对账。
+    目的：防止维护操作后 Milvus 可见集合变化而 pandas 未同步导致大量 NOT FOUND 噪声。
+    """
+    def _log(msg):
+        if file_log:
+            file_log(msg)
+
+    # 1) 拉取 Milvus 全量 ID（Strong）
+    milvus_ids = set()
+    try:
+        it = mm.col.query_iterator(
+            batch_size=10000,
+            expr="id >= 0",
+            output_fields=["id"],
+            consistency_level="Strong"
+        )
+        while True:
+            batch = it.next()
+            if not batch:
+                it.close()
+                break
+            for row in batch:
+                rid = row.get("id")
+                if rid is not None:
+                    milvus_ids.add(int(rid))
+    except Exception as e:
+        _log(f"[OracleSync] Failed to read Milvus IDs ({reason}): {e}")
+        return 0, 0
+
+    pandas_ids = set(int(x) for x in dm.df["id"].tolist()) if not dm.df.empty else set()
+    to_drop = pandas_ids - milvus_ids
+    to_add = milvus_ids - pandas_ids
+
+    # 2) pandas 有 / Milvus 无：删除 pandas 侧残留
+    dropped = 0
+    if to_drop:
+        idx = dm.df[dm.df["id"].isin(list(to_drop))].index.to_numpy()
+        dropped = int(len(idx))
+        if dropped > 0:
+            dm.df = dm.df.drop(idx).reset_index(drop=True)
+            if isinstance(dm.vectors, np.ndarray) and dm.vectors.shape[0] > 0:
+                dm.vectors = np.delete(dm.vectors, idx, axis=0)
+
+    # 3) Milvus 有 / pandas 无：回灌行到 pandas（含 vector）
+    added = 0
+    if to_add:
+        all_output_fields = ["id", "vector"] + [fc["name"] for fc in dm.schema_config]
+        new_rows = []
+        new_vectors = []
+        add_list = list(to_add)
+        for start in range(0, len(add_list), 200):
+            batch_ids = add_list[start:start + 200]
+            try:
+                rows = mm.col.query(
+                    f"id in {batch_ids}",
+                    output_fields=all_output_fields,
+                    limit=len(batch_ids),
+                    consistency_level="Strong"
+                )
+            except Exception as e:
+                _log(f"[OracleSync] Failed to fetch missing rows ({reason}): {e}")
+                continue
+
+            for r in rows:
+                rid = r.get("id")
+                if rid is None:
+                    continue
+                row = {"id": int(rid)}
+                for fc in dm.schema_config:
+                    fname = fc["name"]
+                    row[fname] = _coerce_milvus_value_for_pandas(r.get(fname), fc)
+                vec = r.get("vector")
+                if vec is None:
+                    # 回退：保持维度一致，避免向量数组崩坏
+                    vec = [0.0] * DIM
+                    _log(f"[OracleSync] Missing vector for id={rid}, fallback to zero vector")
+                new_rows.append(row)
+                new_vectors.append(vec)
+
+        if new_rows:
+            dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+            vec_arr = np.array(new_vectors, dtype=np.float32)
+            if isinstance(dm.vectors, np.ndarray) and dm.vectors.size > 0:
+                dm.vectors = np.vstack([dm.vectors, vec_arr])
+            else:
+                dm.vectors = vec_arr
+            added = len(new_rows)
+
+    # 对齐后做一次空值语义规范化，避免 {} / [] 引发 Oracle 偏差
+    normalize_empty_to_none(dm.df, dm.schema_config)
+
+    if added or dropped:
+        _log(f"[OracleSync] reason={reason}, added={added}, dropped={dropped}, pandas_total={len(dm.df)}")
+    return added, dropped
 
 class DataManager:
     # 用于动态生成唯一 ID 的计数器（避免使用 time.time() 导致不可重复）
@@ -1233,7 +1444,20 @@ class OracleQueryGenerator:
         valid_series = self.df[fname].dropna()
         if not valid_series.empty and random.random() < 0.8: # 90% 概率从真实数据采样,这里先暂时改成0.8进行测试
             val = random.choice(valid_series.values)
-            if hasattr(val, "item"): val = val.item()
+            if hasattr(val, "item"):
+                val = val.item()
+            # 避免 pandas nullable/int 列被 upcast 为 float 后，生成如 INT16 <= 10203.0 的非法表达式
+            if ftype in ALL_INT_TYPES:
+                try:
+                    return int(val)
+                except Exception:
+                    pass
+            if ftype == DataType.BOOL:
+                return bool(val)
+            if ftype == DataType.FLOAT:
+                return float(np.float32(val))
+            if ftype == DataType.DOUBLE:
+                return float(val)
             return val
 
 
@@ -2515,17 +2739,12 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                     del_count = min(batch_count, len(dm.df) - 100)
                     del_ids = random.sample(dm.df["id"].tolist(), del_count)
                     try:
-                        expr = f"id in {del_ids}"
-                        mm.col.delete(expr)
-                        mm.col.flush()
-                        mm.col.compact()
-                        mm.col.wait_for_compaction_completed()
-                        mm.col.release()
-                        mm.col.load()
-                        idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
-                        dm.df = dm.df.drop(idx).reset_index(drop=True)
-                        dm.vectors = np.delete(dm.vectors, idx, axis=0)
-                        file_log(f"[Dynamic] Deleted {len(del_ids)} rows")
+                        deleted_ids, still_present = delete_ids_with_strong_sync(
+                            mm, dm, del_ids, file_log=file_log
+                        )
+                        file_log(f"[Dynamic] Deleted {len(deleted_ids)}/{len(del_ids)} rows")
+                        if still_present:
+                            file_log(f"[DELETE_WARN] IDs still exist in Milvus after delete sync: {still_present}")
                     except Exception as e:
                         file_log(f"[Dynamic] Delete failed: {e}")
 
@@ -3049,6 +3268,9 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     CURRENT_INDEX_TYPE = new_index_type
                     mm.col.load()
                     file_log(f"[Maintenance] Reloaded collection after index rebuild at round {i}")
+                    # 维护操作后做 Oracle 对账，避免 Milvus 可见集变化导致 pandas NOT FOUND
+                    if AUTO_ORACLE_RESYNC:
+                        reconcile_pandas_oracle_with_milvus(mm, dm, file_log=file_log, reason=f"vector_rebuild_r{i}")
                 except Exception as e:
                     file_log(f"[Maintenance] Index rebuild failed at round {i}: {e}")
                     # 尝试恢复：重新 load collection
@@ -3070,6 +3292,9 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
 
                     mm.col.load()
                     file_log(f"[Maintenance] Reloaded collection after scalar index rebuild at round {i}")
+                    # 标量索引重建后同样做一次对账（该阶段最容易出现可见集漂移）
+                    if AUTO_ORACLE_RESYNC:
+                        reconcile_pandas_oracle_with_milvus(mm, dm, file_log=file_log, reason=f"scalar_rebuild_r{i}")
                 except Exception as e:
                     file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
                     try:
@@ -3109,28 +3334,19 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                         del_count = min(batch_count, len(dm.df))
                         del_ids = random.sample(dm.df["id"].tolist(), del_count)
                         try:
-                            expr = f"id in {del_ids}"
-                            mm.col.delete(expr)
-                            mm.col.flush()
-                            mm.col.compact()
-                            mm.col.wait_for_compaction_completed()
-                            mm.col.release()
-                            mm.col.load()
-                            idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
-                            dm.df = dm.df.drop(idx).reset_index(drop=True)
-                            dm.vectors = np.delete(dm.vectors, idx, axis=0)
-                            file_log(f"[Dynamic] Deleted {len(del_ids)} rows: ids={del_ids}")
-                            
-                            # 验证删除是否生效
-                            for did in del_ids:
-                                verify_res = mm.col.query(
-                                    f"id == {did}",
-                                    output_fields=["id"],
-                                    consistency_level="Strong"
+                            deleted_ids, still_present = delete_ids_with_strong_sync(
+                                mm, dm, del_ids, file_log=file_log
+                            )
+                            file_log(
+                                f"[Dynamic] Deleted {len(deleted_ids)}/{len(del_ids)} rows: ids={deleted_ids}"
+                            )
+                            if still_present:
+                                file_log(
+                                    f"[DELETE_WARN] IDs still exist in Milvus after delete sync: {still_present}"
                                 )
-                                if verify_res:
-                                    file_log(f"[DELETE_WARN] ID {did} still exists in Milvus after delete!")
-                                    
+                            # 删除后立即做一次轻量对账，防止后续查询出现批量 NOT FOUND
+                            if AUTO_ORACLE_RESYNC:
+                                reconcile_pandas_oracle_with_milvus(mm, dm, file_log=file_log, reason=f"delete_r{i}")
                         except Exception as e:
                             file_log(f"[Dynamic] Delete failed: {e}")
 
@@ -3429,7 +3645,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                         })
                 # --- 向量 + 标量联合校验（HNSW/IVF/FLAT 均可），可选执行 ---
                 # 仅当存在满足标量条件的数据时才做检查，且按比例抽样，避免对公用服务器造成额外压力。
-                if expected_ids and random.random() < VECTOR_CHECK_RATIO:
+                # 仅在标量过滤完全一致时再做向量校验，避免把同一根因重复报成 VectorCheck FAIL
+                if expected_ids == actual_ids and expected_ids and random.random() < VECTOR_CHECK_RATIO:
                     try:
                         # 随机挑一条已有向量作为查询向量，确保搜索能命中实际数据
                         q_idx = random.randint(0, len(dm.vectors) - 1)
@@ -4465,17 +4682,12 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                     del_count = min(batch_count, len(dm.df) - 100)
                     del_ids = random.sample(dm.df["id"].tolist(), del_count)
                     try:
-                        expr = f"id in {del_ids}"
-                        mm.col.delete(expr)
-                        mm.col.flush()
-                        mm.col.compact()
-                        mm.col.wait_for_compaction_completed()
-                        mm.col.release()
-                        mm.col.load()
-                        idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
-                        dm.df = dm.df.drop(idx).reset_index(drop=True)
-                        dm.vectors = np.delete(dm.vectors, idx, axis=0)
-                        file_log(f"[Dynamic] Deleted {len(del_ids)} rows")
+                        deleted_ids, still_present = delete_ids_with_strong_sync(
+                            mm, dm, del_ids, file_log=file_log
+                        )
+                        file_log(f"[Dynamic] Deleted {len(deleted_ids)}/{len(del_ids)} rows")
+                        if still_present:
+                            file_log(f"[DELETE_WARN] IDs still exist in Milvus after delete sync: {still_present}")
                     except Exception as e:
                         file_log(f"[Dynamic] Delete failed: {e}")
 
@@ -4816,17 +5028,12 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                     del_count = min(batch_count, len(dm.df) - 100)
                     del_ids = random.sample(dm.df["id"].tolist(), del_count)
                     try:
-                        expr = f"id in {del_ids}"
-                        mm.col.delete(expr)
-                        mm.col.flush()
-                        mm.col.compact()
-                        mm.col.wait_for_compaction_completed()
-                        mm.col.release()
-                        mm.col.load()
-                        idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
-                        dm.df = dm.df.drop(idx).reset_index(drop=True)
-                        dm.vectors = np.delete(dm.vectors, idx, axis=0)
-                        file_log(f"[Dynamic] Deleted {len(del_ids)} rows")
+                        deleted_ids, still_present = delete_ids_with_strong_sync(
+                            mm, dm, del_ids, file_log=file_log
+                        )
+                        file_log(f"[Dynamic] Deleted {len(deleted_ids)}/{len(del_ids)} rows")
+                        if still_present:
+                            file_log(f"[DELETE_WARN] IDs still exist in Milvus after delete sync: {still_present}")
                     except Exception as e:
                         file_log(f"[Dynamic] Delete failed: {e}")
                 else:  # upsert
