@@ -12,6 +12,7 @@ import time
 import random
 import string
 import math
+import copy
 import numpy as np
 import pandas as pd
 import json
@@ -97,12 +98,139 @@ class DataManager:
         self.vectors = None
         self.schema_config = []
         self.null_ratio = random.uniform(0.05, 0.15)
+        self.boundary_injection_rate = random.uniform(0.08, 0.22)
+        self.query_boundary_rate = min(0.35, self.boundary_injection_rate + 0.08)
         self.array_capacity = random.randint(5, 50)
         self.json_max_depth = random.randint(1, 5)
         self.int_range = random.randint(5000, 100000)
         self.double_scale = random.uniform(100, 10000)
 
     KEY_POOL = [f"k_{i}" for i in range(20)] + ["user", "log", "data", "a_b", "test_key"]
+    FLOAT32_MAX = float(np.finfo(np.float32).max)
+    FLOAT32_MIN_NORMAL = float(np.finfo(np.float32).tiny)
+    FLOAT32_MIN_SUBNORMAL = float(np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32))
+
+    def _boundary_pool(self, ftype):
+        """按字段类型返回边界值候选池。"""
+        epoch_2020 = int(datetime(2020, 1, 1).timestamp())
+        epoch_2025 = int(datetime(2025, 1, 1).timestamp())
+
+        if ftype == FieldType.INT:
+            return [
+                -self.int_range, -1, 0, 1, self.int_range,
+                -2147483648, 2147483647,
+                -9223372036854775807, 9223372036854775806
+            ]
+        if ftype == FieldType.FLOAT:
+            return [
+                -0.0, 0.0, -1.0, 1.0,
+                -self.double_scale, self.double_scale,
+                -self.FLOAT32_MIN_SUBNORMAL, self.FLOAT32_MIN_SUBNORMAL,
+                -self.FLOAT32_MIN_NORMAL, self.FLOAT32_MIN_NORMAL,
+                -self.FLOAT32_MAX, self.FLOAT32_MAX
+            ]
+        if ftype == FieldType.BOOL:
+            return [False, True]
+        if ftype == FieldType.STRING:
+            return [
+                "", " ", "0", "A", "a" * 64,
+                "Z" * 256, "!@#$%^&*()_+-=[]{}|;:,.<>?/"
+            ]
+        if ftype == FieldType.JSON:
+            return [
+                {
+                    "price": 0,
+                    "color": "Red",
+                    "active": True,
+                    "config": {"version": 1},
+                    "history": [0, 0, 0]
+                },
+                {
+                    "price": 999,
+                    "color": "Blue",
+                    "active": False,
+                    "config": {"version": 9},
+                    "history": [99, 50, 1]
+                },
+                {
+                    "price": None,
+                    "color": "Green",
+                    "active": False,
+                    "config": {"version": 0},
+                    "history": [-1, 100, 2147483647],
+                    "random_payload": ""
+                },
+                {
+                    "price": -1,
+                    "color": "",
+                    "active": True,
+                    "test_key": "edge",
+                    "random_payload": {"k": "v"}
+                },
+            ]
+        if ftype == FieldType.ARRAY_INT:
+            return [
+                [], [0], [-1, 0, 1],
+                [-2147483648, 2147483647],
+                [-9223372036854775807, 9223372036854775806]
+            ]
+        if ftype == FieldType.ARRAY_STR:
+            return [
+                [], [""], [" ", "0", "A"],
+                ["x" * 64, "y" * 128],
+                ["!@#", "[]{}"]
+            ]
+        if ftype == FieldType.ARRAY_FLOAT:
+            return [
+                [], [0.0], [-0.0],
+                [-self.FLOAT32_MIN_SUBNORMAL, self.FLOAT32_MIN_SUBNORMAL],
+                [-self.FLOAT32_MAX, self.FLOAT32_MAX]
+            ]
+        if ftype == FieldType.DATETIME:
+            return [0, epoch_2020, epoch_2025 - 1, 2147483647, 4102444800]
+        if ftype == FieldType.GEO:
+            return [
+                {"lat": 0.0, "lon": 0.0},
+                {"lat": -90.0, "lon": -180.0},
+                {"lat": 90.0, "lon": 180.0},
+                {"lat": -89.999999, "lon": 179.999999},
+            ]
+        return []
+
+    def _pick_boundary_value(self, ftype, rng=None):
+        pool = self._boundary_pool(ftype)
+        if not pool:
+            return None
+        if rng is None:
+            val = random.choice(pool)
+        else:
+            val = pool[int(rng.integers(0, len(pool)))]
+        return copy.deepcopy(val)
+
+    def sample_boundary_value(self, ftype):
+        """供查询生成器使用。"""
+        return self._pick_boundary_value(ftype, rng=None)
+
+    def _maybe_use_boundary_value(self, value, ftype, rng):
+        if value is None:
+            return None
+        if float(rng.random()) < self.boundary_injection_rate:
+            boundary_val = self._pick_boundary_value(ftype, rng=rng)
+            if boundary_val is not None:
+                return boundary_val
+        return value
+
+    def _inject_boundary_values(self, values, ftype, rng):
+        if not isinstance(values, list):
+            values = list(values)
+        for idx, val in enumerate(values):
+            if val is None:
+                continue
+            if float(rng.random()) < self.boundary_injection_rate:
+                boundary_val = self._pick_boundary_value(ftype, rng=rng)
+                if boundary_val is not None:
+                    values[idx] = boundary_val
+        return values
 
     def _gen_random_json_structure(self, rng, depth=3):
         """递归生成随机 JSON 结构"""
@@ -174,6 +302,7 @@ class DataManager:
 
     def generate_data(self):
         print(f"🌊 2. Generating {N} rows (Vector Dim={DIM})...")
+        print(f"   -> Boundary injection rate: {self.boundary_injection_rate:.2%}")
         rng = np.random.default_rng(42)
         self.vectors = rng.random((N, DIM), dtype=np.float32)
         self.vectors /= np.linalg.norm(self.vectors, axis=1)[:, np.newaxis]
@@ -187,15 +316,19 @@ class DataManager:
 
             if ftype == FieldType.INT:
                 values = rng.integers(-self.int_range, self.int_range, size=N).tolist()
+                values = self._inject_boundary_values(values, ftype, rng)
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.FLOAT:
                 values = (rng.random(N) * self.double_scale).tolist()
+                values = self._inject_boundary_values(values, ftype, rng)
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.BOOL:
                 values = rng.choice([True, False], size=N).tolist()
+                values = self._inject_boundary_values(values, ftype, rng)
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.STRING:
                 values = [self._random_string(0, random.randint(5, 50)) for _ in range(N)]
+                values = self._inject_boundary_values(values, ftype, rng)
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.JSON:
                 json_list = []
@@ -219,24 +352,28 @@ class DataManager:
                     else:
                         base_obj["random_payload"] = random_part
                     json_list.append(base_obj)
+                json_list = self._inject_boundary_values(json_list, ftype, rng)
                 data[fname] = json_list
             elif ftype == FieldType.ARRAY_INT:
                 arr_list = []
                 for _ in range(N):
                     length = random.randint(0, 5)
                     arr_list.append(list(rng.integers(0, 100, size=length)))
+                arr_list = self._inject_boundary_values(arr_list, ftype, rng)
                 data[fname] = self._apply_nulls(arr_list, rng)
             elif ftype == FieldType.ARRAY_STR:
                 arr_list = []
                 for _ in range(N):
                     length = random.randint(0, 5)
                     arr_list.append([self._random_string(2, 8) for _ in range(length)])
+                arr_list = self._inject_boundary_values(arr_list, ftype, rng)
                 data[fname] = self._apply_nulls(arr_list, rng)
             elif ftype == FieldType.ARRAY_FLOAT:
                 arr_list = []
                 for _ in range(N):
                     length = random.randint(0, 5)
                     arr_list.append([round(float(rng.random() * 1000), 2) for _ in range(length)])
+                arr_list = self._inject_boundary_values(arr_list, ftype, rng)
                 data[fname] = self._apply_nulls(arr_list, rng)
             elif ftype == FieldType.DATETIME:
                 # 生成时间戳（epoch 秒数，整型）
@@ -244,6 +381,7 @@ class DataManager:
                 epoch_2020 = int(datetime(2020, 1, 1).timestamp())
                 epoch_2025 = int(datetime(2025, 1, 1).timestamp())
                 values = [int(rng.integers(epoch_2020, epoch_2025)) for _ in range(N)]
+                values = self._inject_boundary_values(values, ftype, rng)
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.GEO:
                 geo_list = []
@@ -255,6 +393,7 @@ class DataManager:
                             "lat": round(float(rng.uniform(-90, 90)), 6),
                             "lon": round(float(rng.uniform(-180, 180)), 6)
                         })
+                geo_list = self._inject_boundary_values(geo_list, ftype, rng)
                 data[fname] = geo_list
 
         self.df = pd.DataFrame(data)
@@ -291,13 +430,17 @@ class DataManager:
                 continue
 
             if ftype == FieldType.INT:
-                row[fname] = int(rng.integers(-self.int_range, self.int_range))
+                val = int(rng.integers(-self.int_range, self.int_range))
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.FLOAT:
-                row[fname] = float(rng.random() * self.double_scale)
+                val = float(rng.random() * self.double_scale)
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.BOOL:
-                row[fname] = bool(rng.choice([True, False]))
+                val = bool(rng.choice([True, False]))
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.STRING:
-                row[fname] = self._random_string(0, random.randint(5, 50))
+                val = self._random_string(0, random.randint(5, 50))
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.JSON:
                 if rng.random() < self.null_ratio:
                     row[fname] = None
@@ -316,29 +459,34 @@ class DataManager:
                     base_obj.update(random_part)
                 else:
                     base_obj["random_payload"] = random_part
-                row[fname] = base_obj
+                row[fname] = self._maybe_use_boundary_value(base_obj, ftype, rng)
             elif ftype == FieldType.ARRAY_INT:
                 arr_len = rng.integers(0, 6)
-                row[fname] = [int(x) for x in rng.integers(0, 100, size=arr_len)]
+                val = [int(x) for x in rng.integers(0, 100, size=arr_len)]
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.ARRAY_STR:
                 arr_len = rng.integers(0, 6)
-                row[fname] = [self._random_string(2, 8) for _ in range(arr_len)]
+                val = [self._random_string(2, 8) for _ in range(arr_len)]
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.ARRAY_FLOAT:
                 arr_len = rng.integers(0, 6)
-                row[fname] = [round(float(rng.random() * 1000), 2) for _ in range(arr_len)]
+                val = [round(float(rng.random() * 1000), 2) for _ in range(arr_len)]
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.DATETIME:
                 from datetime import datetime as dt_cls
                 epoch_2020 = int(dt_cls(2020, 1, 1).timestamp())
                 epoch_2025 = int(dt_cls(2025, 1, 1).timestamp())
-                row[fname] = int(rng.integers(epoch_2020, epoch_2025))
+                val = int(rng.integers(epoch_2020, epoch_2025))
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.GEO:
                 if rng.random() < self.null_ratio:
                     row[fname] = None
                 else:
-                    row[fname] = {
+                    val = {
                         "lat": round(float(rng.uniform(-90, 90)), 6),
                         "lon": round(float(rng.uniform(-180, 180)), 6)
                     }
+                    row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
         return row
 
     def generate_single_vector(self):
@@ -351,19 +499,20 @@ class DataManager:
         """为给定字段配置生成一个随机值（用于 schema evolution 回填）"""
         rng = np.random.default_rng(np.random.randint(0, 2**31))
         ftype = field_config["type"]
+        value = None
 
         if ftype == FieldType.INT:
-            return int(rng.integers(-self.int_range, self.int_range))
+            value = int(rng.integers(-self.int_range, self.int_range))
         elif ftype == FieldType.FLOAT:
-            return float(rng.random() * self.double_scale)
+            value = float(rng.random() * self.double_scale)
         elif ftype == FieldType.BOOL:
-            return bool(rng.choice([True, False]))
+            value = bool(rng.choice([True, False]))
         elif ftype == FieldType.STRING:
-            return self._random_string(0, random.randint(5, 50))
+            value = self._random_string(0, random.randint(5, 50))
         elif ftype == FieldType.DATETIME:
             epoch_2020 = int(datetime(2020, 1, 1).timestamp())
             epoch_2025 = int(datetime(2025, 1, 1).timestamp())
-            return int(rng.integers(epoch_2020, epoch_2025))
+            value = int(rng.integers(epoch_2020, epoch_2025))
         elif ftype == FieldType.JSON:
             base_obj = {
                 "price": int(rng.integers(0, 1000)),
@@ -379,22 +528,23 @@ class DataManager:
                 base_obj.update(random_part)
             else:
                 base_obj["random_payload"] = random_part
-            return base_obj
+            value = base_obj
         elif ftype == FieldType.ARRAY_INT:
             arr_len = rng.integers(0, 6)
-            return [int(x) for x in rng.integers(0, 100, size=arr_len)]
+            value = [int(x) for x in rng.integers(0, 100, size=arr_len)]
         elif ftype == FieldType.ARRAY_STR:
             arr_len = rng.integers(0, 6)
-            return [self._random_string(2, 8) for _ in range(arr_len)]
+            value = [self._random_string(2, 8) for _ in range(arr_len)]
         elif ftype == FieldType.ARRAY_FLOAT:
             arr_len = rng.integers(0, 6)
-            return [round(float(rng.random() * 1000), 2) for _ in range(arr_len)]
+            value = [round(float(rng.random() * 1000), 2) for _ in range(arr_len)]
         elif ftype == FieldType.GEO:
-            return {
+            value = {
                 "lat": round(float(rng.uniform(-90, 90)), 6),
                 "lon": round(float(rng.uniform(-180, 180)), 6)
             }
-        return None
+
+        return self._maybe_use_boundary_value(value, ftype, rng)
 
     def evolve_schema_add_field(self):
         """
@@ -809,6 +959,7 @@ class OracleQueryGenerator:
     def __init__(self, dm):
         self.schema = dm.schema_config
         self._dm = dm  # 保存 dm 引用，动态获取最新 df
+        self._query_boundary_rate = dm.query_boundary_rate
 
     @property
     def df(self):
@@ -849,12 +1000,22 @@ class OracleQueryGenerator:
         演化字段未回填的行在 Qdrant 里"字段不存在"，需用 IsEmptyCondition 而非 IsNullCondition。"""
         return name.startswith("evo_")
 
-    def _empty_or_null_filter(self, key):
-        """Treat null payloads as empty when checking array emptiness"""
-        return Filter(should=[
-            self._empty_filter(key),
-            self._null_filter(key)
-        ])
+    @staticmethod
+    def _is_na_like(x):
+        return x is None or (isinstance(x, float) and np.isnan(x))
+
+    def _series_is_null(self, series):
+        return series.apply(self._is_na_like)
+
+    def _series_not_null(self, series):
+        return ~self._series_is_null(series)
+
+    def _series_is_empty(self, series):
+        # 对齐 Qdrant IsEmpty：missing/null/[]。在 pandas 中 missing 映射为 None/NaN。
+        return series.apply(lambda x: self._is_na_like(x) or (isinstance(x, list) and len(x) == 0))
+
+    def _series_not_empty(self, series):
+        return ~self._series_is_empty(series)
 
     def _condition_filter(self, condition):
         return Filter(must=[condition])
@@ -864,6 +1025,18 @@ class OracleQueryGenerator:
 
     def _empty_filter(self, key):
         return self._condition_filter(self._is_empty_condition(key))
+
+    def _qdrant_is_empty_filter(self, key):
+        return Filter(must=[self._is_empty_condition(key)])
+
+    def _qdrant_not_empty_filter(self, key):
+        return Filter(must_not=[self._is_empty_condition(key)])
+
+    def _qdrant_nullish_filter(self, key):
+        """nullish 语义：普通字段用 IsNull；演进字段用 IsEmpty（覆盖缺失）。"""
+        if self._is_evolved_field(key):
+            return self._qdrant_is_empty_filter(key)
+        return self._qdrant_is_null_filter(key)
 
     def _get_json_val(self, obj, keys):
         """获取 JSON 嵌套值"""
@@ -883,6 +1056,20 @@ class OracleQueryGenerator:
 
     def get_value_for_query(self, fname, ftype):
         """获取用于查询的值"""
+        # 在查询参数层注入边界值，提升各模式边界覆盖率
+        if random.random() < self._query_boundary_rate:
+            boundary_val = self._dm.sample_boundary_value(ftype)
+            if boundary_val is not None:
+                if ftype == FieldType.FLOAT:
+                    return float(np.float32(boundary_val))
+                if ftype == FieldType.ARRAY_INT and isinstance(boundary_val, list):
+                    return boundary_val[0] if boundary_val else 0
+                if ftype == FieldType.ARRAY_STR and isinstance(boundary_val, list):
+                    return boundary_val[0] if boundary_val else ""
+                if ftype == FieldType.ARRAY_FLOAT and isinstance(boundary_val, list):
+                    return float(np.float32(boundary_val[0])) if boundary_val else 0.0
+                return boundary_val
+
         valid_series = self.df[fname].dropna()
         if not valid_series.empty and random.random() < 0.8:
             val = random.choice(valid_series.values)
@@ -945,40 +1132,31 @@ class OracleQueryGenerator:
 
         # 1. Null/Empty Check
         if random.random() < 0.15:
+            # 演化字段在 Qdrant 中常见“字段缺失”，这里统一走 IsEmpty 语义，避免把 missing 误判到 is_null。
+            if self._is_evolved_field(name):
+                if random.random() < 0.5:
+                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
+                return (self._qdrant_not_empty_filter(name), self._series_not_empty(series), f"{name} is not empty")
+
+            if ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT]:
+                op = random.choice(["is_null", "is_not_null", "is_empty", "is_not_empty"])
+                if op == "is_null":
+                    return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
+                if op == "is_not_null":
+                    return (self._qdrant_not_null_filter(name), self._series_not_null(series), f"{name} is not null")
+                if op == "is_empty":
+                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
+                return (self._qdrant_not_empty_filter(name), self._series_not_empty(series), f"{name} is not empty")
+
             if random.random() < 0.5:
-                # is_null
-                # 演化字段未回填的行在 Qdrant 里是"字段不存在"（Qdrant 不存 None），
-                # 需用 IsEmptyCondition（覆盖"字段不存在 or null or []"）以匹配 Pandas 的 None。
-                if self._is_evolved_field(name):
-                    filter_cond = Filter(must=[self._is_empty_condition(name)])
-                    return (filter_cond, series.isna(), f"{name} is null")
-                else:
-                    filter_cond = self._null_filter(name)
-                    return (filter_cond, series.isnull(), f"{name} is null")
-            else:
-                # is_not_null / is_empty
-                if ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR]:
-                    filter_cond = self._empty_or_null_filter(name)
-                    mask = series.apply(lambda x: x is None or (isinstance(x, list) and len(x) == 0))
-                    return (filter_cond, mask, f"{name} is empty")
-                else:
-                    # 演化字段：NOT IsEmpty (字段存在且有非 None/[] 值)
-                    if self._is_evolved_field(name):
-                        filter_cond = Filter(must_not=[self._is_empty_condition(name)])
-                        return (filter_cond, series.notna(), f"{name} is not null")
-                    else:
-                        # 普通字段：NOT IsNull
-                        filter_cond = Filter(must_not=[self._is_null_condition(name)])
-                        return (filter_cond, series.notnull(), f"{name} is not null")
+                return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
+            return (self._qdrant_not_null_filter(name), self._series_not_null(series), f"{name} is not null")
 
         val = self.get_value_for_query(name, ftype)
         if val is None:
             if self._is_evolved_field(name):
-                filter_cond = Filter(must=[self._is_empty_condition(name)])
-                return (filter_cond, series.isna(), f"{name} is null")
-            else:
-                filter_cond = self._null_filter(name)
-                return (filter_cond, series.isnull(), f"{name} is null")
+                return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
+            return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
 
         # 安全比较函数 - 处理 None 和 NaN
         def safe_compare_scalar(op, target_val):
@@ -1077,7 +1255,10 @@ class OracleQueryGenerator:
             expr_str = f"{name} {op} {val_float}"
 
         elif ftype == FieldType.STRING:
-            op = random.choice(["==", "!=", "in"])
+            str_ops = ["==", "!=", "in"]
+            if hasattr(models, "MatchPhrase"):
+                str_ops.append("phrase")
+            op = random.choice(str_ops)
             
             if op == "==":
                 filter_cond = FieldCondition(key=name, match=MatchValue(value=val))
@@ -1087,6 +1268,17 @@ class OracleQueryGenerator:
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val]}))
                 mask = series.apply(safe_compare_scalar("!=", val))
                 expr_str = f'{name} != "{val}"'
+            elif op == "phrase":
+                val_str = str(val)
+                if len(val_str) >= 4:
+                    start = random.randint(0, max(0, len(val_str) - 3))
+                    phrase = val_str[start:start + random.randint(2, min(6, len(val_str) - start))]
+                else:
+                    phrase = val_str
+                filter_cond = FieldCondition(key=name, match=models.MatchPhrase(phrase=phrase))
+                # 无全文索引时，Qdrant 退化为 substring 匹配
+                mask = series.apply(lambda x, p=phrase: isinstance(x, str) and p in x)
+                expr_str = f'{name} phrase "{phrase}"'
             else:  # in
                 # 生成多个值的列表
                 valid_vals = [str(x) for x in self.df[name].dropna().unique()[:5].tolist()]
@@ -1101,14 +1293,51 @@ class OracleQueryGenerator:
             return self.gen_json_expr(name, series, val)
 
         elif ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR]:
-            # 数组包含查询
+            # 数组包含 / values_count 查询
             valid_series = self.df[name].dropna()
             all_items = []
             for arr in valid_series:
                 if isinstance(arr, list):
                     all_items.extend(arr)
-            
-            if all_items:
+
+            array_ops = ["contains", "not_empty"]
+            # Qdrant 对缺失字段不参与 values_count，而 pandas 中演化字段的 missing/null 不易严格区分，
+            # 为避免 oracle 误报，演化字段不生成 values_count 谓词。
+            if not self._is_evolved_field(name):
+                array_ops.append("values_count")
+            array_op = random.choice(array_ops)
+
+            if array_op == "values_count":
+                cmp_op = random.choice(["gt", "gte", "lt", "lte"])
+                threshold = random.randint(0, 4)
+                filter_cond = FieldCondition(
+                    key=name,
+                    values_count=models.ValuesCount(**{cmp_op: threshold})
+                )
+
+                def _count_match(x, _op=cmp_op, _t=threshold):
+                    # Qdrant 语义：
+                    # - array: count=len(array)
+                    # - null:  count=0
+                    # - scalar(non-array): count=1
+                    if isinstance(x, list):
+                        cnt = len(x)
+                    elif self._is_na_like(x):
+                        cnt = 0
+                    else:
+                        cnt = 1
+                    if _op == "gt":
+                        return cnt > _t
+                    if _op == "gte":
+                        return cnt >= _t
+                    if _op == "lt":
+                        return cnt < _t
+                    return cnt <= _t
+
+                op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+                mask = series.apply(_count_match)
+                expr_str = f"{name} values_count {op_map[cmp_op]} {threshold}"
+            elif array_op == "contains" and all_items:
                 target = random.choice(all_items)
                 # 转换 numpy 类型
                 target = self._convert_to_native(target)
@@ -1116,19 +1345,52 @@ class OracleQueryGenerator:
                 mask = series.apply(lambda x, t=target: t in x if isinstance(x, list) else False)
                 expr_str = f'{name} contains {target}'
             else:
-                # Qdrant 不支持 is_empty=False，需要用 must_not 包装
-                filter_cond = Filter(must_not=[self._is_empty_condition(name)])
-                mask = series.apply(lambda x: isinstance(x, list) and len(x) > 0)
+                filter_cond = self._qdrant_not_empty_filter(name)
+                mask = self._series_not_empty(series)
                 expr_str = f'{name} is not empty'
 
         elif ftype == FieldType.ARRAY_FLOAT:
-            # 浮点数组 - 使用范围查询（检查数组中是否有元素在范围内）
+            # 浮点数组 - 元素范围 / values_count
             valid_series = self.df[name].dropna()
             all_items = []
             for arr in valid_series:
                 if isinstance(arr, list):
                     all_items.extend(arr)
-            if all_items:
+            array_ops = ["element_range", "not_empty"]
+            if not self._is_evolved_field(name):
+                array_ops.append("values_count")
+            array_op = random.choice(array_ops)
+            if array_op == "values_count":
+                cmp_op = random.choice(["gt", "gte", "lt", "lte"])
+                threshold = random.randint(0, 4)
+                filter_cond = FieldCondition(
+                    key=name,
+                    values_count=models.ValuesCount(**{cmp_op: threshold})
+                )
+
+                def _count_match_float(x, _op=cmp_op, _t=threshold):
+                    # Qdrant 语义：
+                    # - array: count=len(array)
+                    # - null:  count=0
+                    # - scalar(non-array): count=1
+                    if isinstance(x, list):
+                        cnt = len(x)
+                    elif self._is_na_like(x):
+                        cnt = 0
+                    else:
+                        cnt = 1
+                    if _op == "gt":
+                        return cnt > _t
+                    if _op == "gte":
+                        return cnt >= _t
+                    if _op == "lt":
+                        return cnt < _t
+                    return cnt <= _t
+
+                op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
+                mask = series.apply(_count_match_float)
+                expr_str = f"{name} values_count {op_map[cmp_op]} {threshold}"
+            elif array_op == "element_range" and all_items:
                 target = random.choice(all_items)
                 target_f = float(target)
                 epsilon = 0.5  # 较大的 epsilon 避免浮点精度问题
@@ -1137,8 +1399,8 @@ class OracleQueryGenerator:
                     any(t - e <= float(v) <= t + e for v in x) if isinstance(x, list) and x else False)
                 expr_str = f'{name} has element ~= {target_f}'
             else:
-                filter_cond = Filter(must_not=[self._is_empty_condition(name)])
-                mask = series.apply(lambda x: isinstance(x, list) and len(x) > 0)
+                filter_cond = self._qdrant_not_empty_filter(name)
+                mask = self._series_not_empty(series)
                 expr_str = f'{name} is not empty'
 
         elif ftype == FieldType.DATETIME:
@@ -1245,11 +1507,12 @@ class OracleQueryGenerator:
                 expr_str = f"{name} in radius({center_lat:.2f},{center_lon:.2f}, r={radius_m:.0f}m)"
 
         if filter_cond is not None and mask is not None:
-            return (filter_cond, mask & series.notnull(), expr_str)
+            # 由各分支自行定义 null 语义，这里不再统一追加 notnull 截断。
+            return (filter_cond, mask, expr_str)
 
-        # 默认返回 - Qdrant 不支持 is_null=False，需要用 must_not 包装
-        filter_cond = Filter(must_not=[self._is_null_condition(name)])
-        return (filter_cond, series.notnull(), f"{name} is not null")
+        # 默认返回：严格 not null（演化字段自动使用 not empty 以对齐缺失语义）
+        filter_cond = self._qdrant_not_null_filter(name)
+        return (filter_cond, self._series_not_null(series), f"{name} is not null")
 
     def gen_json_expr(self, name, series, val):
         """生成 JSON 嵌套字段查询"""
@@ -1379,12 +1642,7 @@ class OracleQueryGenerator:
         return filter_obj, mask, expr_str
 
     def _qdrant_is_null_filter(self, name):
-        """为字段生成 is_null 的 Qdrant filter（自动适配演化字段）。
-        - 演化字段（evo_）: 用 IsEmptyCondition（字段不存在 or null or []）
-        - 普通字段:         用 IsNullCondition（字段存在且值为 null）
-        """
-        if self._is_evolved_field(name):
-            return Filter(must=[self._is_empty_condition(name)])
+        """严格 is_null：仅匹配“字段存在且值为 null”."""
         return Filter(must=[self._is_null_condition(name)])
 
     def _qdrant_not_null_filter(self, name):
@@ -1713,7 +1971,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             # 使用 (宽范围 OR 字段为null) 来确保包含所有数据（包括 null）
             # 因为 Qdrant 的 Range 条件不会匹配 null 值
             range_cond = Filter(must=[FieldCondition(key=name, range=Range(gte=min_val - 1000000, lte=max_val + 1000000))])
-            null_cond = Filter(must=[IsNullCondition(is_null=PayloadField(key=name))])
+            null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
                 f"({name} in wide range OR {name} is null) (always true)"
@@ -1849,7 +2107,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             mid_val = (self._tautology_field["min"] + self._tautology_field["max"]) / 2
             part1 = Filter(must=[base_filter, FieldCondition(key=part_name, range=Range(lt=mid_val))])
             part2 = Filter(must=[base_filter, FieldCondition(key=part_name, range=Range(gte=mid_val))])
-            part3 = Filter(must=[base_filter, IsNullCondition(is_null=PayloadField(key=part_name))])  # null 分区
+            part3 = Filter(must=[base_filter, self._qdrant_nullish_filter(part_name)])  # null/missing 分区（evo 适配）
             
             mutations.append({
                 "type": "PartitionByField",
@@ -2091,7 +2349,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             # 使用 (宽范围 OR 字段为null) 来确保包含所有数据（包括 null）
             # 因为 Qdrant 的 Range 条件不会匹配 null 值
             range_cond = Filter(must=[FieldCondition(key=name, range=Range(gte=min_val - 1000000, lte=max_val + 1000000))])
-            null_cond = Filter(must=[IsNullCondition(is_null=PayloadField(key=name))])
+            null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
                 f"({name} in wide range OR {name} is null) (always true)"
@@ -2270,7 +2528,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             series = self.df[name]
             # 使用 (宽范围 OR null) 确保包含所有数据
             range_cond = Filter(must=[FieldCondition(key=name, range=Range(gte=series.min() - 1e10, lte=series.max() + 1e10))])
-            null_cond = Filter(must=[IsNullCondition(is_null=PayloadField(key=name))])
+            null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
                 f"({name} in wide range OR {name} is null)"
@@ -2292,7 +2550,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         except: pass
 
         if is_null:
-            return self._null_filter(fname), f"{fname} is null"
+            return self._qdrant_nullish_filter(fname), f"{fname} is null"
 
         # 根据类型生成条件
         if ftype == FieldType.BOOL:
@@ -2395,7 +2653,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         elif ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR]:
             if not isinstance(val, list) or len(val) == 0:
-                return self._empty_or_null_filter(fname), f"{fname} is empty"
+                return self._qdrant_is_empty_filter(fname), f"{fname} is empty"
             
             valid_items = [x for x in val if x is not None]
             if valid_items:
@@ -2403,18 +2661,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 # 确保 target 是原生 Python 类型
                 target = self._convert_to_native(target)
                 return FieldCondition(key=fname, match=MatchAny(any=[target])), f"{fname} contains {target}"
-            # Qdrant 不支持 is_null=False，需要用 must_not 包装
-            return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
 
         elif ftype == FieldType.ARRAY_FLOAT:
             if not isinstance(val, list) or len(val) == 0:
-                return self._empty_or_null_filter(fname), f"{fname} is empty"
+                return self._qdrant_is_empty_filter(fname), f"{fname} is empty"
             valid_items = [x for x in val if x is not None]
             if valid_items:
                 target = float(random.choice(valid_items))
                 epsilon = 0.5
                 return FieldCondition(key=fname, range=Range(gte=target - epsilon, lte=target + epsilon)), f"{fname} has element ~= {target}"
-            return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
 
         elif ftype == FieldType.DATETIME:
             val_int = int(val) if hasattr(val, "item") else int(val)
@@ -2463,9 +2720,9 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     ), f"{fname} in radius 1km around ({lat},{lon})"
                 ))
                 return random.choice(strategies)
-            return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
 
-        return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+        return self._qdrant_not_null_filter(fname), f"{fname} is not null"
 
     def _gen_pqs_json_filter(self, fname, json_obj):
         """
@@ -2475,7 +2732,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if json_obj is None:
             return self._null_filter(fname), f"{fname} is null"
         if not isinstance(json_obj, dict) and not isinstance(json_obj, list):
-            return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
 
         # 将 numpy 类型转换
         if hasattr(json_obj, "tolist"): json_obj = json_obj.tolist()
@@ -2508,11 +2765,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         # Case 1: Null
         if current is None:
-            return IsNullCondition(is_null=PayloadField(key=path_str)), f"{path_str} is null"
+            return self._qdrant_is_null_filter(path_str), f"{path_str} is null"
 
         # Case 2: 复杂类型停在中间 → is not null
         if isinstance(current, (dict, list, np.ndarray)):
-            return Filter(must_not=[self._is_null_condition(path_str)]), f"{path_str} is not null"
+            return self._qdrant_not_empty_filter(path_str), f"{path_str} is not empty"
 
         # Case 3: 标量 → 生成边界条件
         if isinstance(current, bool):
@@ -2527,7 +2784,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         elif isinstance(current, str):
             return self._gen_pqs_boundary_str(path_str, current)
 
-        return Filter(must_not=[self._is_null_condition(fname)]), f"{fname} is not null"
+        return self._qdrant_not_null_filter(fname), f"{fname} is not null"
 
     def _gen_pqs_boundary_int(self, path, val):
         """JSON 深层 INT 边界条件（10种策略）"""
