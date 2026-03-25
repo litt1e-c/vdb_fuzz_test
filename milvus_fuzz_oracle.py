@@ -91,6 +91,50 @@ CHAOS_RATE = 0.0
 # Schema Evolution: 最大可动态添加的字段数
 MAX_EVOLVED_FIELDS = 5
 
+# --- 边界值注入 ---
+# 按此概率在数据生成时将正常值替换为边界值（延迟初始化，在 run() 内种子设置后随机选取）
+BOUNDARY_INJECTION_RATE = None
+
+# 每种整数类型的边界值列表
+INT_BOUNDARY_VALUES = {
+    DataType.INT8:  [-128, -127, -1, 0, 1, 126, 127],
+    DataType.INT16: [-32768, -32767, -1, 0, 1, 32766, 32767],
+    DataType.INT32: [-2147483648, -2147483647, -1, 0, 1, 2147483646, 2147483647],
+    DataType.INT64: [-2**63, -2**63 + 1, -1, 0, 1, 2**63 - 2, 2**63 - 1],
+}
+
+# 浮点边界值（不含 inf/NaN —— Milvus 不支持插入 inf/NaN 作为标量值）
+# subnormal: 最小非零正浮点; max_float: 最大可表示有限值
+FLOAT_BOUNDARY_VALUES = {
+    DataType.FLOAT: [
+        float(np.finfo(np.float32).tiny),     # ~1.17e-38 (最小正规化正值)
+        float(np.float32(np.finfo(np.float32).smallest_subnormal)),  # ~1.4e-45 (最小子法线值)
+        float(-np.finfo(np.float32).tiny),
+        0.0,
+        -0.0,
+        float(np.finfo(np.float32).max),      # ~3.4e+38
+        float(-np.finfo(np.float32).max),
+        1.0,
+        -1.0,
+    ],
+    DataType.DOUBLE: [
+        np.finfo(np.float64).tiny,             # ~2.2e-308
+        np.finfo(np.float64).smallest_subnormal,  # ~5e-324
+        -np.finfo(np.float64).tiny,
+        0.0,
+        -0.0,
+        # 注意: 不使用 float64.max (~1.8e+308)，Milvus 表达式解析器可能溢出
+        # 使用安全的大值
+        1e+100,
+        -1e+100,
+        1.0,
+        -1.0,
+    ],
+}
+
+# VARCHAR 边界: max_length=512 对应 schema 中的定义
+VARCHAR_MAX_LENGTH = 512
+
 # --- 1. Data Manager ---
 
 def get_type_name(dtype):
@@ -190,16 +234,45 @@ class DataManager:
                 # 使用较小的范围避免数据过于稀疏
                 effective_lo = max(lo, -self.int_range)
                 effective_hi = min(hi, self.int_range)
-                row[fname] = int(rng.integers(effective_lo, effective_hi))
+                # --- 边界值注入 ---
+                if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+                    bvals = INT_BOUNDARY_VALUES.get(ftype, [])
+                    if bvals:
+                        row[fname] = int(random.choice(bvals))
+                    else:
+                        row[fname] = int(rng.integers(effective_lo, effective_hi))
+                else:
+                    row[fname] = int(rng.integers(effective_lo, effective_hi))
             elif ftype in ALL_FLOAT_TYPES:
-                val = float(rng.random() * self.double_scale)
+                # --- 浮点边界值注入 ---
+                if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+                    fbvals = FLOAT_BOUNDARY_VALUES.get(ftype, [])
+                    if fbvals:
+                        val = float(random.choice(fbvals))
+                    else:
+                        val = float(rng.random() * self.double_scale)
+                else:
+                    val = float(rng.random() * self.double_scale)
                 if ftype == DataType.FLOAT:
                     val = float(np.float32(val))  # clamp 到 float32 精度
                 row[fname] = val
             elif ftype == DataType.BOOL:
                 row[fname] = bool(rng.choice([True, False]))
             elif ftype == DataType.VARCHAR:
-                row[fname] = self._random_string(0, random.randint(5, 50))
+                # --- VARCHAR 边界长度注入 ---
+                if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+                    chars = string.ascii_letters + string.digits
+                    bc = random.random()
+                    if bc < 0.4:
+                        row[fname] = ''.join(random.choices(chars, k=VARCHAR_MAX_LENGTH))
+                    elif bc < 0.6:
+                        row[fname] = ''.join(random.choices(chars, k=VARCHAR_MAX_LENGTH - 1))
+                    elif bc < 0.8:
+                        row[fname] = ''
+                    else:
+                        row[fname] = random.choice(chars)
+                else:
+                    row[fname] = self._random_string(0, random.randint(5, 50))
             elif ftype == DataType.JSON:
                 # 与generate_data中的JSON结构保持一致
                 base_obj = {
@@ -278,12 +351,31 @@ class DataManager:
             lo, hi = INT_RANGES.get(element_type, (-100, 100))
             effective_lo = max(lo, -100)
             effective_hi = min(hi, 100)
-            return [int(x) for x in rng.integers(effective_lo, effective_hi, size=length)]
+            result = [int(x) for x in rng.integers(effective_lo, effective_hi, size=length)]
+            # --- 数组元素边界值注入 ---
+            if BOUNDARY_INJECTION_RATE and BOUNDARY_INJECTION_RATE > 0:
+                bvals = INT_BOUNDARY_VALUES.get(element_type, [])
+                if bvals:
+                    for idx in range(len(result)):
+                        if rng.random() < BOUNDARY_INJECTION_RATE:
+                            result[idx] = int(rng.choice(bvals))
+            return result
         elif element_type in ALL_FLOAT_TYPES:
             vals = rng.random(length) * 200 - 100  # [-100, 100]
             if element_type == DataType.FLOAT:
                 vals = vals.astype(np.float32).astype(np.float64)
-            return [float(x) for x in vals]
+            result = [float(x) for x in vals]
+            # --- 数组浮点边界值注入 ---
+            if BOUNDARY_INJECTION_RATE and BOUNDARY_INJECTION_RATE > 0:
+                fbvals = FLOAT_BOUNDARY_VALUES.get(element_type, [])
+                if fbvals:
+                    for idx in range(len(result)):
+                        if rng.random() < BOUNDARY_INJECTION_RATE:
+                            v = float(rng.choice(fbvals))
+                            if element_type == DataType.FLOAT:
+                                v = float(np.float32(v))
+                            result[idx] = v
+            return result
         elif element_type == DataType.BOOL:
             return [bool(rng.choice([True, False])) for _ in range(length)]
         elif element_type == DataType.VARCHAR:
@@ -350,15 +442,56 @@ class DataManager:
                 effective_lo = max(lo, -self.int_range)
                 effective_hi = min(hi, self.int_range)
                 data[fname] = rng.integers(effective_lo, effective_hi, size=N)
+                # --- 边界值注入 ---
+                if BOUNDARY_INJECTION_RATE and BOUNDARY_INJECTION_RATE > 0:
+                    bvals = INT_BOUNDARY_VALUES.get(ftype, [])
+                    if bvals:
+                        inject_mask = rng.random(N) < BOUNDARY_INJECTION_RATE
+                        inject_count = int(inject_mask.sum())
+                        if inject_count > 0:
+                            chosen = rng.choice(bvals, size=inject_count)
+                            data[fname][inject_mask] = chosen
             elif ftype in ALL_FLOAT_TYPES:
                 vals = rng.random(N) * self.double_scale
                 if ftype == DataType.FLOAT:
                     vals = vals.astype(np.float32).astype(np.float64)  # clamp 精度
                 data[fname] = vals
+                # --- 浮点边界值注入 ---
+                if BOUNDARY_INJECTION_RATE and BOUNDARY_INJECTION_RATE > 0:
+                    fbvals = FLOAT_BOUNDARY_VALUES.get(ftype, [])
+                    if fbvals:
+                        inject_mask = rng.random(N) < BOUNDARY_INJECTION_RATE
+                        inject_count = int(inject_mask.sum())
+                        if inject_count > 0:
+                            chosen = rng.choice(fbvals, size=inject_count)
+                            if ftype == DataType.FLOAT:
+                                chosen = np.array([float(np.float32(v)) for v in chosen])
+                            arr = np.array(data[fname], dtype=np.float64)
+                            arr[inject_mask] = chosen
+                            data[fname] = arr
             elif ftype == DataType.BOOL:
                 data[fname] = rng.choice([True, False], size=N)
             elif ftype == DataType.VARCHAR:
-                data[fname] = [self._random_string(0, random.randint(5, 50)) for _ in range(N)]
+                str_list = [self._random_string(0, random.randint(5, 50)) for _ in range(N)]
+                # --- VARCHAR 边界长度注入 ---
+                if BOUNDARY_INJECTION_RATE and BOUNDARY_INJECTION_RATE > 0:
+                    chars = string.ascii_letters + string.digits
+                    for vi in range(N):
+                        if random.random() < BOUNDARY_INJECTION_RATE:
+                            boundary_choice = random.random()
+                            if boundary_choice < 0.4:
+                                # max_length 字符串 (512)
+                                str_list[vi] = ''.join(random.choices(chars, k=VARCHAR_MAX_LENGTH))
+                            elif boundary_choice < 0.6:
+                                # max_length - 1
+                                str_list[vi] = ''.join(random.choices(chars, k=VARCHAR_MAX_LENGTH - 1))
+                            elif boundary_choice < 0.8:
+                                # 空字符串
+                                str_list[vi] = ''
+                            else:
+                                # 单字符
+                                str_list[vi] = random.choice(chars)
+                data[fname] = str_list
             elif ftype == DataType.JSON:
                 json_list = []
                 for _ in range(N):
@@ -410,8 +543,19 @@ class DataManager:
             lo, hi = INT_RANGES[ftype]
             effective_lo = max(lo, -self.int_range)
             effective_hi = min(hi, self.int_range)
+            if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+                bvals = INT_BOUNDARY_VALUES.get(ftype, [])
+                if bvals:
+                    return int(random.choice(bvals))
             return random.randint(effective_lo, effective_hi)
         elif ftype in ALL_FLOAT_TYPES:
+            if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+                fbvals = FLOAT_BOUNDARY_VALUES.get(ftype, [])
+                if fbvals:
+                    val = float(random.choice(fbvals))
+                    if ftype == DataType.FLOAT:
+                        val = float(np.float32(val))
+                    return val
             val = random.random() * self.double_scale
             if ftype == DataType.FLOAT:
                 val = float(np.float32(val))
@@ -419,6 +563,15 @@ class DataManager:
         elif ftype == DataType.BOOL:
             return random.choice([True, False])
         elif ftype == DataType.VARCHAR:
+            if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+                chars = string.ascii_letters + string.digits
+                bc = random.random()
+                if bc < 0.5:
+                    return ''.join(random.choices(chars, k=VARCHAR_MAX_LENGTH))
+                elif bc < 0.7:
+                    return ''
+                else:
+                    return random.choice(chars)
             return self._random_string(0, random.randint(5, 50))
         elif ftype == DataType.JSON:
             # 演进字段使用简单 JSON 结构，避免复杂嵌套
@@ -904,6 +1057,7 @@ class OracleQueryGenerator:
     def _float_safe_range(result, is_float32):
         """
         生成经过 Milvus FLOAT 字面量隐式降精度后仍然正确的范围边界。
+        若 result 为 NaN/inf 则返回 None。
 
         [BUG WORKAROUND] Milvus 会将表达式中的浮点字面量隐式转换为字段存储类型
         (FLOAT → float32) 再与运算结果比较。若容差 < float32 ULP，上下界会坍缩
@@ -912,6 +1066,8 @@ class OracleQueryGenerator:
         解决方案: 对 FLOAT 字段使用 float32 nextafter 边界 (跳过 2 个 ULP)。
         TODO: Milvus 修复字面量精度处理后移除此 workaround。
         """
+        if isinstance(result, float) and (np.isnan(result) or np.isinf(result)):
+            return None
         if is_float32:
             f32 = np.float32(result)
             lo = f32
@@ -919,10 +1075,16 @@ class OracleQueryGenerator:
             for _ in range(2):
                 lo = np.nextafter(lo, np.float32(-np.inf))
                 hi = np.nextafter(hi, np.float32(np.inf))
-            return float(lo), float(hi)
+            lo, hi = float(lo), float(hi)
+            if not np.isfinite(lo) or not np.isfinite(hi):
+                return None
+            return lo, hi
         else:
             epsilon = max(0.001, abs(result) * 1e-12)
-            return result - epsilon, result + epsilon
+            lo, hi = result - epsilon, result + epsilon
+            if not np.isfinite(lo) or not np.isfinite(hi):
+                return None
+            return lo, hi
 
     def _get_field_type(self, fname):
         """根据字段名查找字段类型（用于 PQS 模式中不直接传递 ftype 的场景）"""
@@ -1053,6 +1215,20 @@ class OracleQueryGenerator:
         获取一个用于查询的值，有 10% 的概率返回该类型的一个“不存在的值”。
         如果返回 None，表示该字段适合生成 IS NULL/IS NOT NULL 查询。
         """
+        # 0. 按 BOUNDARY_INJECTION_RATE 概率返回边界值
+        if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+            if ftype in ALL_INT_TYPES:
+                bvals = INT_BOUNDARY_VALUES.get(ftype, [])
+                if bvals:
+                    return int(random.choice(bvals))
+            elif ftype in ALL_FLOAT_TYPES:
+                fbvals = FLOAT_BOUNDARY_VALUES.get(ftype, [])
+                if fbvals:
+                    val = float(random.choice(fbvals))
+                    if ftype == DataType.FLOAT:
+                        val = float(np.float32(val))
+                    return val
+
         # 1. 尝试从真实数据中采样一个值 (90% 概率)
         valid_series = self.df[fname].dropna()
         if not valid_series.empty and random.random() < 0.8: # 90% 概率从真实数据采样,这里先暂时改成0.8进行测试
@@ -1089,7 +1265,10 @@ class OracleQueryGenerator:
                 val = random.random() * 200000.0
 
             # 【修复点 2】生成的随机浮点数也要做精度截断
-            return float(np.float32(val))
+            # 仅 FLOAT 类型做 float32 截断，DOUBLE 直接返回
+            if ftype == DataType.FLOAT:
+                return float(np.float32(val))
+            return float(val)
 
         elif ftype == DataType.BOOL:
             # Bool 只有 True/False，无法生成“不存在”值，只能采样
@@ -1245,7 +1424,11 @@ class OracleQueryGenerator:
                 if arith_res:
                     return arith_res
             val_float = float(val)
-            # 🚨 关键回退：移除 "==", "!=" 以避免 IEEE 754 精度误报
+            # �️ inf/NaN 不是有效的 Milvus 表达式字面量，回退到安全表达式
+            if not np.isfinite(val_float):
+                id_mask = self.df["id"] > 0
+                return ("id > 0", id_mask.astype("boolean"))
+            # �🚨 关键回退：移除 "==", "!=" 以避免 IEEE 754 精度误报
             op = random.choice([">", "<", ">=", "<="])
             expr = f"{name} {op} {val_float}"
             mask = series.apply(safe_compare_scalar(op, val_float)).astype("boolean")
@@ -1671,6 +1854,7 @@ class OracleQueryGenerator:
         if hasattr(sample_val, 'item'):
             sample_val = sample_val.item()
 
+        INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
         try:
             if op == "+": expected = sample_val + operand
             elif op == "-": expected = sample_val - operand
@@ -1683,6 +1867,15 @@ class OracleQueryGenerator:
                 expected = int(np.fmod(sample_val, operand))
         except:
             return None
+
+        # 防止边界值算术溢出 INT64 范围
+        if ftype not in ALL_FLOAT_TYPES:
+            if not (INT64_MIN <= expected <= INT64_MAX):
+                return None
+        else:
+            # 防止浮点算术产生 NaN/inf
+            if isinstance(expected, float) and (np.isnan(expected) or np.isinf(expected)):
+                return None
 
         if ftype in ALL_FLOAT_TYPES:
             cmp_op = random.choice([">", "<", ">=", "<="])
@@ -1703,6 +1896,9 @@ class OracleQueryGenerator:
                     threshold = expected - delta
                 else:
                     threshold = expected + delta
+            # 防止浮点 threshold 产生 NaN/inf
+            if isinstance(threshold, float) and (np.isnan(threshold) or np.isinf(threshold)):
+                return None
         else:
             cmp_op = random.choice([">", "<", "==", ">=", "<="])
             if cmp_op == "==":
@@ -1711,6 +1907,9 @@ class OracleQueryGenerator:
                 threshold = expected - random.randint(1, 10)
             else:
                 threshold = expected + random.randint(1, 10)
+            # 防止 threshold 溢出 INT64 范围
+            if not (INT64_MIN <= threshold <= INT64_MAX):
+                return None
 
         expr = f"{name} {op} {operand} {cmp_op} {threshold}"
 
@@ -1927,6 +2126,10 @@ class OracleQueryGenerator:
                 val_int = int(val)
                 low = val_int - random.randint(10, 100)
                 high = val_int + random.randint(10, 100)
+                # 防止边界值算术溢出 INT64 范围
+                INT64_MIN_L, INT64_MAX_L = -(2**63), 2**63 - 1
+                low = max(low, INT64_MIN_L)
+                high = min(high, INT64_MAX_L)
                 inner_expr = f"({name} > {low} and {name} < {high})"
                 expr = f"not {inner_expr}"
                 # Oracle: not (col > low and col < high)
@@ -2210,7 +2413,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
     """
     运行等价性模糊测试
     """
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY, BOUNDARY_INJECTION_RATE
     
     if seed is not None:
         print(f"\n🔒 Equivalence 模式使用固定种子 {seed}")
@@ -2232,6 +2435,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
     SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
+    BOUNDARY_INJECTION_RATE = random.uniform(0.08, 0.15)
 
     # 一致性等级: 固定或随机 (独立 RNG, 不消耗主 PRNG 序列)
     ALL_CONSISTENCY_LEVELS = ["Strong", "Bounded", "Eventually", "Session"]
@@ -2248,7 +2452,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
         return consistency_rng.choice(ALL_CONSISTENCY_LEVELS)
 
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
-    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
+    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}, 边界注入率: {BOUNDARY_INJECTION_RATE:.2f}")
 
     # --- 日志设置 ---
     timestamp = int(time.time())
@@ -2573,7 +2777,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
     seed=None: 随机数据，每次不同（默认行为）
     seed=<数字>: 固定种子，完全复现之前的测试
     """
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY, BOUNDARY_INJECTION_RATE
     
     # 记录当前使用的种子（如果有的话），方便后续复现
     current_seed = seed
@@ -2599,6 +2803,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
     SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
+    BOUNDARY_INJECTION_RATE = random.uniform(0.08, 0.15)
 
     # 一致性等级: 固定或随机 (独立 RNG, 不消耗主 PRNG 序列, 不影响表达式/数据生成)
     ALL_CONSISTENCY_LEVELS = ["Strong", "Bounded", "Eventually", "Session"]
@@ -2615,7 +2820,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
         return consistency_rng.choice(ALL_CONSISTENCY_LEVELS)
 
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}, 向量校验比例: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}")
-    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
+    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}, 边界注入率: {BOUNDARY_INJECTION_RATE:.2f}")
 
     # 1. 初始化
     dm = DataManager()
@@ -3602,6 +3807,27 @@ class PQSQueryGenerator(OracleQueryGenerator):
         strategies.append(f"{fname} == {val}")
         strategies.append(f"{fname} >= {val}")
         strategies.append(f"{fname} <= {val}")
+
+        # 1.5 当值刚好是类型边界时，生成更具针对性的策略
+        ftype = self._get_field_type(fname) if '"' not in fname else None
+        if ftype and ftype in INT_BOUNDARY_VALUES:
+            bvals = INT_BOUNDARY_VALUES[ftype]
+            lo_bound, hi_bound = bvals[0], bvals[-1]
+            if val == lo_bound:
+                # 在类型最小值: >= min, not (field < min)
+                strategies.append(f"{fname} >= {lo_bound}")
+                strategies.append(f"({fname} >= {lo_bound} and {fname} <= {lo_bound})")
+            elif val == hi_bound:
+                # 在类型最大值: <= max, not (field > max)
+                strategies.append(f"{fname} <= {hi_bound}")
+                strategies.append(f"({fname} >= {hi_bound} and {fname} <= {hi_bound})")
+            elif val == 0:
+                strategies.append(f"{fname} == 0")
+                strategies.append(f"({fname} >= 0 and {fname} <= 0)")
+            elif val == -1:
+                strategies.append(f"({fname} >= -1 and {fname} <= -1)")
+            elif val == 1:
+                strategies.append(f"({fname} >= 1 and {fname} <= 1)")
         # 1.1 逻辑否定（与 >=/<= 等价），增强操作符多样性
         # [WORKAROUND: Milvus NOT(UNKNOWN) Bug]
         # 原始代码:
@@ -3633,11 +3859,24 @@ class PQSQueryGenerator(OracleQueryGenerator):
             strategies.append(f"{fname} < 1")
 
         # 4. ±1 范围覆盖 (强力推荐)
-        # 构造一个刚好包围 val 的区间
-        strategies.append(f"({fname} > {val - 1} and {fname} < {val + 1})")
+        # 构造一个刚好包围 val 的区间，防止边界值溢出
+        INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
+        low_1 = max(val - 1, INT64_MIN)
+        high_1 = min(val + 1, INT64_MAX)
+        if low_1 < val and high_1 > val:
+            strategies.append(f"({fname} > {low_1} and {fname} < {high_1})")
+        elif low_1 < val:
+            strategies.append(f"({fname} > {low_1} and {fname} <= {val})")
+        else:
+            strategies.append(f"({fname} >= {val} and {fname} < {high_1})")
 
         # 5. 排除法
         fake = val + random.choice([-100, 100])
+        # 防止 fake 溢出 INT64 范围
+        if not (INT64_MIN <= fake <= INT64_MAX):
+            fake = val - random.choice([-100, 100])
+        if not (INT64_MIN <= fake <= INT64_MAX):
+            fake = 0  # 回退到安全值
         # [WORKAROUND: Milvus JSON != Bug]
         # 原始代码: strategies.append(f"{fname} != {fake}")
         if '"' not in fname:
@@ -3650,13 +3889,46 @@ class PQSQueryGenerator(OracleQueryGenerator):
     def _gen_boundary_float(self, fname, val, ftype=None):
 
         val = float(val)
+        # 🛡️ inf/NaN 不是有效的 Milvus 表达式字面量
+        if not np.isfinite(val):
+            return f"{fname} is not null"
         strategies = []
+
+        # 0. 边界浮点值的特殊处理
+        # 对于极小值 (subnormal/tiny) 和极大值，使用宽范围策略避免精度问题
+        abs_val = abs(val)
+        if abs_val > 0 and abs_val < 1e-30:
+            # subnormal / tiny 值: 只能用宽范围
+            if val > 0:
+                strategies.append(f"({fname} > 0 and {fname} < 1e-20)")
+                strategies.append(f"{fname} > 0")
+            else:
+                strategies.append(f"({fname} < 0 and {fname} > -1e-20)")
+                strategies.append(f"{fname} < 0")
+            strategies.append(f"{fname} is not null")
+            return random.choice(strategies)
+        if abs_val > 1e+90:
+            # 极大值: 用宽范围
+            if val > 0:
+                strategies.append(f"{fname} > 1e+80")
+            else:
+                strategies.append(f"{fname} < -1e+80")
+            strategies.append(f"{fname} is not null")
+            return random.choice(strategies)
+        if val == 0.0:
+            # 0.0 和 -0.0 在浮点比较中相等
+            strategies.append(f"({fname} >= -1e-10 and {fname} <= 1e-10)")
+            strategies.append(f"{fname} >= -0.001")
+            strategies.append(f"{fname} <= 0.001")
+            return random.choice(strategies)
 
         # 1. 基础范围 (浮点数不建议用 ==)
         # [WORKAROUND] FLOAT 字段: 使用 float32 ULP-aware 边界
         is_f32 = (ftype == DataType.FLOAT)
-        lo, hi = self._float_safe_range(val, is_f32)
-        strategies.append(f"({fname} > {lo} and {fname} < {hi})")
+        range_result = self._float_safe_range(val, is_f32)
+        if range_result is not None:
+            lo, hi = range_result
+            strategies.append(f"({fname} > {lo} and {fname} < {hi})")
 
         # 2. 宽松范围 (>= / <= 对 float32 降精度天然安全，使用固定 epsilon 即可)
         epsilon = 1e-5
@@ -3864,9 +4136,12 @@ class PQSQueryGenerator(OracleQueryGenerator):
         针对数值类型生成算术运算查询。
         目标：测试 +, -, *, %, ** 是否导致 Crash 或计算错误。
         """
-        if not isinstance(val, (int, float)): return None
+        if not isinstance(val, (int, float, np.integer, np.floating)): return None
 
-        is_float = isinstance(val, float)
+        # 使用 ftype 判断而不是 isinstance(val)，因为 pandas 会把含 null 的 INT 列 upcast 为 float
+        is_float = ftype in ALL_FLOAT_TYPES if ftype else isinstance(val, float)
+        if not is_float:
+            val = int(val)  # 确保 INT 类型的 val 是整数
 
         if is_float:
             ops = ["+", "-", "*"] # 浮点数不测取模
@@ -3883,6 +4158,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             operand = random.randint(1, 100)
 
         # 计算预期结果 (使用 C/Go 风格取模，与 Milvus 一致)
+        INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
         try:
             if op == "+": res = val + operand
             elif op == "-": res = val - operand
@@ -3891,19 +4167,34 @@ class PQSQueryGenerator(OracleQueryGenerator):
         except:
             return None
 
+        # 防止边界值算术溢出 INT64 范围
+        if not isinstance(res, float):
+            if not (INT64_MIN <= res <= INT64_MAX):
+                return None
+        else:
+            # 防止浮点算术产生 NaN/inf
+            if np.isnan(res) or np.isinf(res):
+                return None
+
         # 构造 Milvus 表达式
         # 注意：浮点数比较需要用范围
         # [WORKAROUND] FLOAT 字段的字面量会被 Milvus 隐式降精度到 float32
         if isinstance(res, float):
             is_f32 = (ftype == DataType.FLOAT)
-            lo, hi = self._float_safe_range(res, is_f32)
+            range_result = self._float_safe_range(res, is_f32)
+            if range_result is None:
+                return None
+            lo, hi = range_result
             return f"({fname} {op} {operand} > {lo} and {fname} {op} {operand} < {hi})"
         else:
             # 整数可以直接比较，也可以偶尔用 != 混淆
+            wrong_val = res + 9999
+            if not (INT64_MIN <= wrong_val <= INT64_MAX):
+                wrong_val = res - 9999
             if random.random() < 0.5:
                 return f"({fname} {op} {operand} == {res})"
             else:
-                return f"({fname} {op} {operand} != {res + 9999})" # 必真逻辑：结果肯定不等于一个错误值
+                return f"({fname} {op} {operand} != {wrong_val})" # 必真逻辑：结果肯定不等于一个错误值
 
     def gen_advanced_like(self, fname, val):
         """
@@ -4048,7 +4339,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return f"{fname} is not null"
 
 def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
-    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY
+    global INDEX_TYPE, CURRENT_INDEX_TYPE, VECTOR_CHECK_RATIO, VECTOR_TOPK, _GLOBAL_ID_COUNTER, METRIC_TYPE, SCALAR_INDEX_PROBABILITY, BOUNDARY_INJECTION_RATE
     
     if seed is not None:
         print(f"\n🔒 PQS模式使用固定种子 {seed}")
@@ -4072,8 +4363,9 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
     SCALAR_INDEX_PROBABILITY = random.uniform(0.3, 0.8)
+    BOUNDARY_INJECTION_RATE = random.uniform(0.08, 0.15)
     print(f"   索引类型: {INDEX_TYPE}, 度量类型: {METRIC_TYPE}")
-    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
+    print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}, 边界注入率: {BOUNDARY_INJECTION_RATE:.2f}")
 
     # --- 日志设置 ---
     timestamp = int(time.time())
