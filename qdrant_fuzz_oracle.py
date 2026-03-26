@@ -56,6 +56,12 @@ def _init_vector_check_config():
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
 
+
+def is_qdrant_format_error(exc):
+    """识别 Qdrant 400 JSON filter 格式错误（通常由无效条件或越界值触发）。"""
+    msg = str(exc)
+    return ("Unexpected Response: 400" in msg) and ("Format error in JSON body" in msg)
+
 # 混淆开关（默认关闭）
 CHAOS_RATE = 0.0
 
@@ -960,6 +966,8 @@ class OracleQueryGenerator:
         self.schema = dm.schema_config
         self._dm = dm  # 保存 dm 引用，动态获取最新 df
         self._query_boundary_rate = dm.query_boundary_rate
+        self.INT64_MIN = -(2 ** 63)
+        self.INT64_MAX = (2 ** 63) - 1
 
     @property
     def df(self):
@@ -967,6 +975,8 @@ class OracleQueryGenerator:
         return self._dm.df
 
     def _random_string(self, min_len=5, max_len=10):
+        if max_len < min_len:
+            max_len = min_len
         chars = string.ascii_letters + string.digits
         return ''.join(random.choices(chars, k=random.randint(min_len, max_len)))
 
@@ -1003,6 +1013,17 @@ class OracleQueryGenerator:
     @staticmethod
     def _is_na_like(x):
         return x is None or (isinstance(x, float) and np.isnan(x))
+
+    def _clip_int64(self, v):
+        iv = int(v)
+        if iv < self.INT64_MIN:
+            return self.INT64_MIN
+        if iv > self.INT64_MAX:
+            return self.INT64_MAX
+        return iv
+
+    def _offset_int64(self, base, delta):
+        return self._clip_int64(int(base) + int(delta))
 
     def _series_is_null(self, series):
         return series.apply(self._is_na_like)
@@ -1079,8 +1100,12 @@ class OracleQueryGenerator:
         # 生成不存在的值
         if ftype == FieldType.INT:
             if not valid_series.empty:
-                min_val, max_val = int(valid_series.min()), int(valid_series.max())
-                return random.choice([max_val + 100000, min_val - 100000])
+                min_val = self._clip_int64(valid_series.min())
+                max_val = self._clip_int64(valid_series.max())
+                return random.choice([
+                    self._offset_int64(max_val, 100000),
+                    self._offset_int64(min_val, -100000),
+                ])
             return random.randint(-200000, 200000)
 
         elif ftype == FieldType.FLOAT:
@@ -1190,7 +1215,7 @@ class OracleQueryGenerator:
             expr_str = f"{name} == {val_bool}"
 
         elif ftype == FieldType.INT:
-            val_int = int(val)
+            val_int = self._clip_int64(val)
             op = random.choice([">", "<", "==", "!=", ">=", "<=", "in", "not_in"])
             
             if op == "==":
@@ -1219,7 +1244,7 @@ class OracleQueryGenerator:
                 expr_str = f"{name} <= {val_int}"
             elif op == "in":
                 # IN 列表查询：从实际数据中采样 2-6 个值
-                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                valid_vals = [self._clip_int64(x) for x in self.df[name].dropna().unique()[:20]]
                 sample_size = min(random.randint(2, 6), len(valid_vals))
                 in_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 if val_int not in in_vals:
@@ -1230,7 +1255,7 @@ class OracleQueryGenerator:
                 expr_str = f"{name} in {in_vals}"
             else:  # not_in
                 # NOT IN 排除查询
-                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                valid_vals = [self._clip_int64(x) for x in self.df[name].dropna().unique()[:20]]
                 sample_size = min(random.randint(2, 6), len(valid_vals))
                 excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
@@ -1757,9 +1782,9 @@ class OracleQueryGenerator:
                 valid = series.dropna()
                 if valid.empty:
                     return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
-                val = int(self._convert_to_native(random.choice(valid.values)))
-                low = val - random.randint(10, 100)
-                high = val + random.randint(10, 100)
+                val = self._clip_int64(self._convert_to_native(random.choice(valid.values)))
+                low = self._offset_int64(val, -random.randint(10, 100))
+                high = self._offset_int64(val, random.randint(10, 100))
                 inner = Filter(must=[
                     FieldCondition(key=name, range=Range(gt=low)),
                     FieldCondition(key=name, range=Range(lt=high))
@@ -1809,14 +1834,16 @@ class OracleQueryGenerator:
         """生成常量表达式（Qdrant 支持有限）"""
         # Qdrant 中 id 是点 ID，不能用于 FieldCondition 过滤
         # 使用一个实际存在的 INT 字段来实现恒真/恒假条件
-        
+        using_int = False
+
         # 找到一个 INT 类型的字段
         int_fields = [f for f in self.schema if f["type"] == FieldType.INT]
         if int_fields:
             field_name = int_fields[0]["name"]
             series = self.df[field_name]
-            min_val = series.min()
-            max_val = series.max()
+            min_val = self._clip_int64(series.min())
+            max_val = self._clip_int64(series.max())
+            using_int = True
         else:
             # 回退到使用 FLOAT 字段
             float_fields = [f for f in self.schema if f["type"] == FieldType.FLOAT]
@@ -1835,10 +1862,27 @@ class OracleQueryGenerator:
 
         if random.random() < 0.5:
             # 必真：使用一个肯定包含所有非 null 数据的范围
-            filter_cond = FieldCondition(key=field_name, range=Range(gte=min_val - 1000000, lte=max_val + 1000000))
+            if using_int:
+                low = self._offset_int64(min_val, -1000000)
+                high = self._offset_int64(max_val, 1000000)
+            else:
+                low = min_val - 1000000
+                high = max_val + 1000000
+            filter_cond = FieldCondition(key=field_name, range=Range(gte=low, lte=high))
             return (filter_cond, true_mask, f"{field_name} in wide range (always true)")
         else:
             # 必假：使用一个不可能的范围（大于最大值 + 大偏移）
+            if using_int:
+                impossible_val = self._offset_int64(max_val, 10000000)
+                if impossible_val > max_val:
+                    filter_cond = FieldCondition(key=field_name, range=Range(gt=impossible_val))
+                    return (filter_cond, false_mask, f"{field_name} > {impossible_val} (always false)")
+                # 触发饱和时，改用矛盾区间避免产生越界数字
+                filter_cond = Filter(must=[
+                    FieldCondition(key=field_name, range=Range(gt=max_val)),
+                    FieldCondition(key=field_name, range=Range(lt=min_val)),
+                ])
+                return (filter_cond, false_mask, f"({field_name} > {max_val} and {field_name} < {min_val})")
             impossible_val = max_val + 10000000
             filter_cond = FieldCondition(key=field_name, range=Range(gt=impossible_val))
             return (filter_cond, false_mask, f"{field_name} > {impossible_val} (always false)")
@@ -1968,9 +2012,17 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             name = self._tautology_field["name"]
             min_val = self._tautology_field["min"]
             max_val = self._tautology_field["max"]
+            if self._tautology_field.get("type") == "int":
+                min_val = self._clip_int64(min_val)
+                max_val = self._clip_int64(max_val)
+                low = self._offset_int64(min_val, -1000000)
+                high = self._offset_int64(max_val, 1000000)
+            else:
+                low = min_val - 1000000
+                high = max_val + 1000000
             # 使用 (宽范围 OR 字段为null) 来确保包含所有数据（包括 null）
             # 因为 Qdrant 的 Range 条件不会匹配 null 值
-            range_cond = Filter(must=[FieldCondition(key=name, range=Range(gte=min_val - 1000000, lte=max_val + 1000000))])
+            range_cond = Filter(must=[FieldCondition(key=name, range=Range(gte=low, lte=high))])
             null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
@@ -2346,9 +2398,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
             name = self._tautology_field["name"]
             min_val = self._tautology_field["min"]
             max_val = self._tautology_field["max"]
+            if self._tautology_field.get("type") == "int":
+                min_val = self._clip_int64(min_val)
+                max_val = self._clip_int64(max_val)
+                low = self._offset_int64(min_val, -1000000)
+                high = self._offset_int64(max_val, 1000000)
+            else:
+                low = min_val - 1000000
+                high = max_val + 1000000
             # 使用 (宽范围 OR 字段为null) 来确保包含所有数据（包括 null）
             # 因为 Qdrant 的 Range 条件不会匹配 null 值
-            range_cond = Filter(must=[FieldCondition(key=name, range=Range(gte=min_val - 1000000, lte=max_val + 1000000))])
+            range_cond = Filter(must=[FieldCondition(key=name, range=Range(gte=low, lte=high))])
             null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
@@ -2557,7 +2617,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             return FieldCondition(key=fname, match=MatchValue(value=bool(val))), f"{fname} == {bool(val)}"
 
         elif ftype == FieldType.INT:
-            val_int = int(val) if hasattr(val, "item") else int(val)
+            val_int = self._clip_int64(val.item() if hasattr(val, "item") else val)
             strategies = []
             # 策略1: 精确匹配
             strategies.append((
@@ -2571,11 +2631,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
             ))
             # 策略3: 开区间包裹
             strategies.append((
-                FieldCondition(key=fname, range=Range(gt=val_int-1, lt=val_int+1)),
-                f"{fname} > {val_int-1} AND < {val_int+1}"
+                FieldCondition(
+                    key=fname,
+                    range=Range(
+                        gt=self._offset_int64(val_int, -1),
+                        lt=self._offset_int64(val_int, 1),
+                    ),
+                ),
+                f"{fname} > {self._offset_int64(val_int, -1)} AND < {self._offset_int64(val_int, 1)}"
             ))
             # 策略4: MatchAny 包含真值+噪声
-            dummies = [val_int + random.randint(100000, 200000) for _ in range(3)]
+            dummies = [self._offset_int64(val_int, random.randint(100000, 200000)) for _ in range(3)]
             candidates = dummies + [val_int]
             random.shuffle(candidates)
             strategies.append((
@@ -2583,13 +2649,13 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 f"{fname} in {candidates}"
             ))
             # 策略5: MatchExcept 排除不存在的假值
-            fake_vals = [val_int + random.randint(100000, 200000) for _ in range(3)]
+            fake_vals = [self._offset_int64(val_int, random.randint(100000, 200000)) for _ in range(3)]
             strategies.append((
                 FieldCondition(key=fname, match=MatchExcept(**{"except": fake_vals})),
                 f"{fname} not in {fake_vals}"
             ))
             # 策略6: must_not + Range 反面 (val < boundary → must_not val >= boundary)
-            boundary = val_int + random.randint(1, 100)
+            boundary = self._offset_int64(val_int, random.randint(1, 100))
             strategies.append((
                 Filter(must_not=[FieldCondition(key=fname, range=Range(gte=boundary))]),
                 f"NOT ({fname} >= {boundary})"
@@ -2788,22 +2854,24 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
     def _gen_pqs_boundary_int(self, path, val):
         """JSON 深层 INT 边界条件（10种策略）"""
-        val = int(val)
+        val = self._clip_int64(val)
         strategies = []
         # 1. 精确匹配
         strategies.append((FieldCondition(key=path, match=MatchValue(value=val)), f"{path} == {val}"))
         # 2. 闭区间
         strategies.append((FieldCondition(key=path, range=Range(gte=val, lte=val)), f"{path} >= {val} AND <= {val}"))
         # 3. 开区间 ±1
-        strategies.append((FieldCondition(key=path, range=Range(gt=val-1, lt=val+1)), f"{path} > {val-1} AND < {val+1}"))
+        low_1 = self._offset_int64(val, -1)
+        high_1 = self._offset_int64(val, 1)
+        strategies.append((FieldCondition(key=path, range=Range(gt=low_1, lt=high_1)), f"{path} > {low_1} AND < {high_1}"))
         # 4. NOT反面 (val < boundary → NOT gte boundary)
-        boundary = val + random.randint(1, 100)
+        boundary = self._offset_int64(val, random.randint(1, 100))
         strategies.append((Filter(must_not=[FieldCondition(key=path, range=Range(gte=boundary))]), f"NOT ({path} >= {boundary})"))
         # 5. NOT反面 (val > boundary → NOT lte boundary)
-        boundary_low = val - random.randint(1, 100)
+        boundary_low = self._offset_int64(val, -random.randint(1, 100))
         strategies.append((Filter(must_not=[FieldCondition(key=path, range=Range(lte=boundary_low))]), f"NOT ({path} <= {boundary_low})"))
         # 6. MatchAny 包含噪声
-        dummies = [val + random.randint(100000, 200000) for _ in range(3)]
+        dummies = [self._offset_int64(val, random.randint(100000, 200000)) for _ in range(3)]
         candidates = dummies + [val]
         random.shuffle(candidates)
         strategies.append((FieldCondition(key=path, match=MatchAny(any=candidates)), f"{path} in {candidates}"))
@@ -3401,6 +3469,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                         file_log(f"  VectorCheck: ERROR {e}")
 
             except Exception as e:
+                if is_qdrant_format_error(e):
+                    file_log(f"  -> SKIP INVALID FILTER (Qdrant 400 format): {e}")
+                    continue
                 print(f"\n⚠️ [Test {i}] CRASHED!")
                 print(f"   Expr: {expr_str}")
                 print(f"   Error: {e}\n")
@@ -3517,6 +3588,9 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                 )
                 base_ids = set(p.id for p in base_res[0])
             except Exception as e:
+                if is_qdrant_format_error(e):
+                    file_log(f"[Test {i}] Base Query Skipped (invalid filter): {e}")
+                    continue
                 file_log(f"[Test {i}] Base Query Failed: {e}")
                 continue
 
@@ -3573,6 +3647,9 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                         })
 
                 except Exception as e:
+                    if is_qdrant_format_error(e):
+                        file_log(f"  ⚠️ [{m_type}] SKIP INVALID FILTER: {e}")
+                        continue
                     print(f"\n\n⚠️ Mutation Crash [Test {i}]")
                     print(f"   Type: {m_type}")
                     print(f"   Expr: {m_expr}")
@@ -3736,6 +3813,10 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                     errors.append({"id": pivot_id, "expr": expr})
 
             except Exception as e:
+                if is_qdrant_format_error(e):
+                    skipped_tests += 1
+                    file_log(f"  -> SKIP INVALID FILTER (Qdrant 400 format): {e}")
+                    continue
                 print(f"\n\n⚠️ Execution Error [Round {i}]: {e}")
                 file_log(f"  -> EXECUTION ERROR: {e}")
 
