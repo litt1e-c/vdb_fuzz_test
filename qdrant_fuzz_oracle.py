@@ -34,7 +34,9 @@ from qdrant_client.http.models import (
 
 # --- Configuration (User Specified) ---
 HOST = "127.0.0.1"
-PORT = 6333                # Qdrant default port
+PORT = 6333                # REST port
+GRPC_PORT = 6334           # gRPC port
+PREFER_GRPC = False        # 默认使用 REST，按需可切到 gRPC
 COLLECTION_NAME = "fuzz_oracle_v1"
 N = 5000                   # 数据量
 DIM = 128                  # 向量维度
@@ -68,6 +70,19 @@ CHAOS_RATE = 0.0
 # Schema Evolution 最大演进字段数
 MAX_EVOLVED_FIELDS = 5
 
+# Schema Evolution: 是否为未回填行显式回写 NULL
+# 默认关闭：演进字段查询统一走 is_empty 语义，避免对全量点逐条 upsert 导致性能/一致性漂移。
+SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = False
+
+
+def evolved_field_use_empty_semantics() -> bool:
+    """
+    演进字段（evo_*）的空值语义选择：
+    - True:  使用 IsEmpty / NOT IsEmpty（字段缺失、null、[] 视为空）
+    - False: 使用 IsNull  / NOT IsNull（严格区分字段缺失与显式 null）
+    """
+    return not SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC
+
 # 唯一 ID 计数器（用于动态插入）
 _global_id_counter = N * 10
 
@@ -99,10 +114,15 @@ def get_type_name(dtype):
 class DataManager:
     _id_counter = 0  # 类级别 ID 计数器
 
-    def __init__(self):
+    def __init__(self, data_seed=None):
         self.df = None
         self.vectors = None
         self.schema_config = []
+        self.INT64_MIN = -(2 ** 63)
+        self.INT64_MAX = (2 ** 63) - 1
+        if data_seed is None:
+            data_seed = int(np.random.randint(0, 2**31 - 1))
+        self.data_seed = int(data_seed)
         self.null_ratio = random.uniform(0.05, 0.15)
         self.boundary_injection_rate = random.uniform(0.08, 0.22)
         self.query_boundary_rate = min(0.35, self.boundary_injection_rate + 0.08)
@@ -238,6 +258,170 @@ class DataManager:
                     values[idx] = boundary_val
         return values
 
+    @staticmethod
+    def _is_missing_scalar(v):
+        if v is None or v is pd.NA:
+            return True
+        if isinstance(v, (float, np.floating)):
+            return bool(np.isnan(v))
+        return False
+
+    def _clip_int64(self, v):
+        iv = int(v)
+        if iv < self.INT64_MIN:
+            return self.INT64_MIN
+        if iv > self.INT64_MAX:
+            return self.INT64_MAX
+        return iv
+
+    def _to_python_nested(self, obj):
+        """递归将 numpy/pandas 标量转换为 Python 原生类型，并规范缺失值。"""
+        if obj is None or obj is pd.NA:
+            return None
+        if isinstance(obj, (float, np.floating)):
+            return None if np.isnan(obj) else float(obj)
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.bool_,)):
+            return bool(obj)
+        if isinstance(obj, dict):
+            return {k: self._to_python_nested(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple, np.ndarray)):
+            return [self._to_python_nested(v) for v in list(obj)]
+        return obj
+
+    def _normalize_scalar_for_field(self, v, ftype):
+        if self._is_missing_scalar(v):
+            return None
+        if ftype in [FieldType.INT, FieldType.DATETIME]:
+            try:
+                return self._clip_int64(v)
+            except Exception:
+                return None
+        if ftype == FieldType.BOOL:
+            try:
+                return bool(v)
+            except Exception:
+                return None
+        if ftype == FieldType.FLOAT:
+            try:
+                fv = float(v)
+                if np.isnan(fv):
+                    return None
+                return fv
+            except Exception:
+                return None
+        if ftype == FieldType.ARRAY_INT:
+            if self._is_missing_scalar(v):
+                return None
+            if not isinstance(v, (list, tuple, np.ndarray)):
+                v = [v]
+            out = []
+            for x in list(v):
+                if self._is_missing_scalar(x):
+                    continue
+                try:
+                    out.append(self._clip_int64(x))
+                except Exception:
+                    continue
+            return out
+        if ftype == FieldType.ARRAY_FLOAT:
+            if self._is_missing_scalar(v):
+                return None
+            if not isinstance(v, (list, tuple, np.ndarray)):
+                v = [v]
+            out = []
+            for x in list(v):
+                if self._is_missing_scalar(x):
+                    continue
+                try:
+                    out.append(float(x))
+                except Exception:
+                    continue
+            return out
+        if ftype == FieldType.ARRAY_STR:
+            if self._is_missing_scalar(v):
+                return None
+            if not isinstance(v, (list, tuple, np.ndarray)):
+                v = [v]
+            return [str(x) for x in list(v) if not self._is_missing_scalar(x)]
+        if ftype == FieldType.GEO:
+            if self._is_missing_scalar(v):
+                return None
+            if not isinstance(v, dict):
+                return None
+            lat = v.get("lat")
+            lon = v.get("lon")
+            if self._is_missing_scalar(lat) or self._is_missing_scalar(lon):
+                return None
+            try:
+                return {"lat": float(lat), "lon": float(lon)}
+            except Exception:
+                return None
+        if ftype == FieldType.JSON:
+            return self._to_python_nested(v)
+        return v
+
+    def normalize_row_for_storage(self, row):
+        """
+        按 schema 规范化单行数据，避免 payload 在写入 Qdrant 前发生类型漂移。
+        """
+        norm = {}
+        rid = row.get("id")
+        norm["id"] = self._clip_int64(rid) if rid is not None else None
+        field_type_map = {f["name"]: f["type"] for f in self.schema_config}
+        for k, v in row.items():
+            if k == "id":
+                continue
+            ftype = field_type_map.get(k)
+            if ftype is None:
+                norm[k] = self._to_python_nested(v)
+            else:
+                norm[k] = self._normalize_scalar_for_field(v, ftype)
+        return norm
+
+    def coerce_dataframe_types(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        按 schema 将任意 DataFrame 显式转换为稳定 dtype。
+        供主表与动态批量 DataFrame 复用，避免“先推断为 float 再回转 int”的精度漂移。
+        """
+        if df is None:
+            return df
+        out = df.copy()
+
+        if "id" in out.columns:
+            out["id"] = pd.to_numeric(out["id"], errors="coerce").astype("Int64")
+
+        for field in self.schema_config:
+            fname = field["name"]
+            ftype = field["type"]
+            if fname not in out.columns:
+                continue
+
+            if ftype in [FieldType.INT, FieldType.DATETIME]:
+                raw_vals = out[fname].tolist()
+                coerced = [pd.NA if self._is_missing_scalar(x) else self._clip_int64(x) for x in raw_vals]
+                out[fname] = pd.Series(pd.array(coerced, dtype="Int64"), index=out.index)
+            elif ftype == FieldType.BOOL:
+                raw_vals = out[fname].tolist()
+                coerced = [pd.NA if self._is_missing_scalar(x) else bool(x) for x in raw_vals]
+                out[fname] = pd.Series(pd.array(coerced, dtype="boolean"), index=out.index)
+            elif ftype == FieldType.FLOAT:
+                out[fname] = pd.to_numeric(out[fname], errors="coerce")
+            elif ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT, FieldType.GEO, FieldType.JSON]:
+                out[fname] = out[fname].apply(lambda x, t=ftype: self._normalize_scalar_for_field(x, t))
+
+        return out
+
+    def normalize_dataframe_types(self):
+        """
+        统一主 DataFrame 中标量字段类型，避免 INT/DATETIME 在带 NULL 场景下漂移成 float，
+        从而导致 Oracle 比较语义失真（特别是 int64 边界值）。
+        """
+        if self.df is None:
+            return
+        self.df = self.coerce_dataframe_types(self.df)
+
     def _gen_random_json_structure(self, rng, depth=3):
         """递归生成随机 JSON 结构"""
         if depth == 0 or rng.random() < 0.3:
@@ -308,8 +492,9 @@ class DataManager:
 
     def generate_data(self):
         print(f"🌊 2. Generating {N} rows (Vector Dim={DIM})...")
+        print(f"   -> Data RNG seed: {self.data_seed}")
         print(f"   -> Boundary injection rate: {self.boundary_injection_rate:.2%}")
-        rng = np.random.default_rng(42)
+        rng = np.random.default_rng(self.data_seed)
         self.vectors = rng.random((N, DIM), dtype=np.float32)
         self.vectors /= np.linalg.norm(self.vectors, axis=1)[:, np.newaxis]
 
@@ -402,7 +587,26 @@ class DataManager:
                 geo_list = self._inject_boundary_values(geo_list, ftype, rng)
                 data[fname] = geo_list
 
+        # 在 DataFrame 构造前先固定关键标量列的 dtype，避免“int + null”先被推断成 float
+        # 造成 64-bit 边界值在 normalize 前就发生精度漂移。
+        for field in self.schema_config:
+            fname = field["name"]
+            ftype = field["type"]
+            if fname not in data:
+                continue
+            if ftype in [FieldType.INT, FieldType.DATETIME]:
+                data[fname] = pd.array(
+                    [pd.NA if self._is_missing_scalar(x) else self._clip_int64(x) for x in data[fname]],
+                    dtype="Int64"
+                )
+            elif ftype == FieldType.BOOL:
+                data[fname] = pd.array(
+                    [pd.NA if self._is_missing_scalar(x) else bool(x) for x in data[fname]],
+                    dtype="boolean"
+                )
+
         self.df = pd.DataFrame(data)
+        self.normalize_dataframe_types()
         print("✅ Data Generation Complete.")
 
     def _apply_nulls(self, values, rng):
@@ -576,8 +780,14 @@ class DataManager:
         # 添加到 schema_config（OracleQueryGenerator 通过引用自动可见）
         self.schema_config.append(field_config)
 
-        # 更新 pandas DataFrame: 所有现有行设为 None
-        self.df[field_name] = None
+        # 更新 pandas DataFrame: 所有现有行设为缺失值，并尽量保持类型稳定
+        if ftype in [FieldType.INT, FieldType.DATETIME]:
+            self.df[field_name] = pd.Series([pd.NA] * len(self.df), dtype="Int64")
+        elif ftype == FieldType.BOOL:
+            self.df[field_name] = pd.Series([pd.NA] * len(self.df), dtype="boolean")
+        else:
+            self.df[field_name] = None
+        self.normalize_dataframe_types()
 
         return field_config
 
@@ -613,6 +823,7 @@ class DataManager:
             # 同步更新 pandas DataFrame
             self.df.at[idx, field_name] = value
 
+        self.normalize_dataframe_types()
         return backfill_data
 
 # --- 2. Qdrant Manager ---
@@ -620,18 +831,55 @@ class DataManager:
 class QdrantManager:
     def __init__(self):
         self.client = None
+        self._transport_info = {}
 
     def connect(self):
-        print(f"🔌 Connecting to Qdrant at {HOST}:{PORT}...")
+        proto = "gRPC" if PREFER_GRPC else "REST"
+        print(f"🔌 Connecting to Qdrant ({proto}) at {HOST}:{PORT} (grpc:{GRPC_PORT})...")
         try:
-            self.client = QdrantClient(host=HOST, port=PORT, timeout=30)
+            # 关键：port 始终是 REST 端口；gRPC 走独立 grpc_port。
+            self.client = QdrantClient(
+                host=HOST,
+                port=PORT,
+                grpc_port=GRPC_PORT,
+                prefer_grpc=PREFER_GRPC,
+                timeout=30
+            )
             # 测试连接
             self.client.get_collections()
+            backend = getattr(self.client, "_client", None)
+            backend_cls = type(backend).__name__ if backend is not None else "unknown"
+            actual_prefer_grpc = getattr(backend, "_prefer_grpc", None)
+            self._transport_info = {
+                "host": HOST,
+                "rest_port": PORT,
+                "grpc_port": GRPC_PORT,
+                "requested_prefer_grpc": bool(PREFER_GRPC),
+                "backend_class": backend_cls,
+                "backend_prefer_grpc": actual_prefer_grpc,
+            }
+            print(
+                "🔎 Transport Check: "
+                f"backend={backend_cls}, requested_prefer_grpc={PREFER_GRPC}, "
+                f"backend_prefer_grpc={actual_prefer_grpc}"
+            )
             print("✅ Connected to Qdrant successfully.")
         except Exception as e:
             print(f"❌ Connection failed: {e}")
             print("   (Please check if Qdrant container is running)")
             exit(1)
+
+    def get_transport_info(self):
+        if self._transport_info:
+            return dict(self._transport_info)
+        return {
+            "host": HOST,
+            "rest_port": PORT,
+            "grpc_port": GRPC_PORT,
+            "requested_prefer_grpc": bool(PREFER_GRPC),
+            "backend_class": "unknown",
+            "backend_prefer_grpc": None,
+        }
 
     def reset_collection(self, schema_config):
         global DISTANCE_TYPE
@@ -655,11 +903,29 @@ class QdrantManager:
 
     def insert(self, dm):
         print(f"⚡ 3. Inserting Data (Batch={BATCH_SIZE}, Sleep={SLEEP_INTERVAL}s)...")
+        dm.normalize_dataframe_types()
         records = dm.df.to_dict(orient="records")
         total = len(records)
         
         # 构建字段类型映射
         field_type_map = {f["name"]: f["type"] for f in dm.schema_config}
+        int64_min = dm.INT64_MIN
+        int64_max = dm.INT64_MAX
+
+        def is_missing_scalar(v):
+            if v is None or v is pd.NA:
+                return True
+            if isinstance(v, (float, np.floating)):
+                return bool(np.isnan(v))
+            return False
+
+        def clip_int64(v):
+            iv = int(v)
+            if iv < int64_min:
+                return int64_min
+            if iv > int64_max:
+                return int64_max
+            return iv
 
         def convert_numpy_types(obj):
             """递归转换 numpy 类型为 Python 原生类型"""
@@ -679,31 +945,10 @@ class QdrantManager:
         
         def convert_value_by_type(k, v, field_type_map):
             """根据 schema 类型正确转换值，确保 INT 字段存为 int"""
-            # 处理 None 和 NaN
-            if v is None:
-                return None
-            if isinstance(v, float) and np.isnan(v):
-                return None
-            
             ftype = field_type_map.get(k)
-            
-            # INT 字段必须转为 int（Pandas 有 None 时会把整列变成 float）
-            if ftype == FieldType.INT:
-                return int(v)
-            # BOOL 字段确保是 Python bool
-            elif ftype == FieldType.BOOL:
-                return bool(v)
-            # DATETIME 字段转为 int（epoch 秒数）
-            elif ftype == FieldType.DATETIME:
-                return int(v)
-            # GEO 字段确保是正确的 dict
-            elif ftype == FieldType.GEO:
-                if isinstance(v, dict) and "lat" in v and "lon" in v:
-                    return {"lat": float(v["lat"]), "lon": float(v["lon"])}
-                return None
-            # 其他类型递归转换
-            else:
+            if ftype is None:
                 return convert_numpy_types(v)
+            return dm._normalize_scalar_for_field(v, ftype)
 
         for start in range(0, total, BATCH_SIZE):
             end = min(start + BATCH_SIZE, total)
@@ -796,6 +1041,74 @@ class QdrantManager:
                 # 索引创建失败不是致命错误
                 pass
         print("✅ Index creation complete.")
+
+    def sync_float_fields_from_storage(self, dm, batch_size=None):
+        """
+        在 gRPC 路径下，Qdrant 对极值 float 的序列化可能与本地 pandas 侧存在 ULP 级差异。
+        该方法回读实际 payload，将 FLOAT / ARRAY_FLOAT 字段对齐到“库内真实值”，
+        避免 oracle 在边界比较时出现假阳性 mismatch。
+        """
+        if batch_size is None:
+            batch_size = BATCH_SIZE
+
+        float_fields = [f["name"] for f in dm.schema_config if f["type"] == FieldType.FLOAT]
+        array_float_fields = [f["name"] for f in dm.schema_config if f["type"] == FieldType.ARRAY_FLOAT]
+        if not float_fields and not array_float_fields:
+            return 0
+
+        ids = [int(x) for x in dm.df["id"].tolist()]
+        id_to_idx = {int(dm.df.at[i, "id"]): int(i) for i in range(len(dm.df))}
+        touched = 0
+
+        for start in range(0, len(ids), batch_size):
+            batch_ids = ids[start:start + batch_size]
+            try:
+                recs = self.client.retrieve(
+                    collection_name=COLLECTION_NAME,
+                    ids=batch_ids,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+            except Exception:
+                continue
+
+            for rec in recs:
+                pid = int(rec.id)
+                idx = id_to_idx.get(pid)
+                if idx is None:
+                    continue
+                payload = rec.payload or {}
+
+                for fname in float_fields:
+                    v = payload.get(fname, None)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        dm.df.at[idx, fname] = float(v)
+                    elif v is None:
+                        dm.df.at[idx, fname] = None
+                    else:
+                        dm.df.at[idx, fname] = None
+
+                for fname in array_float_fields:
+                    v = payload.get(fname, None)
+                    if v is None:
+                        dm.df.at[idx, fname] = None
+                    elif isinstance(v, list):
+                        ok = True
+                        arr = []
+                        for x in v:
+                            if isinstance(x, (int, float)) and not isinstance(x, bool):
+                                arr.append(float(x))
+                            else:
+                                ok = False
+                                break
+                        dm.df.at[idx, fname] = arr if ok else None
+                    else:
+                        dm.df.at[idx, fname] = None
+
+                touched += 1
+
+        dm.normalize_dataframe_types()
+        return touched
 
     def backfill_field_data(self, field_name, backfill_data):
         """
@@ -1012,7 +1325,11 @@ class OracleQueryGenerator:
 
     @staticmethod
     def _is_na_like(x):
-        return x is None or (isinstance(x, float) and np.isnan(x))
+        if x is None or x is pd.NA:
+            return True
+        if isinstance(x, (float, np.floating)):
+            return bool(np.isnan(x))
+        return False
 
     def _clip_int64(self, v):
         iv = int(v)
@@ -1025,15 +1342,40 @@ class OracleQueryGenerator:
     def _offset_int64(self, base, delta):
         return self._clip_int64(int(base) + int(delta))
 
+    def _normalize_int_scalar(self, x):
+        if self._is_na_like(x):
+            return None
+        try:
+            return self._clip_int64(x)
+        except Exception:
+            return None
+
+    def _as_bool_mask(self, mask):
+        """统一 mask 为 pandas nullable boolean Series，避免 object/float 掩码的隐式行为。"""
+        if isinstance(mask, pd.Series):
+            s = mask
+        else:
+            s = pd.Series(mask, index=self.df.index)
+        if not s.index.equals(self.df.index):
+            s = s.reindex(self.df.index)
+        return s.astype("boolean")
+
+    def _safe_apply(self, series, fn):
+        """
+        对 Series 执行逐元素函数时先转 object，规避 pandas nullable Int64
+        在 apply/map 中隐式转为 float64 导致的 64-bit 边界值精度丢失。
+        """
+        return series.astype(object).apply(fn)
+
     def _series_is_null(self, series):
-        return series.apply(self._is_na_like)
+        return self._safe_apply(series, self._is_na_like)
 
     def _series_not_null(self, series):
         return ~self._series_is_null(series)
 
     def _series_is_empty(self, series):
         # 对齐 Qdrant IsEmpty：missing/null/[]。在 pandas 中 missing 映射为 None/NaN。
-        return series.apply(lambda x: self._is_na_like(x) or (isinstance(x, list) and len(x) == 0))
+        return self._safe_apply(series, lambda x: self._is_na_like(x) or (isinstance(x, list) and len(x) == 0))
 
     def _series_not_empty(self, series):
         return ~self._series_is_empty(series)
@@ -1055,7 +1397,7 @@ class OracleQueryGenerator:
 
     def _qdrant_nullish_filter(self, key):
         """nullish 语义：普通字段用 IsNull；演进字段用 IsEmpty（覆盖缺失）。"""
-        if self._is_evolved_field(key):
+        if self._is_evolved_field(key) and evolved_field_use_empty_semantics():
             return self._qdrant_is_empty_filter(key)
         return self._qdrant_is_null_filter(key)
 
@@ -1157,11 +1499,15 @@ class OracleQueryGenerator:
 
         # 1. Null/Empty Check
         if random.random() < 0.15:
-            # 演化字段在 Qdrant 中常见“字段缺失”，这里统一走 IsEmpty 语义，避免把 missing 误判到 is_null。
+            # 演化字段默认走 IsEmpty（覆盖 missing/null/[]）；若开启显式 NULL 同步则走严格 IsNull。
             if self._is_evolved_field(name):
+                if evolved_field_use_empty_semantics():
+                    if random.random() < 0.5:
+                        return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
+                    return (self._qdrant_not_empty_filter(name), self._series_not_empty(series), f"{name} is not empty")
                 if random.random() < 0.5:
-                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
-                return (self._qdrant_not_empty_filter(name), self._series_not_empty(series), f"{name} is not empty")
+                    return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
+                return (self._qdrant_not_null_filter(name), self._series_not_null(series), f"{name} is not null")
 
             if ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT]:
                 op = random.choice(["is_null", "is_not_null", "is_empty", "is_not_empty"])
@@ -1180,7 +1526,9 @@ class OracleQueryGenerator:
         val = self.get_value_for_query(name, ftype)
         if val is None:
             if self._is_evolved_field(name):
-                return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
+                if evolved_field_use_empty_semantics():
+                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
+                return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
             return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
 
         # 安全比较函数 - 处理 None 和 NaN
@@ -1211,7 +1559,7 @@ class OracleQueryGenerator:
                 key=name,
                 match=MatchValue(value=val_bool)
             )
-            mask = series.apply(safe_compare_scalar("==", val_bool))
+            mask = self._safe_apply(series, safe_compare_scalar("==", val_bool))
             expr_str = f"{name} == {val_bool}"
 
         elif ftype == FieldType.INT:
@@ -1220,47 +1568,85 @@ class OracleQueryGenerator:
             
             if op == "==":
                 filter_cond = FieldCondition(key=name, match=MatchValue(value=val_int))
-                mask = series.apply(safe_compare_scalar("==", val_int))
+                mask = self._safe_apply(series, lambda x, t=val_int: self._normalize_int_scalar(x) == t)
                 expr_str = f"{name} == {val_int}"
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
-                mask = series.apply(safe_compare_scalar("!=", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) != t
+                    )
+                )
                 expr_str = f"{name} != {val_int}"
             elif op == ">":
                 filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
-                mask = series.apply(safe_compare_scalar(">", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) > t
+                    )
+                )
                 expr_str = f"{name} > {val_int}"
             elif op == "<":
                 filter_cond = FieldCondition(key=name, range=Range(lt=val_int))
-                mask = series.apply(safe_compare_scalar("<", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) < t
+                    )
+                )
                 expr_str = f"{name} < {val_int}"
             elif op == ">=":
                 filter_cond = FieldCondition(key=name, range=Range(gte=val_int))
-                mask = series.apply(safe_compare_scalar(">=", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) >= t
+                    )
+                )
                 expr_str = f"{name} >= {val_int}"
             elif op == "<=":
                 filter_cond = FieldCondition(key=name, range=Range(lte=val_int))
-                mask = series.apply(safe_compare_scalar("<=", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) <= t
+                    )
+                )
                 expr_str = f"{name} <= {val_int}"
             elif op == "in":
                 # IN 列表查询：从实际数据中采样 2-6 个值
-                valid_vals = [self._clip_int64(x) for x in self.df[name].dropna().unique()[:20]]
+                valid_vals = []
+                for x in self.df[name].dropna().unique()[:50]:
+                    nx = self._normalize_int_scalar(self._convert_to_native(x))
+                    if nx is not None:
+                        valid_vals.append(nx)
+                valid_vals = list(dict.fromkeys(valid_vals))
                 sample_size = min(random.randint(2, 6), len(valid_vals))
                 in_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 if val_int not in in_vals:
                     in_vals[0] = val_int  # 确保至少包含查询基准值
                 filter_cond = FieldCondition(key=name, match=MatchAny(any=in_vals))
                 in_set = set(in_vals)
-                mask = series.apply(lambda x: int(x) in in_set if pd.notna(x) else False)
+                mask = self._safe_apply(series, 
+                    lambda x, s=in_set: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) in s
+                    )
+                )
                 expr_str = f"{name} in {in_vals}"
             else:  # not_in
                 # NOT IN 排除查询
-                valid_vals = [self._clip_int64(x) for x in self.df[name].dropna().unique()[:20]]
+                valid_vals = []
+                for x in self.df[name].dropna().unique()[:50]:
+                    nx = self._normalize_int_scalar(self._convert_to_native(x))
+                    if nx is not None:
+                        valid_vals.append(nx)
+                valid_vals = list(dict.fromkeys(valid_vals))
                 sample_size = min(random.randint(2, 6), len(valid_vals))
                 excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
                 excl_set = set(excl_vals)
-                mask = series.apply(lambda x: int(x) not in excl_set if pd.notna(x) else False)
+                mask = self._safe_apply(series, 
+                    lambda x, s=excl_set: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) not in s
+                    )
+                )
                 expr_str = f"{name} not in {excl_vals}"
 
         elif ftype == FieldType.FLOAT:
@@ -1276,7 +1662,7 @@ class OracleQueryGenerator:
             elif op == "<=":
                 filter_cond = FieldCondition(key=name, range=Range(lte=val_float))
             
-            mask = series.apply(safe_compare_scalar(op, val_float))
+            mask = self._safe_apply(series, safe_compare_scalar(op, val_float))
             expr_str = f"{name} {op} {val_float}"
 
         elif ftype == FieldType.STRING:
@@ -1287,11 +1673,11 @@ class OracleQueryGenerator:
             
             if op == "==":
                 filter_cond = FieldCondition(key=name, match=MatchValue(value=val))
-                mask = series.apply(safe_compare_scalar("==", val))
+                mask = self._safe_apply(series, safe_compare_scalar("==", val))
                 expr_str = f'{name} == "{val}"'
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val]}))
-                mask = series.apply(safe_compare_scalar("!=", val))
+                mask = self._safe_apply(series, safe_compare_scalar("!=", val))
                 expr_str = f'{name} != "{val}"'
             elif op == "phrase":
                 val_str = str(val)
@@ -1302,7 +1688,7 @@ class OracleQueryGenerator:
                     phrase = val_str
                 filter_cond = FieldCondition(key=name, match=models.MatchPhrase(phrase=phrase))
                 # 无全文索引时，Qdrant 退化为 substring 匹配
-                mask = series.apply(lambda x, p=phrase: isinstance(x, str) and p in x)
+                mask = self._safe_apply(series, lambda x, p=phrase: isinstance(x, str) and p in x)
                 expr_str = f'{name} phrase "{phrase}"'
             else:  # in
                 # 生成多个值的列表
@@ -1310,7 +1696,7 @@ class OracleQueryGenerator:
                 if val not in valid_vals:
                     valid_vals.append(val)
                 filter_cond = FieldCondition(key=name, match=MatchAny(any=valid_vals))
-                mask = series.apply(lambda x: x in valid_vals if x is not None else False)
+                mask = self._safe_apply(series, lambda x: x in valid_vals if x is not None else False)
                 expr_str = f'{name} in {valid_vals}'
 
         elif ftype == FieldType.JSON:
@@ -1360,14 +1746,14 @@ class OracleQueryGenerator:
                     return cnt <= _t
 
                 op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
-                mask = series.apply(_count_match)
+                mask = self._safe_apply(series, _count_match)
                 expr_str = f"{name} values_count {op_map[cmp_op]} {threshold}"
             elif array_op == "contains" and all_items:
                 target = random.choice(all_items)
                 # 转换 numpy 类型
                 target = self._convert_to_native(target)
                 filter_cond = FieldCondition(key=name, match=MatchAny(any=[target]))
-                mask = series.apply(lambda x, t=target: t in x if isinstance(x, list) else False)
+                mask = self._safe_apply(series, lambda x, t=target: t in x if isinstance(x, list) else False)
                 expr_str = f'{name} contains {target}'
             else:
                 filter_cond = self._qdrant_not_empty_filter(name)
@@ -1413,14 +1799,14 @@ class OracleQueryGenerator:
                     return cnt <= _t
 
                 op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
-                mask = series.apply(_count_match_float)
+                mask = self._safe_apply(series, _count_match_float)
                 expr_str = f"{name} values_count {op_map[cmp_op]} {threshold}"
             elif array_op == "element_range" and all_items:
                 target = random.choice(all_items)
                 target_f = float(target)
                 epsilon = 0.5  # 较大的 epsilon 避免浮点精度问题
                 filter_cond = FieldCondition(key=name, range=Range(gte=target_f - epsilon, lte=target_f + epsilon))
-                mask = series.apply(lambda x, t=target_f, e=epsilon:
+                mask = self._safe_apply(series, lambda x, t=target_f, e=epsilon:
                     any(t - e <= float(v) <= t + e for v in x) if isinstance(x, list) and x else False)
                 expr_str = f'{name} has element ~= {target_f}'
             else:
@@ -1429,49 +1815,87 @@ class OracleQueryGenerator:
                 expr_str = f'{name} is not empty'
 
         elif ftype == FieldType.DATETIME:
-            val_int = int(val)
+            val_int = self._clip_int64(int(val))
             op = random.choice([">", "<", ">=", "<=", "==", "!=", "in", "not_in"])
             if op == "==":
                 filter_cond = FieldCondition(key=name, match=MatchValue(value=val_int))
-                mask = series.apply(safe_compare_scalar("==", val_int))
+                mask = self._safe_apply(series, lambda x, t=val_int: self._normalize_int_scalar(x) == t)
                 expr_str = f"{name} == {val_int} (timestamp)"
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
-                mask = series.apply(safe_compare_scalar("!=", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) != t
+                    )
+                )
                 expr_str = f"{name} != {val_int} (timestamp)"
             elif op == ">":
                 filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
-                mask = series.apply(safe_compare_scalar(">", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) > t
+                    )
+                )
                 expr_str = f"{name} > {val_int} (timestamp)"
             elif op == "<":
                 filter_cond = FieldCondition(key=name, range=Range(lt=val_int))
-                mask = series.apply(safe_compare_scalar("<", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) < t
+                    )
+                )
                 expr_str = f"{name} < {val_int} (timestamp)"
             elif op == ">=":
                 filter_cond = FieldCondition(key=name, range=Range(gte=val_int))
-                mask = series.apply(safe_compare_scalar(">=", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) >= t
+                    )
+                )
                 expr_str = f"{name} >= {val_int} (timestamp)"
             elif op == "<=":
                 filter_cond = FieldCondition(key=name, range=Range(lte=val_int))
-                mask = series.apply(safe_compare_scalar("<=", val_int))
+                mask = self._safe_apply(series, 
+                    lambda x, t=val_int: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) <= t
+                    )
+                )
                 expr_str = f"{name} <= {val_int} (timestamp)"
             elif op == "in":
-                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                valid_vals = []
+                for x in self.df[name].dropna().unique()[:50]:
+                    nx = self._normalize_int_scalar(self._convert_to_native(x))
+                    if nx is not None:
+                        valid_vals.append(nx)
+                valid_vals = list(dict.fromkeys(valid_vals))
                 sample_size = min(random.randint(2, 6), len(valid_vals))
                 in_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 if val_int not in in_vals:
                     in_vals[0] = val_int
                 filter_cond = FieldCondition(key=name, match=MatchAny(any=in_vals))
                 in_set = set(in_vals)
-                mask = series.apply(lambda x: int(x) in in_set if pd.notna(x) else False)
+                mask = self._safe_apply(series, 
+                    lambda x, s=in_set: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) in s
+                    )
+                )
                 expr_str = f"{name} in {in_vals} (timestamp)"
             else:  # not_in
-                valid_vals = [int(x) for x in self.df[name].dropna().unique()[:20]]
+                valid_vals = []
+                for x in self.df[name].dropna().unique()[:50]:
+                    nx = self._normalize_int_scalar(self._convert_to_native(x))
+                    if nx is not None:
+                        valid_vals.append(nx)
+                valid_vals = list(dict.fromkeys(valid_vals))
                 sample_size = min(random.randint(2, 6), len(valid_vals))
                 excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
                 excl_set = set(excl_vals)
-                mask = series.apply(lambda x: int(x) not in excl_set if pd.notna(x) else False)
+                mask = self._safe_apply(series, 
+                    lambda x, s=excl_set: (
+                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) not in s
+                    )
+                )
                 expr_str = f"{name} not in {excl_vals} (timestamp)"
 
         elif ftype == FieldType.GEO:
@@ -1499,7 +1923,7 @@ class OracleQueryGenerator:
                         bottom_right=GeoPoint(lat=bottom_lat, lon=right_lon)
                     )
                 )
-                mask = series.apply(lambda x: (
+                mask = self._safe_apply(series, lambda x: (
                     x is not None and isinstance(x, dict)
                     and "lat" in x and "lon" in x
                     and bottom_lat <= x["lat"] <= top_lat
@@ -1528,7 +1952,7 @@ class OracleQueryGenerator:
                     c = 2 * math.asin(min(1.0, math.sqrt(a)))
                     dist = 6_371_000 * c  # 地球平均半径(m)
                     return dist <= r
-                mask = series.apply(_haversine_check)
+                mask = self._safe_apply(series, _haversine_check)
                 expr_str = f"{name} in radius({center_lat:.2f},{center_lon:.2f}, r={radius_m:.0f}m)"
 
         if filter_cond is not None and mask is not None:
@@ -1582,7 +2006,7 @@ class OracleQueryGenerator:
                     return (isinstance(v, (int, float)) and v > low and v < high)
                 except: return False
 
-            return (filter_cond, series.apply(check_range), f'{name}.price > {low} and < {high}')
+            return (filter_cond, self._safe_apply(series, check_range), f'{name}.price > {low} and < {high}')
 
         elif strategy == "nested":
             val = random.randint(1, 9)
@@ -1599,7 +2023,7 @@ class OracleQueryGenerator:
                     return v == val
                 except: return False
 
-            return (filter_cond, series.apply(check_nested), f'{name}.config.version == {val}')
+            return (filter_cond, self._safe_apply(series, check_nested), f'{name}.config.version == {val}')
 
         elif strategy == "index":
             idx = 0
@@ -1617,7 +2041,7 @@ class OracleQueryGenerator:
                     return (isinstance(v, (int, float)) and v > val)
                 except: return False
 
-            return (filter_cond, series.apply(check_index), f'{name}.history[{idx}] > {val}')
+            return (filter_cond, self._safe_apply(series, check_index), f'{name}.history[{idx}] > {val}')
 
         else:  # multi_key
             color = random.choice(["Red", "Blue"])
@@ -1637,7 +2061,7 @@ class OracleQueryGenerator:
                     return col_val == color
                 except: return False
 
-            return (filter_cond, series.apply(check_multi), f'{name}.active == true and {name}.color == "{color}"')
+            return (filter_cond, self._safe_apply(series, check_multi), f'{name}.active == true and {name}.color == "{color}"')
 
     def gen_has_id_expr(self):
         """
@@ -1656,12 +2080,12 @@ class OracleQueryGenerator:
         if random.random() < 0.5:
             filter_obj = Filter(must=[HasIdCondition(has_id=selected_ids)])
             id_set = set(selected_ids)
-            mask = self.df["id"].apply(lambda x: int(x) in id_set)
+            mask = self._safe_apply(self.df["id"], lambda x: int(x) in id_set)
             expr_str = f"id in {selected_ids}"
         else:
             filter_obj = Filter(must_not=[HasIdCondition(has_id=selected_ids)])
             id_set = set(selected_ids)
-            mask = self.df["id"].apply(lambda x: int(x) not in id_set)
+            mask = self._safe_apply(self.df["id"], lambda x: int(x) not in id_set)
             expr_str = f"id not in {selected_ids}"
 
         return filter_obj, mask, expr_str
@@ -1672,10 +2096,12 @@ class OracleQueryGenerator:
 
     def _qdrant_not_null_filter(self, name):
         """为字段生成 is_not_null 的 Qdrant filter（自动适配演化字段）。
-        - 演化字段（evo_）: NOT IsEmpty（字段存在且有非 null/[] 值）
+        - 演化字段（evo_）:
+            * 默认: NOT IsEmpty（字段存在且有非 null/[] 值）
+            * 开启显式 NULL 同步: NOT IsNull（严格 is_not_null）
         - 普通字段:         NOT IsNull
         """
-        if self._is_evolved_field(name):
+        if self._is_evolved_field(name) and evolved_field_use_empty_semantics():
             return Filter(must_not=[self._is_empty_condition(name)])
         return Filter(must_not=[self._is_null_condition(name)])
 
@@ -1700,15 +2126,41 @@ class OracleQueryGenerator:
 
         # --- 策略 1: NOT + 比较 ---
         if strategy == "not_compare":
-            if ftype in [FieldType.INT, FieldType.FLOAT, FieldType.DATETIME]:
+            if ftype in [FieldType.INT, FieldType.DATETIME]:
+                valid = series.dropna()
+                if valid.empty:
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                val = self._normalize_int_scalar(self._convert_to_native(random.choice(valid.values)))
+                if val is None:
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                op = random.choice(["gt", "lt", "gte", "lte"])
+                inner_cond = FieldCondition(key=name, range=Range(**{op: val}))
+                f_obj = Filter(must_not=[inner_cond])
+
+                def _mask_fn_int(x, _op=op, _val=val):
+                    nx = self._normalize_int_scalar(x)
+                    if nx is None:
+                        return True  # null -> must_not 不命中 inner -> 保留
+                    if _op == "gt":
+                        return not (nx > _val)
+                    if _op == "lt":
+                        return not (nx < _val)
+                    if _op == "gte":
+                        return not (nx >= _val)
+                    if _op == "lte":
+                        return not (nx <= _val)
+                    return True
+
+                mask = self._safe_apply(series, _mask_fn_int)
+                op_sym = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[op]
+                return f_obj, mask, f"NOT ({name} {op_sym} {val})"
+
+            if ftype == FieldType.FLOAT:
                 valid = series.dropna()
                 if valid.empty:
                     return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 val = self._convert_to_native(random.choice(valid.values))
-                if ftype == FieldType.INT or ftype == FieldType.DATETIME:
-                    val = int(val)
-                else:
-                    val = float(val)
+                val = float(val)
                 op = random.choice(["gt", "lt", "gte", "lte"])
                 inner_cond = FieldCondition(key=name, range=Range(**{op: val}))
                 f_obj = Filter(must_not=[inner_cond])
@@ -1724,7 +2176,7 @@ class OracleQueryGenerator:
                         if _op == "lte": return not (xv <= _val)
                     except: return True
                     return True
-                mask = series.apply(_mask_fn)
+                mask = self._safe_apply(series, _mask_fn)
                 op_sym = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[op]
                 return f_obj, mask, f"NOT ({name} {op_sym} {val})"
 
@@ -1735,14 +2187,14 @@ class OracleQueryGenerator:
                 val = str(random.choice(valid.values))
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
                 f_obj = Filter(must_not=[inner_cond])
-                mask = series.apply(lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val)
+                mask = self._safe_apply(series, lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val)
                 return f_obj, mask, f'NOT ({name} == "{val}")'
 
             elif ftype == FieldType.BOOL:
                 val_bool = random.choice([True, False])
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val_bool))
                 f_obj = Filter(must_not=[inner_cond])
-                mask = series.apply(lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val_bool)
+                mask = self._safe_apply(series, lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val_bool)
                 return f_obj, mask, f"NOT ({name} == {val_bool})"
 
             # fallback
@@ -1754,10 +2206,16 @@ class OracleQueryGenerator:
                 valid = series.dropna()
                 if valid.empty:
                     return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
-                val = int(self._convert_to_native(random.choice(valid.values)))
+                val = self._normalize_int_scalar(self._convert_to_native(random.choice(valid.values)))
+                if val is None:
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
                 f_obj = Filter(must_not=[inner_cond])
-                mask = series.apply(lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else int(x) != val)
+                mask = self._safe_apply(series, 
+                    lambda x, t=val: (
+                        self._normalize_int_scalar(x) is None or self._normalize_int_scalar(x) != t
+                    )
+                )
                 return f_obj, mask, f"NOT ({name} == {val})"
             return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
@@ -1782,7 +2240,9 @@ class OracleQueryGenerator:
                 valid = series.dropna()
                 if valid.empty:
                     return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
-                val = self._clip_int64(self._convert_to_native(random.choice(valid.values)))
+                val = self._normalize_int_scalar(self._convert_to_native(random.choice(valid.values)))
+                if val is None:
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 low = self._offset_int64(val, -random.randint(10, 100))
                 high = self._offset_int64(val, random.randint(10, 100))
                 inner = Filter(must=[
@@ -1792,13 +2252,11 @@ class OracleQueryGenerator:
                 f_obj = Filter(must_not=[inner])
                 # Qdrant must_not: null → 不匹配 inner → 保留
                 def _and_mask(x, _low=low, _high=high):
-                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                    nx = self._normalize_int_scalar(x)
+                    if nx is None:
                         return True
-                    try:
-                        xv = float(x)
-                        return not (xv > _low and xv < _high)
-                    except: return True
-                mask = series.apply(_and_mask)
+                    return not (nx > _low and nx < _high)
+                mask = self._safe_apply(series, _and_mask)
                 return f_obj, mask, f"NOT ({name} > {low} AND {name} < {high})"
             return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
@@ -1808,7 +2266,15 @@ class OracleQueryGenerator:
                 valid = series.dropna()
                 if len(valid) < 2:
                     return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
-                vals = [int(self._convert_to_native(v)) for v in random.sample(list(valid.values), min(2, len(valid)))]
+                vals = []
+                for v in random.sample(list(valid.values), min(8, len(valid))):
+                    nv = self._normalize_int_scalar(self._convert_to_native(v))
+                    if nv is not None:
+                        vals.append(nv)
+                    if len(vals) >= 2:
+                        break
+                if len(vals) < 2:
+                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
                 v1, v2 = vals[0], vals[-1]
                 inner = Filter(should=[
                     Filter(must=[FieldCondition(key=name, match=MatchValue(value=v1))]),
@@ -1816,13 +2282,11 @@ class OracleQueryGenerator:
                 ])
                 f_obj = Filter(must_not=[inner])
                 def _or_mask(x, _v1=v1, _v2=v2):
-                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                    nx = self._normalize_int_scalar(x)
+                    if nx is None:
                         return True
-                    try:
-                        xv = int(x)
-                        return not (xv == _v1 or xv == _v2)
-                    except: return True
-                mask = series.apply(_or_mask)
+                    return not (nx == _v1 or nx == _v2)
+                mask = self._safe_apply(series, _or_mask)
                 return f_obj, mask, f"NOT ({name} == {v1} OR {name} == {v2})"
             return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
 
@@ -1960,7 +2424,8 @@ class OracleQueryGenerator:
             # Qdrant must_not: 排除匹配的点（null 值的点由于不匹配条件，会被保留）
             # Pandas ~mask: True -> False, False -> True（与 must_not 语义一致）
             not_filter = Filter(must_not=[filter_l])
-            not_mask = ~mask_l.fillna(False)
+            mask_lb = self._as_bool_mask(mask_l)
+            not_mask = ~mask_lb.fillna(False)
             return not_filter, not_mask, f"NOT ({expr_l})"
 
         # AND/OR 需要第二个子表达式
@@ -1971,11 +2436,15 @@ class OracleQueryGenerator:
             # AND 逻辑：将两个 Filter 作为整体放入 must 列表
             # 不能直接提取 must 字段，因为 Filter 可能是用 should/must_not 构建的
             combined_filter = Filter(must=[filter_l, filter_r])
-            return combined_filter, (mask_l & mask_r), f"({expr_l} AND {expr_r})"
+            mask_lb = self._as_bool_mask(mask_l).fillna(False)
+            mask_rb = self._as_bool_mask(mask_r).fillna(False)
+            return combined_filter, (mask_lb & mask_rb), f"({expr_l} AND {expr_r})"
         else:
             # OR 逻辑：将两个 Filter 作为整体放入 should 列表
             combined_filter = Filter(should=[filter_l, filter_r])
-            return combined_filter, (mask_l | mask_r), f"({expr_l} OR {expr_r})"
+            mask_lb = self._as_bool_mask(mask_l).fillna(False)
+            mask_rb = self._as_bool_mask(mask_r).fillna(False)
+            return combined_filter, (mask_lb | mask_rb), f"({expr_l} OR {expr_r})"
 
 
 # --- 4. Equivalence Query Generator ---
@@ -2998,21 +3467,41 @@ def query_qdrant_rows(qm, id_list, limit=5):
 
 def format_row_for_display(row_dict):
     """清理行数据用于显示：移除向量、转换 numpy 类型、NaN 转 None"""
+    def to_native(v):
+        if v is pd.NA:
+            return None
+        if isinstance(v, (np.integer,)):
+            return int(v)
+        if isinstance(v, (np.floating,)):
+            return None if np.isnan(v) else float(v)
+        if isinstance(v, np.bool_):
+            return bool(v)
+        if isinstance(v, float) and (v != v):  # NaN check
+            return None
+        if isinstance(v, dict):
+            return {kk: to_native(vv) for kk, vv in v.items()}
+        if isinstance(v, list):
+            return [to_native(x) for x in v]
+        if isinstance(v, np.ndarray):
+            return [to_native(x) for x in v.tolist()]
+        return v
+
     clean = {}
     for k, v in row_dict.items():
         if k == "vector":
             continue
-        if isinstance(v, (np.integer,)):
-            clean[k] = int(v)
-        elif isinstance(v, (np.floating,)):
-            clean[k] = None if np.isnan(v) else float(v)
-        elif isinstance(v, np.bool_):
-            clean[k] = bool(v)
-        elif isinstance(v, float) and (v != v):  # NaN check
-            clean[k] = None
-        else:
-            clean[k] = v
+        clean[k] = to_native(v)
     return clean
+
+
+def dataframe_row_to_dict(df, row_idx):
+    """
+    按列读取单行，避免 `df.iloc[idx].to_dict()` 将 Int64 行值隐式提升为 float。
+    """
+    out = {}
+    for col in df.columns:
+        out[col] = df[col].iloc[row_idx]
+    return out
 
 
 def print_diff_evidence(dm, qm, diff_ids, label, expr_str, file_log):
@@ -3037,7 +3526,7 @@ def print_diff_evidence(dm, qm, diff_ids, label, expr_str, file_log):
         if pdf_row.empty:
             file_log(f"    [Pandas] NOT FOUND (deleted?)")
         else:
-            row_data = format_row_for_display(pdf_row.iloc[0].to_dict())
+            row_data = format_row_for_display(dataframe_row_to_dict(pdf_row, 0))
             null_fields = [k for k, v in row_data.items() if v is None and k != "id"]
             file_log(f"    [Pandas] {json.dumps(row_data, default=str, ensure_ascii=False)}")
             if null_fields:
@@ -3053,7 +3542,7 @@ def print_diff_evidence(dm, qm, diff_ids, label, expr_str, file_log):
 
             # NULL 不一致检测
             if not pdf_row.empty:
-                row_data = format_row_for_display(pdf_row.iloc[0].to_dict())
+                row_data = format_row_for_display(dataframe_row_to_dict(pdf_row, 0))
                 for field in row_data:
                     if field == "id":
                         continue
@@ -3070,8 +3559,8 @@ def print_diff_evidence(dm, qm, diff_ids, label, expr_str, file_log):
 def _do_schema_evolution(dm, qm, file_log):
     """
     Schema Evolution 操作：随机添加新字段并回填部分数据。
-    关键：对未回填的行显式设置字段为 None，
-    避免 Qdrant “字段不存在” ≠ “字段为 null” 的语义差异。
+    可选：对未回填的行显式设置字段为 None（严格 IsNull 语义）。
+    默认关闭，改用演进字段 IsEmpty 语义以提升动态模式稳定性。
     """
     try:
         field_config = dm.evolve_schema_add_field()
@@ -3095,18 +3584,27 @@ def _do_schema_evolution(dm, qm, file_log):
         else:
             file_log(f"[SchemaEvolution] No rows to backfill for '{field_name}'")
 
-        # 对未回填行显式设置为 null，避免“字段不存在”与“字段为 null”语义差异
-        all_ids = set(int(x) for x in dm.df["id"].tolist())
-        unfilled_ids = list(all_ids - backfilled_ids)
-        if unfilled_ids:
-            null_count = qm.set_null_for_points(field_name, unfilled_ids)
+        # 对未回填行默认不做显式 NULL 回写：
+        # 演进字段在查询层统一按 is_empty 处理，不依赖“显式 null vs 字段缺失”差异。
+        # 逐条 upsert 全量点会显著拖慢动态模式，并可能引入额外一致性噪音。
+        if SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC:
+            all_ids = set(int(x) for x in dm.df["id"].tolist())
+            unfilled_ids = list(all_ids - backfilled_ids)
+            if unfilled_ids:
+                null_count = qm.set_null_for_points(field_name, unfilled_ids)
+                file_log(
+                    f"[SchemaEvolution] Explicitly set NULL for {null_count}/{len(unfilled_ids)} rows on '{field_name}'"
+                )
+        else:
             file_log(
-                f"[SchemaEvolution] Explicitly set NULL for {null_count}/{len(unfilled_ids)} rows on '{field_name}'"
+                f"[SchemaEvolution] Explicit NULL sync skipped for '{field_name}' "
+                f"(using is_empty semantics for evolved fields)."
             )
 
         # 创建索引
         qm.create_evolved_field_index(field_config)
         file_log(f"[SchemaEvolution] Index created for '{field_name}'")
+        dm.normalize_dataframe_types()
 
         return True
     except Exception as e:
@@ -3148,7 +3646,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
         new_rows = []
         new_vecs = []
         for _ in range(batch_count):
-            row = dm.generate_single_row()
+            row = dm.normalize_row_for_storage(dm.generate_single_row())
             vec = dm.generate_single_vector()
             new_rows.append(row)
             new_vecs.append(vec)
@@ -3162,10 +3660,13 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 points=points,
                 wait=True
             )
-            new_df = pd.DataFrame(new_rows)
+            # 先以 object 保留 Python 原生整数，再按 schema 显式收敛 dtype
+            new_df = pd.DataFrame(new_rows, dtype=object)
+            new_df = dm.coerce_dataframe_types(new_df)
             new_df = new_df.dropna(axis=1, how='all')  # 避免全NA列的 FutureWarning
             dm.df = pd.concat([dm.df, new_df], ignore_index=True)
             dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
+            dm.normalize_dataframe_types()
             inserted_ids = [r["id"] for r in new_rows]
             _sync_explicit_nulls(new_rows, inserted_ids)
             file_log(f"[Dynamic] Inserted {len(new_rows)} rows: ids={inserted_ids}")
@@ -3185,6 +3686,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
                 dm.df = dm.df.drop(idx).reset_index(drop=True)
                 dm.vectors = np.delete(dm.vectors, idx, axis=0)
+                dm.normalize_dataframe_types()
                 file_log(f"[Dynamic] Deleted {len(del_ids)} rows: ids={del_ids}")
 
                 # 删除后验证：确认被删 ID 真的不再存在
@@ -3212,7 +3714,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 target_id = random.choice(dm.df["id"].tolist())
             else:
                 target_id = generate_unique_id()
-            row = dm.generate_single_row(id_override=target_id)
+            row = dm.normalize_row_for_storage(dm.generate_single_row(id_override=target_id))
             vec = dm.generate_single_vector()
             upsert_rows.append(row)
             upsert_vecs.append(vec)
@@ -3240,10 +3742,13 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                     new_rows.append(row)
                     new_vectors.append(vec)
             if new_rows:
-                new_df = pd.DataFrame(new_rows)
+                # 避免 INT+NULL 在构造临时 DataFrame 时先漂移到 float
+                new_df = pd.DataFrame(new_rows, dtype=object)
+                new_df = dm.coerce_dataframe_types(new_df)
                 new_df = new_df.dropna(axis=1, how='all')  # 避免全NA列的 FutureWarning
                 dm.df = pd.concat([dm.df, new_df], ignore_index=True)
                 dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
+            dm.normalize_dataframe_types()
             upsert_ids = [r["id"] for r in upsert_rows]
             _sync_explicit_nulls(upsert_rows, upsert_ids)
             file_log(f"[Dynamic] Upserted {len(upsert_rows)} rows: ids={upsert_ids}")
@@ -3280,6 +3785,26 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
 
 # --- 7. Main Execution Functions ---
 
+def _format_transport_line(qm):
+    info = qm.get_transport_info()
+    return (
+        f"Transport: host={info.get('host')} "
+        f"rest={info.get('rest_port')} grpc={info.get('grpc_port')} "
+        f"requested_prefer_grpc={info.get('requested_prefer_grpc')} "
+        f"backend={info.get('backend_class')} "
+        f"backend_prefer_grpc={info.get('backend_prefer_grpc')}"
+    )
+
+
+def _transport_warning_line():
+    if not PREFER_GRPC:
+        return (
+            "TransportWarning: REST path has known inconsistency on range comparisons "
+            "at +/-float32_max; use --prefer-grpc if this affects mismatch analysis."
+        )
+    return None
+
+
 def run(rounds=100, seed=None, enable_dynamic_ops=False):
     """
     Oracle 模式主测试：Qdrant vs Pandas 对比
@@ -3300,7 +3825,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
     # 1. 初始化随机化配置（种子已设置，确保可复现）
     _init_vector_check_config()
 
-    dm = DataManager()
+    dm = DataManager(data_seed=current_seed)
     dm.generate_schema()
     dm.generate_data()
 
@@ -3308,6 +3833,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
     qm.connect()
     qm.reset_collection(dm.schema_config)
     qm.insert(dm)
+    if PREFER_GRPC:
+        synced = qm.sync_float_fields_from_storage(dm)
+        print(f"🔧 Synced FLOAT payloads from Qdrant for oracle alignment: {synced} rows.")
 
     # 2. 日志设置
     timestamp = int(time.time())
@@ -3329,10 +3857,17 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
             if not id_set:
                 return []
             subset = dm.df[dm.df["id"].isin(list(id_set))]
-            rows = subset.to_dict(orient="records")
-            return rows[:limit]
+            rows = []
+            for ridx in range(min(limit, len(subset))):
+                raw = dataframe_row_to_dict(subset, ridx)
+                rows.append(format_row_for_display(raw))
+            return rows
 
         file_log(f"Start Testing: {total_test} rounds | Seed: {current_seed}")
+        file_log(_format_transport_line(qm))
+        tw = _transport_warning_line()
+        if tw:
+            file_log(tw)
         file_log("=" * 50)
 
         for i in range(total_test):
@@ -3529,7 +4064,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     print("="*60)
 
     # 初始化
-    dm = DataManager()
+    dm = DataManager(data_seed=seed)
     dm.generate_schema()
     dm.generate_data()
 
@@ -3537,6 +4072,9 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     qm.connect()
     qm.reset_collection(dm.schema_config)
     qm.insert(dm)
+    if PREFER_GRPC:
+        synced = qm.sync_float_fields_from_storage(dm)
+        print(f"🔧 Synced FLOAT payloads from Qdrant for oracle alignment: {synced} rows.")
 
     qg = EquivalenceQueryGenerator(dm)
     failed_cases = []
@@ -3547,6 +4085,10 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             f.flush()
 
         file_log(f"Equivalence Test Started | Seed: {seed}")
+        file_log(_format_transport_line(qm))
+        tw = _transport_warning_line()
+        if tw:
+            file_log(tw)
 
         for i in range(rounds):
             print(f"\r⚖️  Test {i+1}/{rounds}...", end="", flush=True)
@@ -3691,7 +4233,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     print("="*60)
 
     # 初始化
-    dm = DataManager()
+    dm = DataManager(data_seed=seed)
     dm.generate_schema()
     dm.generate_data()
 
@@ -3699,14 +4241,17 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     qm.connect()
     qm.reset_collection(dm.schema_config)
     qm.insert(dm)
+    if PREFER_GRPC:
+        synced = qm.sync_float_fields_from_storage(dm)
+        print(f"🔧 Synced FLOAT payloads from Qdrant for oracle alignment: {synced} rows.")
 
     pqs_gen = PQSQueryGenerator(dm)
     errors = []
     successful_tests = 0
     skipped_tests = 0
 
-    def safe_format_row(row_series):
-        row_dict = row_series.to_dict()
+    def safe_format_row(row_mapping):
+        row_dict = dict(row_mapping)
         safe_data = {}
         for k, v in row_dict.items():
             if k == "vector": continue
@@ -3727,6 +4272,10 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             f.flush()
 
         file_log(f"PQS Test Started | Rounds: {rounds} | Seed: {seed}")
+        file_log(_format_transport_line(qm))
+        tw = _transport_warning_line()
+        if tw:
+            file_log(tw)
         file_log("=" * 80)
 
         for i in range(rounds):
@@ -3745,7 +4294,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                 _do_schema_evolution(dm, qm, file_log)
 
             random_idx = random.randint(0, len(dm.df) - 1)
-            pivot_row = dm.df.iloc[random_idx]
+            pivot_row = dataframe_row_to_dict(dm.df, random_idx)
             pivot_id = int(pivot_row["id"])
 
             filter_obj = None
@@ -3865,7 +4414,7 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
     print("="*60)
 
     # 初始化
-    dm = DataManager()
+    dm = DataManager(data_seed=seed)
     dm.generate_schema()
     dm.generate_data()
 
@@ -3873,6 +4422,9 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
     qm.connect()
     qm.reset_collection(dm.schema_config)
     qm.insert(dm)
+    if PREFER_GRPC:
+        synced = qm.sync_float_fields_from_storage(dm)
+        print(f"🔧 Synced FLOAT payloads from Qdrant for oracle alignment: {synced} rows.")
 
     # 识别可用于分组的字段
     potential_group_fields = []
@@ -3895,6 +4447,10 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
             f.flush()
 
         file_log(f"GroupBy Test Started | Rounds: {rounds} | Seed: {seed}")
+        file_log(_format_transport_line(qm))
+        tw = _transport_warning_line()
+        if tw:
+            file_log(tw)
 
         for i in range(rounds):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
@@ -3991,6 +4547,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   python qdrant_fuzz_oracle.py --equiv --rounds 500    # 等价性模式
   python qdrant_fuzz_oracle.py --pqs --pqs-rounds 200  # PQS 模式
   python qdrant_fuzz_oracle.py --dynamic --rounds 300  # 动态操作模式
+  python qdrant_fuzz_oracle.py --dynamic --evo-null-sync # 演进字段严格 IsNull 语义
+  python qdrant_fuzz_oracle.py --prefer-grpc            # 使用 gRPC 查询路径
         """,
     )
 
@@ -4014,6 +4572,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--pqs-rounds", type=int, default=1000, dest="pqs_rounds",
                    help="PQS 测试轮数 (默认: 1000)")
 
+    # ---- 连接参数 ----
+    p.add_argument("--host", type=str, default=HOST,
+                   help=f"Qdrant 主机地址 (默认: {HOST})")
+    p.add_argument("--port", type=int, default=PORT,
+                   help=f"Qdrant REST 端口 (默认: {PORT})")
+    p.add_argument("--grpc-port", type=int, default=GRPC_PORT, dest="grpc_port",
+                   help=f"Qdrant gRPC 端口 (默认: {GRPC_PORT})")
+    p.add_argument("--prefer-grpc", action="store_true",
+                   help="优先使用 gRPC 传输（仍保留 REST 端口以兼容部分 API）")
+
     # ---- 功能开关 ----
     p.add_argument("--dynamic", action="store_true",
                    help="开启动态数据操作 (insert/delete/upsert)")
@@ -4022,12 +4590,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--chaos-rate", type=float, default=0.0, dest="chaos_rate",
                    metavar="RATE",
                    help="自定义混淆概率 0.0-1.0 (隐含 --chaos)")
+    p.add_argument(
+        "--evo-null-sync",
+        action="store_true",
+        help="Schema Evolution 时为未回填行显式写入 NULL（演进字段采用严格 IsNull 语义）",
+    )
 
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     global CHAOS_RATE
+    global SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC
+    global HOST, PORT, GRPC_PORT, PREFER_GRPC
 
     args = parse_args(argv)
 
@@ -4036,6 +4611,12 @@ def main(argv: list[str] | None = None) -> None:
         CHAOS_RATE = args.chaos_rate
     elif args.chaos:
         CHAOS_RATE = 0.1
+
+    SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = bool(args.evo_null_sync)
+    HOST = args.host
+    PORT = int(args.port)
+    GRPC_PORT = int(args.grpc_port)
+    PREFER_GRPC = bool(args.prefer_grpc)
 
     # Banner
     print("=" * 80)
@@ -4046,6 +4627,13 @@ def main(argv: list[str] | None = None) -> None:
     print(f"   随机种子:   {args.seed or '(随机)'}")
     print(f"   动态操作:   {'开启' if args.dynamic else '关闭'}")
     print(f"   混淆概率:   {CHAOS_RATE}")
+    print(f"   连接:       {HOST}:{PORT} (grpc:{GRPC_PORT}, prefer_grpc={PREFER_GRPC})")
+    if not PREFER_GRPC:
+        print("   ⚠️  说明: REST 路径对 ±float32_max 的范围比较存在已知不一致（建议使用 --prefer-grpc）")
+    print(
+        "   演进空值语义: "
+        + ("严格 IsNull（显式NULL回填）" if SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC else "IsEmpty（缺失/null/[]统一）")
+    )
     print("=" * 80)
 
     # Dispatch
