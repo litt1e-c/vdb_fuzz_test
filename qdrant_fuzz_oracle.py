@@ -29,7 +29,8 @@ from qdrant_client.http.models import (
     HasIdCondition, PointIdsList,
     GeoPoint, GeoBoundingBox, GeoRadius,
     PayloadSchemaType,
-    SearchParams
+    SearchParams,
+    NestedCondition, Nested,
 )
 
 # --- Configuration (User Specified) ---
@@ -106,6 +107,7 @@ class FieldType:
     ARRAY_FLOAT = "ARRAY_FLOAT"
     DATETIME = "DATETIME"
     GEO = "GEO"
+    ARRAY_OBJECT = "ARRAY_OBJECT"
 
 def get_type_name(dtype):
     """Map field type to string"""
@@ -220,6 +222,14 @@ class DataManager:
                 {"lat": -90.0, "lon": -180.0},
                 {"lat": 90.0, "lon": 180.0},
                 {"lat": -89.999999, "lon": 179.999999},
+            ]
+        if ftype == FieldType.ARRAY_OBJECT:
+            return [
+                [],
+                [{"score": 0, "label": "alpha", "active": True}],
+                [{"score": -100, "label": "", "active": False}],
+                [{"score": 99, "label": "gamma", "active": True},
+                 {"score": -99, "label": "delta", "active": False}],
             ]
         return []
 
@@ -360,6 +370,12 @@ class DataManager:
                 return None
         if ftype == FieldType.JSON:
             return self._to_python_nested(v)
+        if ftype == FieldType.ARRAY_OBJECT:
+            if self._is_missing_scalar(v):
+                return None
+            if not isinstance(v, (list, tuple)):
+                return None
+            return [self._to_python_nested(item) for item in v]
         return v
 
     def normalize_row_for_storage(self, row):
@@ -408,7 +424,7 @@ class DataManager:
                 out[fname] = pd.Series(pd.array(coerced, dtype="boolean"), index=out.index)
             elif ftype == FieldType.FLOAT:
                 out[fname] = pd.to_numeric(out[fname], errors="coerce")
-            elif ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT, FieldType.GEO, FieldType.JSON]:
+            elif ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT, FieldType.GEO, FieldType.JSON, FieldType.ARRAY_OBJECT]:
                 out[fname] = out[fname].apply(lambda x, t=ftype: self._normalize_scalar_for_field(x, t))
 
         return out
@@ -483,6 +499,17 @@ class DataManager:
 
         # 添加 GEO 字段（经纬度坐标）
         self.schema_config.append({"name": "location_geo", "type": FieldType.GEO})
+
+        # 添加 Nested 对象数组字段（用于 NestedCondition 测试）
+        self.schema_config.append({
+            "name": "items_nested",
+            "type": FieldType.ARRAY_OBJECT,
+            "sub_fields": [
+                {"name": "score", "type": "int"},
+                {"name": "label", "type": "str"},
+                {"name": "active", "type": "bool"},
+            ]
+        })
 
         print(f"   -> Generated {len(self.schema_config)} dynamic fields (plus id & vector).")
         print("   -> Schema Structure:")
@@ -586,6 +613,25 @@ class DataManager:
                         })
                 geo_list = self._inject_boundary_values(geo_list, ftype, rng)
                 data[fname] = geo_list
+            elif ftype == FieldType.ARRAY_OBJECT:
+                # 生成对象数组：每行含 0-5 个子对象，每个子对象带 score(int)/label(str)/active(bool)
+                nested_labels = ["alpha", "beta", "gamma", "delta", "epsilon"]
+                obj_list = []
+                for _ in range(N):
+                    if rng.random() < self.null_ratio:
+                        obj_list.append(None)
+                        continue
+                    length = int(rng.integers(1, 6))  # 1-5 个子对象
+                    arr = []
+                    for _ in range(length):
+                        arr.append({
+                            "score": int(rng.integers(-100, 100)),
+                            "label": str(rng.choice(nested_labels)),
+                            "active": bool(rng.choice([True, False])),
+                        })
+                    obj_list.append(arr)
+                obj_list = self._inject_boundary_values(obj_list, ftype, rng)
+                data[fname] = obj_list
 
         # 在 DataFrame 构造前先固定关键标量列的 dtype，避免“int + null”先被推断成 float
         # 造成 64-bit 边界值在 normalize 前就发生精度漂移。
@@ -697,6 +743,20 @@ class DataManager:
                         "lon": round(float(rng.uniform(-180, 180)), 6)
                     }
                     row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
+            elif ftype == FieldType.ARRAY_OBJECT:
+                if rng.random() < self.null_ratio:
+                    row[fname] = None
+                else:
+                    nested_labels = ["alpha", "beta", "gamma", "delta", "epsilon"]
+                    length = int(rng.integers(1, 6))
+                    arr = []
+                    for _ in range(length):
+                        arr.append({
+                            "score": int(rng.integers(-100, 100)),
+                            "label": str(rng.choice(nested_labels)),
+                            "active": bool(rng.choice([True, False])),
+                        })
+                    row[fname] = self._maybe_use_boundary_value(arr, ftype, rng)
         return row
 
     def generate_single_vector(self):
@@ -753,6 +813,16 @@ class DataManager:
                 "lat": round(float(rng.uniform(-90, 90)), 6),
                 "lon": round(float(rng.uniform(-180, 180)), 6)
             }
+        elif ftype == FieldType.ARRAY_OBJECT:
+            nested_labels = ["alpha", "beta", "gamma", "delta", "epsilon"]
+            length = int(rng.integers(1, 6))
+            value = []
+            for _ in range(length):
+                value.append({
+                    "score": int(rng.integers(-100, 100)),
+                    "label": str(rng.choice(nested_labels)),
+                    "active": bool(rng.choice([True, False])),
+                })
 
         return self._maybe_use_boundary_value(value, ftype, rng)
 
@@ -1380,6 +1450,43 @@ class OracleQueryGenerator:
     def _series_not_empty(self, series):
         return ~self._series_is_empty(series)
 
+    def _uses_empty_semantics(self, name):
+        """演进字段默认无法区分 missing 与显式 null，统一按 IsEmpty 语义处理。"""
+        return self._is_evolved_field(name) and evolved_field_use_empty_semantics()
+
+    def _series_qdrant_nullish(self, name, series):
+        if self._uses_empty_semantics(name):
+            return self._series_is_empty(series)
+        return self._series_is_null(series)
+
+    def _series_qdrant_not_nullish(self, name, series):
+        if self._uses_empty_semantics(name):
+            return self._series_not_empty(series)
+        return self._series_not_null(series)
+
+    def _nullish_expr(self, name):
+        return f"{name} is empty" if self._uses_empty_semantics(name) else f"{name} is null"
+
+    def _not_nullish_expr(self, name):
+        return f"{name} is not empty" if self._uses_empty_semantics(name) else f"{name} is not null"
+
+    def _series_match_except(self, name, series, excluded_set, normalizer):
+        """
+        对齐 Qdrant MatchExcept:
+        - 真实 Rust server 语义下，null / missing 均不会命中 MatchExcept。
+        - 因此 pandas 侧只保留“可归一化后的非空值且不在 except 列表中”的行。
+        """
+        def _match(x, _excluded=excluded_set):
+            if self._is_na_like(x):
+                return False
+            try:
+                normalized = normalizer(x)
+            except Exception:
+                return False
+            return normalized is not None and normalized not in _excluded
+
+        return self._safe_apply(series, _match)
+
     def _condition_filter(self, condition):
         return Filter(must=[condition])
 
@@ -1496,6 +1603,10 @@ class OracleQueryGenerator:
         f = random.choice(self.schema)
         name, ftype = f["name"], f["type"]
         series = self.df[name]
+        not_nullish_mask = self._series_qdrant_not_nullish(name, series)
+        nullish_mask = self._series_qdrant_nullish(name, series)
+        nullish_expr = self._nullish_expr(name)
+        not_nullish_expr = self._not_nullish_expr(name)
 
         # 1. Null/Empty Check
         if random.random() < 0.15:
@@ -1572,11 +1683,7 @@ class OracleQueryGenerator:
                 expr_str = f"{name} == {val_int}"
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
-                mask = self._safe_apply(series, 
-                    lambda x, t=val_int: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) != t
-                    )
-                )
+                mask = self._series_match_except(name, series, {val_int}, self._normalize_int_scalar)
                 expr_str = f"{name} != {val_int}"
             elif op == ">":
                 filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
@@ -1642,11 +1749,7 @@ class OracleQueryGenerator:
                 excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
                 excl_set = set(excl_vals)
-                mask = self._safe_apply(series, 
-                    lambda x, s=excl_set: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) not in s
-                    )
-                )
+                mask = self._series_match_except(name, series, excl_set, self._normalize_int_scalar)
                 expr_str = f"{name} not in {excl_vals}"
 
         elif ftype == FieldType.FLOAT:
@@ -1677,7 +1780,12 @@ class OracleQueryGenerator:
                 expr_str = f'{name} == "{val}"'
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val]}))
-                mask = self._safe_apply(series, safe_compare_scalar("!=", val))
+                mask = self._series_match_except(
+                    name,
+                    series,
+                    {val},
+                    lambda x: x if isinstance(x, str) else None,
+                )
                 expr_str = f'{name} != "{val}"'
             elif op == "phrase":
                 val_str = str(val)
@@ -1823,11 +1931,7 @@ class OracleQueryGenerator:
                 expr_str = f"{name} == {val_int} (timestamp)"
             elif op == "!=":
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
-                mask = self._safe_apply(series, 
-                    lambda x, t=val_int: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) != t
-                    )
-                )
+                mask = self._series_match_except(name, series, {val_int}, self._normalize_int_scalar)
                 expr_str = f"{name} != {val_int} (timestamp)"
             elif op == ">":
                 filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
@@ -1891,11 +1995,7 @@ class OracleQueryGenerator:
                 excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
                 filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
                 excl_set = set(excl_vals)
-                mask = self._safe_apply(series, 
-                    lambda x, s=excl_set: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) not in s
-                    )
-                )
+                mask = self._series_match_except(name, series, excl_set, self._normalize_int_scalar)
                 expr_str = f"{name} not in {excl_vals} (timestamp)"
 
         elif ftype == FieldType.GEO:
@@ -1955,13 +2055,17 @@ class OracleQueryGenerator:
                 mask = self._safe_apply(series, _haversine_check)
                 expr_str = f"{name} in radius({center_lat:.2f},{center_lon:.2f}, r={radius_m:.0f}m)"
 
+        elif ftype == FieldType.ARRAY_OBJECT:
+            # Nested object filter：使用 NestedCondition 进行对象数组内部过滤
+            return self.gen_nested_expr(name, series)
+
         if filter_cond is not None and mask is not None:
             # 由各分支自行定义 null 语义，这里不再统一追加 notnull 截断。
             return (filter_cond, mask, expr_str)
 
-        # 默认返回：严格 not null（演化字段自动使用 not empty 以对齐缺失语义）
+        # 默认返回：普通字段 is not null；演化字段默认 is not empty。
         filter_cond = self._qdrant_not_null_filter(name)
-        return (filter_cond, self._series_not_null(series), f"{name} is not null")
+        return (filter_cond, self._series_qdrant_not_nullish(name, series), self._not_nullish_expr(name))
 
     def gen_json_expr(self, name, series, val):
         """生成 JSON 嵌套字段查询"""
@@ -2063,6 +2167,226 @@ class OracleQueryGenerator:
 
             return (filter_cond, self._safe_apply(series, check_multi), f'{name}.active == true and {name}.color == "{color}"')
 
+    # ------------------------------------------------------------------ #
+    #  Nested Object Filter 查询生成器                                    #
+    # ------------------------------------------------------------------ #
+    def gen_nested_expr(self, name, series):
+        """
+        生成 NestedCondition 查询。
+        Qdrant nested 语义：payload 中对象数组至少有一个元素同时满足所有条件。
+        返回: (Filter, pandas_mask, expr_str)
+        """
+        # 从 DataFrame 中收集实际存在的值，用于构造有意义的查询
+        valid_series = series.dropna()
+        all_scores = set()
+        all_labels = set()
+        for arr in valid_series:
+            if isinstance(arr, list):
+                for item in arr:
+                    if isinstance(item, dict):
+                        if "score" in item and item["score"] is not None:
+                            all_scores.add(int(item["score"]))
+                        if "label" in item and item["label"] is not None:
+                            all_labels.add(str(item["label"]))
+
+        # 确保有足够的候选值
+        if not all_scores:
+            all_scores = {0, 10, -10, 50, -50}
+        if not all_labels:
+            all_labels = {"alpha", "beta", "gamma"}
+
+        score_list = list(all_scores)
+        label_list = list(all_labels)
+
+        strategy = random.choice([
+            "single_match",   # 单字段精确匹配
+            "single_range",   # 单字段范围
+            "multi_and",      # 多字段 AND
+            "should_or",      # should (OR) 内嵌
+            "must_not",       # must_not 内嵌
+        ])
+
+        # --- 策略 1: 单字段精确匹配 ---
+        if strategy == "single_match":
+            sub_field = random.choice(["score", "label", "active"])
+            if sub_field == "score":
+                val = random.choice(score_list)
+                inner_filter = Filter(must=[
+                    FieldCondition(key="score", match=MatchValue(value=val))
+                ])
+                def _mask(x, _v=val):
+                    if not isinstance(x, list) or not x:
+                        return False
+                    return any(
+                        isinstance(item, dict) and item.get("score") == _v
+                        for item in x
+                    )
+                expr_str = f"{name} nested(score == {val})"
+            elif sub_field == "label":
+                val = random.choice(label_list)
+                inner_filter = Filter(must=[
+                    FieldCondition(key="label", match=MatchValue(value=val))
+                ])
+                def _mask(x, _v=val):
+                    if not isinstance(x, list) or not x:
+                        return False
+                    return any(
+                        isinstance(item, dict) and item.get("label") == _v
+                        for item in x
+                    )
+                expr_str = f'{name} nested(label == "{val}")'
+            else:  # active
+                val = random.choice([True, False])
+                inner_filter = Filter(must=[
+                    FieldCondition(key="active", match=MatchValue(value=val))
+                ])
+                def _mask(x, _v=val):
+                    if not isinstance(x, list) or not x:
+                        return False
+                    return any(
+                        isinstance(item, dict) and item.get("active") == _v
+                        for item in x
+                    )
+                expr_str = f"{name} nested(active == {val})"
+
+        # --- 策略 2: 单字段范围 (score) ---
+        elif strategy == "single_range":
+            val = random.choice(score_list)
+            op = random.choice(["gt", "lt", "gte", "lte"])
+            inner_filter = Filter(must=[
+                FieldCondition(key="score", range=Range(**{op: val}))
+            ])
+            op_sym = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[op]
+            def _mask(x, _op=op, _v=val):
+                if not isinstance(x, list) or not x:
+                    return False
+                for item in x:
+                    if not isinstance(item, dict) or "score" not in item or item["score"] is None:
+                        continue
+                    s = item["score"]
+                    if _op == "gt" and s > _v:
+                        return True
+                    if _op == "lt" and s < _v:
+                        return True
+                    if _op == "gte" and s >= _v:
+                        return True
+                    if _op == "lte" and s <= _v:
+                        return True
+                return False
+            expr_str = f"{name} nested(score {op_sym} {val})"
+
+        # --- 策略 3: 多字段 AND (score + label 或 score + active) ---
+        elif strategy == "multi_and":
+            score_val = random.choice(score_list)
+            score_op = random.choice(["gt", "lt", "gte", "lte"])
+            score_op_sym = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[score_op]
+
+            second_field = random.choice(["label", "active"])
+            if second_field == "label":
+                label_val = random.choice(label_list)
+                inner_filter = Filter(must=[
+                    FieldCondition(key="score", range=Range(**{score_op: score_val})),
+                    FieldCondition(key="label", match=MatchValue(value=label_val)),
+                ])
+                def _mask(x, _sop=score_op, _sv=score_val, _lv=label_val):
+                    if not isinstance(x, list) or not x:
+                        return False
+                    for item in x:
+                        if not isinstance(item, dict):
+                            continue
+                        s = item.get("score")
+                        l = item.get("label")
+                        if s is None or l is None:
+                            continue
+                        score_ok = False
+                        if _sop == "gt": score_ok = s > _sv
+                        elif _sop == "lt": score_ok = s < _sv
+                        elif _sop == "gte": score_ok = s >= _sv
+                        elif _sop == "lte": score_ok = s <= _sv
+                        if score_ok and l == _lv:
+                            return True
+                    return False
+                expr_str = f'{name} nested(score {score_op_sym} {score_val} AND label == "{label_val}")'
+            else:  # active
+                active_val = random.choice([True, False])
+                inner_filter = Filter(must=[
+                    FieldCondition(key="score", range=Range(**{score_op: score_val})),
+                    FieldCondition(key="active", match=MatchValue(value=active_val)),
+                ])
+                def _mask(x, _sop=score_op, _sv=score_val, _av=active_val):
+                    if not isinstance(x, list) or not x:
+                        return False
+                    for item in x:
+                        if not isinstance(item, dict):
+                            continue
+                        s = item.get("score")
+                        a = item.get("active")
+                        if s is None or a is None:
+                            continue
+                        score_ok = False
+                        if _sop == "gt": score_ok = s > _sv
+                        elif _sop == "lt": score_ok = s < _sv
+                        elif _sop == "gte": score_ok = s >= _sv
+                        elif _sop == "lte": score_ok = s <= _sv
+                        if score_ok and a == _av:
+                            return True
+                    return False
+                expr_str = f"{name} nested(score {score_op_sym} {score_val} AND active == {active_val})"
+
+        # --- 策略 4: should (OR) 内嵌 ---
+        elif strategy == "should_or":
+            # 至少一个元素满足 score==v1 OR score==v2
+            vals = random.sample(score_list, min(2, len(score_list)))
+            if len(vals) < 2:
+                vals = [vals[0], vals[0] + 1]
+            v1, v2 = vals[0], vals[1]
+            inner_filter = Filter(should=[
+                Filter(must=[FieldCondition(key="score", match=MatchValue(value=v1))]),
+                Filter(must=[FieldCondition(key="score", match=MatchValue(value=v2))]),
+            ])
+            def _mask(x, _v1=v1, _v2=v2):
+                if not isinstance(x, list) or not x:
+                    return False
+                # Qdrant nested + should: 至少一个元素满足 should 中任意一个条件
+                for item in x:
+                    if not isinstance(item, dict):
+                        continue
+                    s = item.get("score")
+                    if s is not None and (s == _v1 or s == _v2):
+                        return True
+                return False
+            expr_str = f"{name} nested(score == {v1} OR score == {v2})"
+
+        # --- 策略 5: must_not 内嵌 ---
+        else:  # must_not
+            # 至少一个元素不满足 active==True（即 active 不为 True）
+            active_val = random.choice([True, False])
+            inner_filter = Filter(must_not=[
+                FieldCondition(key="active", match=MatchValue(value=active_val)),
+            ])
+            def _mask(x, _av=active_val):
+                if not isinstance(x, list) or not x:
+                    return False
+                # Qdrant nested + must_not: 至少一个元素使 must_not 条件生效
+                # 即至少一个元素的 active 字段不等于 _av（或缺失/null → 也不匹配，所以 must_not 保留）
+                for item in x:
+                    if not isinstance(item, dict):
+                        # 非 dict 元素不匹配 active==_av → must_not 保留
+                        return True
+                    a = item.get("active")
+                    if a != _av:
+                        return True
+                return False
+            expr_str = f"{name} nested(NOT active == {active_val})"
+
+        # 构造最终 NestedCondition + Filter
+        nested_cond = NestedCondition(
+            nested=Nested(key=name, filter=inner_filter)
+        )
+        filter_obj = Filter(must=[nested_cond])
+        mask = self._safe_apply(series, _mask)
+        return (filter_obj, mask, expr_str)
+
     def gen_has_id_expr(self):
         """
         生成 HasId 条件：使用点 ID 直接过滤。
@@ -2114,6 +2438,10 @@ class OracleQueryGenerator:
         f = random.choice(self.schema)
         name, ftype = f["name"], f["type"]
         series = self.df[name]
+        not_nullish_mask = self._series_qdrant_not_nullish(name, series)
+        nullish_mask = self._series_qdrant_nullish(name, series)
+        nullish_expr = self._nullish_expr(name)
+        not_nullish_expr = self._not_nullish_expr(name)
 
         strategy = random.choice([
             "not_compare",     # NOT (col > X)
@@ -2129,10 +2457,10 @@ class OracleQueryGenerator:
             if ftype in [FieldType.INT, FieldType.DATETIME]:
                 valid = series.dropna()
                 if valid.empty:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 val = self._normalize_int_scalar(self._convert_to_native(random.choice(valid.values)))
                 if val is None:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 op = random.choice(["gt", "lt", "gte", "lte"])
                 inner_cond = FieldCondition(key=name, range=Range(**{op: val}))
                 f_obj = Filter(must_not=[inner_cond])
@@ -2158,7 +2486,7 @@ class OracleQueryGenerator:
             if ftype == FieldType.FLOAT:
                 valid = series.dropna()
                 if valid.empty:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 val = self._convert_to_native(random.choice(valid.values))
                 val = float(val)
                 op = random.choice(["gt", "lt", "gte", "lte"])
@@ -2166,7 +2494,7 @@ class OracleQueryGenerator:
                 f_obj = Filter(must_not=[inner_cond])
                 # Oracle: Qdrant must_not 对 null → 不匹配 → 保留
                 def _mask_fn(x, _op=op, _val=val):
-                    if x is None or (isinstance(x, float) and np.isnan(x)):
+                    if self._is_na_like(x):
                         return True  # null → must_not 不命中 → 保留
                     try:
                         xv = float(x)
@@ -2183,32 +2511,32 @@ class OracleQueryGenerator:
             elif ftype == FieldType.STRING:
                 valid = series.dropna()
                 if valid.empty:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 val = str(random.choice(valid.values))
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
                 f_obj = Filter(must_not=[inner_cond])
-                mask = self._safe_apply(series, lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val)
+                mask = self._safe_apply(series, lambda x: True if self._is_na_like(x) else x != val)
                 return f_obj, mask, f'NOT ({name} == "{val}")'
 
             elif ftype == FieldType.BOOL:
                 val_bool = random.choice([True, False])
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val_bool))
                 f_obj = Filter(must_not=[inner_cond])
-                mask = self._safe_apply(series, lambda x: True if x is None or (isinstance(x, float) and np.isnan(x)) else x != val_bool)
+                mask = self._safe_apply(series, lambda x: True if self._is_na_like(x) else x != val_bool)
                 return f_obj, mask, f"NOT ({name} == {val_bool})"
 
             # fallback
-            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
 
         # --- 策略 2: NOT + 等值 ---
         elif strategy == "not_eq":
             if ftype == FieldType.INT:
                 valid = series.dropna()
                 if valid.empty:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 val = self._normalize_int_scalar(self._convert_to_native(random.choice(valid.values)))
                 if val is None:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 inner_cond = FieldCondition(key=name, match=MatchValue(value=val))
                 f_obj = Filter(must_not=[inner_cond])
                 mask = self._safe_apply(series, 
@@ -2217,32 +2545,28 @@ class OracleQueryGenerator:
                     )
                 )
                 return f_obj, mask, f"NOT ({name} == {val})"
-            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
 
-        # --- 策略 3: NOT (is null) → 非空行 ---
+        # --- 策略 3: NOT (is null / is empty) → 非空行 ---
         elif strategy == "not_is_null":
-            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
 
-        # --- 策略 4: NOT (is not null) → 空行 ---
+        # --- 策略 4: NOT (is not null / is not empty) → 空行 ---
         elif strategy == "not_is_not_null":
             # NOT(NOT(is_null)) = is_null
             inner = self._qdrant_not_null_filter(name)
             f_obj = Filter(must_not=[inner])
-            if self._is_evolved_field(name):
-                mask = series.isna()  # 演化字段：field 不存在 = Pandas None
-            else:
-                mask = series.isna()
-            return f_obj, mask, f"NOT (NOT ({name} is null))"
+            return f_obj, nullish_mask, f"NOT ({not_nullish_expr})"
 
         # --- 策略 5: NOT + AND (德摩根定律) ---
         elif strategy == "not_and":
             if ftype in [FieldType.INT, FieldType.DATETIME]:
                 valid = series.dropna()
                 if valid.empty:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 val = self._normalize_int_scalar(self._convert_to_native(random.choice(valid.values)))
                 if val is None:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 low = self._offset_int64(val, -random.randint(10, 100))
                 high = self._offset_int64(val, random.randint(10, 100))
                 inner = Filter(must=[
@@ -2258,14 +2582,14 @@ class OracleQueryGenerator:
                     return not (nx > _low and nx < _high)
                 mask = self._safe_apply(series, _and_mask)
                 return f_obj, mask, f"NOT ({name} > {low} AND {name} < {high})"
-            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
 
         # --- 策略 6: NOT + OR (德摩根延伸) ---
         elif strategy == "not_or":
             if ftype == FieldType.INT:
                 valid = series.dropna()
                 if len(valid) < 2:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 vals = []
                 for v in random.sample(list(valid.values), min(8, len(valid))):
                     nv = self._normalize_int_scalar(self._convert_to_native(v))
@@ -2274,7 +2598,7 @@ class OracleQueryGenerator:
                     if len(vals) >= 2:
                         break
                 if len(vals) < 2:
-                    return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
                 v1, v2 = vals[0], vals[-1]
                 inner = Filter(should=[
                     Filter(must=[FieldCondition(key=name, match=MatchValue(value=v1))]),
@@ -2288,10 +2612,10 @@ class OracleQueryGenerator:
                     return not (nx == _v1 or nx == _v2)
                 mask = self._safe_apply(series, _or_mask)
                 return f_obj, mask, f"NOT ({name} == {v1} OR {name} == {v2})"
-            return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+            return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
 
         # 终极兜底
-        return self._qdrant_not_null_filter(name), series.notna(), f"NOT ({name} is null)"
+        return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
 
     def gen_constant_expr(self):
 
@@ -2495,7 +2819,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
-                f"({name} in wide range OR {name} is null) (always true)"
+                f"({name} in wide range OR {self._nullish_expr(name)}) (always true)"
             )
         # 如果没有数值字段，返回 None（不应该发生）
         return None, None
@@ -2621,7 +2945,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             })
 
         # 3. 数值字段切分 (Partitioning)
-        # A => (A AND field < mid) OR (A AND field >= mid) OR (A AND field is null)
+        # A => (A AND field < mid) OR (A AND field >= mid) OR (A AND field is null/is empty)
         # 使用 INT 字段进行切分，需要包含 null 值以保持等价性
         if self._tautology_field:
             part_name = self._tautology_field["name"]
@@ -2633,7 +2957,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             mutations.append({
                 "type": "PartitionByField",
                 "filter": Filter(should=[part1, part2, part3]),
-                "expr": f"(({base_expr}) AND {part_name}<{mid_val}) OR (({base_expr}) AND {part_name}>={mid_val}) OR (({base_expr}) AND {part_name} is null)"
+                "expr": f"(({base_expr}) AND {part_name}<{mid_val}) OR (({base_expr}) AND {part_name}>={mid_val}) OR (({base_expr}) AND {self._nullish_expr(part_name)})"
             })
 
         # 4. 冗余 OR (Self OR)
@@ -2881,7 +3205,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
-                f"({name} in wide range OR {name} is null) (always true)"
+                f"({name} in wide range OR {self._nullish_expr(name)}) (always true)"
             )
         # 如果没有数值字段，返回 None（不应该发生）
         return None, None
@@ -3060,7 +3384,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             null_cond = self._qdrant_nullish_filter(name)
             return (
                 Filter(should=[range_cond, null_cond]),
-                f"({name} in wide range OR {name} is null)"
+                f"({name} in wide range OR {self._nullish_expr(name)})"
             )
         return None, None
 
@@ -3079,7 +3403,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         except: pass
 
         if is_null:
-            return self._qdrant_nullish_filter(fname), f"{fname} is null"
+            return self._qdrant_nullish_filter(fname), self._nullish_expr(fname)
 
         # 根据类型生成条件
         if ftype == FieldType.BOOL:
@@ -3196,7 +3520,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 # 确保 target 是原生 Python 类型
                 target = self._convert_to_native(target)
                 return FieldCondition(key=fname, match=MatchAny(any=[target])), f"{fname} contains {target}"
-            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
         elif ftype == FieldType.ARRAY_FLOAT:
             if not isinstance(val, list) or len(val) == 0:
@@ -3206,7 +3530,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 target = float(random.choice(valid_items))
                 epsilon = 0.5
                 return FieldCondition(key=fname, range=Range(gte=target - epsilon, lte=target + epsilon)), f"{fname} has element ~= {target}"
-            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
         elif ftype == FieldType.DATETIME:
             val_int = int(val) if hasattr(val, "item") else int(val)
@@ -3255,9 +3579,70 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     ), f"{fname} in radius 1km around ({lat},{lon})"
                 ))
                 return random.choice(strategies)
-            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
-        return self._qdrant_not_null_filter(fname), f"{fname} is not null"
+        elif ftype == FieldType.ARRAY_OBJECT:
+            # Nested 对象数组 PQS: 从 pivot_row 的实际数组中选取一个元素构造必真条件
+            if not isinstance(val, list) or len(val) == 0:
+                return self._qdrant_is_empty_filter(fname), f"{fname} is empty"
+            # 从数组中选一个有效的子对象
+            valid_items = [item for item in val if isinstance(item, dict)]
+            if not valid_items:
+                return self._qdrant_is_empty_filter(fname), f"{fname} is empty"
+            chosen = random.choice(valid_items)
+            strategies = []
+            # 策略1: 精确匹配 score
+            if "score" in chosen and chosen["score"] is not None:
+                sv = int(chosen["score"])
+                strategies.append((
+                    Filter(must=[NestedCondition(
+                        nested=Nested(key=fname, filter=Filter(must=[
+                            FieldCondition(key="score", match=MatchValue(value=sv))
+                        ]))
+                    )]),
+                    f"{fname} nested(score == {sv})"
+                ))
+            # 策略2: 精确匹配 label
+            if "label" in chosen and chosen["label"] is not None:
+                lv = str(chosen["label"])
+                strategies.append((
+                    Filter(must=[NestedCondition(
+                        nested=Nested(key=fname, filter=Filter(must=[
+                            FieldCondition(key="label", match=MatchValue(value=lv))
+                        ]))
+                    )]),
+                    f'{fname} nested(label == "{lv}")'
+                ))
+            # 策略3: 多字段 AND (score + label)
+            if ("score" in chosen and chosen["score"] is not None
+                    and "label" in chosen and chosen["label"] is not None):
+                sv = int(chosen["score"])
+                lv = str(chosen["label"])
+                strategies.append((
+                    Filter(must=[NestedCondition(
+                        nested=Nested(key=fname, filter=Filter(must=[
+                            FieldCondition(key="score", match=MatchValue(value=sv)),
+                            FieldCondition(key="label", match=MatchValue(value=lv)),
+                        ]))
+                    )]),
+                    f'{fname} nested(score == {sv} AND label == "{lv}")'
+                ))
+            # 策略4: 范围包裹 score
+            if "score" in chosen and chosen["score"] is not None:
+                sv = int(chosen["score"])
+                strategies.append((
+                    Filter(must=[NestedCondition(
+                        nested=Nested(key=fname, filter=Filter(must=[
+                            FieldCondition(key="score", range=Range(gte=sv, lte=sv))
+                        ]))
+                    )]),
+                    f"{fname} nested(score >= {sv} AND score <= {sv})"
+                ))
+            if strategies:
+                return random.choice(strategies)
+            return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
+
+        return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
     def _gen_pqs_json_filter(self, fname, json_obj):
         """
@@ -3265,9 +3650,9 @@ class PQSQueryGenerator(OracleQueryGenerator):
         支持递归深度下钻（最多12层），到达标量时生成边界条件。
         """
         if json_obj is None:
-            return self._null_filter(fname), f"{fname} is null"
+            return self._qdrant_nullish_filter(fname), self._nullish_expr(fname)
         if not isinstance(json_obj, dict) and not isinstance(json_obj, list):
-            return self._qdrant_not_null_filter(fname), f"{fname} is not null"
+            return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
         # 将 numpy 类型转换
         if hasattr(json_obj, "tolist"): json_obj = json_obj.tolist()
@@ -3319,7 +3704,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         elif isinstance(current, str):
             return self._gen_pqs_boundary_str(path_str, current)
 
-        return self._qdrant_not_null_filter(fname), f"{fname} is not null"
+        return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
     def _gen_pqs_boundary_int(self, path, val):
         """JSON 深层 INT 边界条件（10种策略）"""
