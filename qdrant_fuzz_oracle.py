@@ -3833,9 +3833,20 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
 # --- 6. Dynamic Data Operations & Schema Evolution Helpers ---
 
+def _to_native_point_id(value):
+    """Normalize pandas/numpy integer scalars to a plain Python int for Qdrant client models."""
+    if hasattr(value, "item"):
+        value = value.item()
+    return int(value)
+
+
+def _to_native_point_ids(values):
+    return [_to_native_point_id(v) for v in values]
+
+
 def query_qdrant_rows(qm, id_list, limit=5):
     """查询 Qdrant 中指定 ID 的完整 payload 数据，用于调试对比"""
-    ids = list(id_list)[:limit]
+    ids = _to_native_point_ids(list(id_list)[:limit])
     if not ids:
         return {}
     try:
@@ -4061,7 +4072,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
     elif op == "delete":
         if len(dm.df) > delete_min_rows:
             del_count = min(batch_count, len(dm.df) - delete_min_rows)
-            del_ids = random.sample(dm.df["id"].tolist(), del_count)
+            del_ids = _to_native_point_ids(random.sample(dm.df["id"].tolist(), del_count))
             try:
                 qm.client.delete(
                     collection_name=COLLECTION_NAME,
@@ -4140,7 +4151,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
 
             # Upsert 后数据同步验证：回查 Qdrant 确认数据一致
             for row in upsert_rows:
-                rid = row["id"]
+                rid = _to_native_point_id(row["id"])
                 try:
                     qdrant_res = qm.client.retrieve(
                         collection_name=COLLECTION_NAME,
