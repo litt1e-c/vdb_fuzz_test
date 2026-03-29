@@ -16,26 +16,11 @@ Features:
 13. Tokenization.FIELD for TEXT/TEXT_ARRAY: case-sensitive, no stopword filtering
 14. Dynamic row tracking: Weaviate inverted-index bug detection & classification
 
-Known Weaviate Server Bugs (reproducible):
-  BUG-1 (Inverted Index Corruption): After replace() operations on rows with multiple
-    fields (BOOL, BOOL_ARRAY, INT_ARRAY, etc.), filter operations like not_equal(),
-    NOT(equal()), contains_none, NOT(is_none()) return incorrect results for the
-    modified rows. The corruption is PERSISTENT (not timing-dependent) and grows with
-    more replace/upsert operations. Only affects dynamically modified rows.
-    Reproduce: --seed 225912938 -N 2000 --rounds 500 (with dynamic ops enabled)
-    Workaround: dynamic_ids tracking — mismatches involving only dynamic rows are
-    classified as WEAVIATE_BUG warnings instead of failures.
-  BUG-2 (OBJECT is_none(False)): When non-null OBJECT values exist, is_none(False)
-    returns 0 results instead of matching all non-null rows.
-    Workaround: Fuzzer only uses is_none(True) for OBJECT fields.
-  BUG-3 (Pagination Non-determinism): offset-based pagination WITHOUT explicit
-    sort produces duplicate rows across pages. Root cause: range/complex filters
-    trigger parallel goroutines whose completion order is non-deterministic,
-    so result ordering shifts between page requests.
-    This is a known limitation (not a filter-logic bug), same as ES/PG without ORDER BY.
-    Fix: Always use Sort when paginating with offset. Fuzzer tests both:
-      - With sort: duplicates = REAL BUG (FAIL)
-      - Without sort: duplicates = known limitation (INFO)
+Notes:
+  Historical bug status drifts across Weaviate/client versions, so this file keeps
+  the runtime logic but avoids hard-coding a large "known bugs" list in the header.
+  Use the dedicated repro scripts in compare_test/weaviate_bug*.py for the current
+  version-specific probes that still reproduce locally.
 """
 import time
 import random
@@ -46,6 +31,8 @@ import json
 import sys
 import uuid
 import argparse
+import re
+from datetime import timedelta, timezone
 import weaviate
 from weaviate.classes.config import (
     Configure, Property, DataType, Reconfigure,
@@ -57,39 +44,6 @@ from weaviate.classes.config import ConsistencyLevel
 
 # --- Null 过滤默认启用 ---
 ENABLE_NULL_FILTER = True
-
-# Weaviate 停用词列表 (英文常见停用词)
-WEAVIATE_STOPWORDS = {
-    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'but', 'by', 'for', 'if', 'in',
-    'into', 'is', 'it', 'no', 'not', 'of', 'on', 'or', 'such', 'that', 'the',
-    'their', 'then', 'there', 'these', 'they', 'this', 'to', 'was', 'will', 'with',
-    'i', 'me', 'my', 'myself', 'we', 'our', 'ours', 'ourselves', 'you', 'your',
-    'yours', 'yourself', 'yourselves', 'he', 'him', 'his', 'himself', 'she', 'her',
-    'hers', 'herself', 'its', 'itself', 'what', 'which', 'who', 'whom', 'when',
-    'where', 'why', 'how', 'all', 'am', 'been', 'being', 'both', 'can', 'could',
-    'did', 'do', 'does', 'doing', 'done', 'down', 'during', 'each', 'few', 'from',
-    'further', 'had', 'has', 'have', 'having', 'here', 'just', 'may', 'might',
-    'more', 'most', 'must', 'nor', 'now', 'only', 'other', 'ought', 'own', 'same',
-    'shall', 'should', 'so', 'some', 'than', 'too', 'until', 'up', 'very', 'were',
-    'would', 'about', 'above', 'after', 'again', 'against', 'any', 'because',
-    'before', 'below', 'between', 'cannot', 'could', 'either', 'else', 'ever',
-    'every', 'get', 'got', 'had', 'hardly', 'however', 'indeed', 'isn', 'let',
-    'likely', 'may', 'neither', 'never', 'nobody', 'nothing', 'often', 'once',
-    'over', 'perhaps', 'rather', 'really', 'said', 'say', 'seem', 'seemed',
-    'seems', 'since', 'still', 'sure', 'though', 'through', 'thus', 'under',
-    'unless', 'upon', 'very', 'want', 'wants', 'way', 'ways', 'well', 'went',
-    'whether', 'while', 'within', 'without', 'yet', 'am', 'are', 'aren', 'arent',
-    'isn', 'isnt', 'wasn', 'wasnt', 'weren', 'werent', 'won', 'wont', 'wouldn',
-    'wouldnt', 'can', 'cant', 'cannot', 'couldn', 'couldnt', 'didn', 'didnt',
-    'doesn', 'doesnt', 'don', 'dont', 'hadn', 'hadnt', 'hasn', 'hasnt', 'haven',
-    'havent', 'mightn', 'mightnt', 'mustn', 'mustnt', 'needn', 'neednt', 'shan',
-    'shant', 'shouldn', 'shouldnt'
-}
-
-def is_stopword(word):
-    if not isinstance(word, str):
-        return False
-    return word.lower().strip() in WEAVIATE_STOPWORDS
 
 # --- Configuration ---
 HOST = "127.0.0.1"
@@ -103,6 +57,88 @@ SLEEP_INTERVAL = 0.02
 # --- 延迟初始化的随机变量 (在 run() 中种子设置后初始化) ---
 VECTOR_CHECK_RATIO = None
 VECTOR_TOPK = None
+BOUNDARY_INJECTION_RATE = None
+
+# 标量优先：过滤表达式更偏向标量字段，减少因数组/OBJECT 语义导致的噪声
+SCALAR_QUERY_PRIORITY = 0.85
+
+# Current Weaviate client/transport path may coerce large integers through
+# floating-point serialization. Keep fuzzed INT values within the IEEE-754
+# safe-integer range so insert/query failures reflect engine behavior rather
+# than client-side rounding artifacts.
+WEAVIATE_SAFE_INT_MIN = -((2**53) - 1)
+WEAVIATE_SAFE_INT_MAX = (2**53) - 1
+
+INT_BOUNDARY_VALUES = [
+    WEAVIATE_SAFE_INT_MIN,
+    WEAVIATE_SAFE_INT_MIN + 1,
+    -1024,
+    -1,
+    0,
+    1,
+    1024,
+    WEAVIATE_SAFE_INT_MAX - 1,
+    WEAVIATE_SAFE_INT_MAX,
+]
+INT64_MIN = -(2**63)
+INT64_MAX = (2**63) - 1
+
+NUMBER_BOUNDARY_VALUES = [
+    float(-np.finfo(np.float64).tiny),
+    -1e12,
+    -1e6,
+    -1.0,
+    -1e-12,
+    -0.0,
+    0.0,
+    np.finfo(np.float64).smallest_subnormal,
+    np.finfo(np.float64).tiny,
+    1e-12,
+    1.0,
+    1e6,
+    1e12,
+]
+
+DATE_BOUNDARY_VALUES = [
+    "1969-12-31T23:59:59Z",
+    "1970-01-01T00:00:00Z",
+    "1999-12-31T23:59:59Z",
+    "2000-02-29T00:00:00Z",
+    "2001-09-09T01:46:40Z",
+    "2016-12-31T23:59:59-08:00",
+    "2020-02-29T12:34:56+00:00",
+    "2024-02-29T23:59:59+08:00",
+    "2025-12-31T23:59:59Z",
+]
+
+TEXT_BOUNDARY_VALUES = [
+    "",
+    "A",
+    "a",
+    "0",
+    "Aa",
+    "a_a",
+    "A-A",
+    "CaseSensitive",
+    "casesensitive",
+    "x" * 64,
+    "Y" * 255,
+]
+
+TEXT_STEMS = [
+    "alpha",
+    "ALPHA",
+    "Alpha",
+    "beta",
+    "BETA",
+    "item",
+    "ITEM",
+    "user",
+    "User",
+    "edge",
+    "EDGE",
+    "mix",
+]
 
 # 向量索引类型和距离度量
 ALL_VECTOR_INDEX_TYPES = ["hnsw", "flat", "dynamic"]
@@ -172,6 +208,9 @@ class FuzzStats:
     def record_skip(self):
         self.skipped += 1
 
+    def record_fail(self, error_cat=None):
+        self.record(False, error_cat=error_cat)
+
     def summary(self):
         lines = []
         lines.append(f"Total:{self.total} Pass:{self.passed} Fail:{self.failed} Skip:{self.skipped}")
@@ -186,37 +225,307 @@ class FuzzStats:
         return " | ".join(lines)
 
 
+def to_utc_timestamp(value):
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    try:
+        ts = pd.to_datetime(value, utc=True)
+    except Exception:
+        return None
+    if pd.isna(ts):
+        return None
+    return ts
+
+
+def canonicalize_date_string(value):
+    ts = to_utc_timestamp(value)
+    if ts is None:
+        return None
+    return ts.isoformat().replace("+00:00", "Z")
+
+
+def float_window(value, ulps=4):
+    if value is None:
+        return None, None
+    try:
+        fv = float(value)
+    except Exception:
+        return None, None
+    if not np.isfinite(fv):
+        return None, None
+    lo = np.float64(fv)
+    hi = np.float64(fv)
+    for _ in range(max(1, ulps)):
+        lo = np.nextafter(lo, np.float64(-np.inf))
+        hi = np.nextafter(hi, np.float64(np.inf))
+    return float(lo), float(hi)
+
+
+def is_null_like(value):
+    if value is None:
+        return True
+    if isinstance(value, float) and np.isnan(value):
+        return True
+    return False
+
+
+def select_sorted_value(values, fraction):
+    if not values:
+        return None
+    idx = int(round((len(values) - 1) * fraction))
+    idx = max(0, min(len(values) - 1, idx))
+    return values[idx]
+
+
+def build_int_stats(values):
+    if not values:
+        return None
+    ordered = sorted(int(v) for v in values)
+    return {
+        "min": ordered[0],
+        "max": ordered[-1],
+        "median": select_sorted_value(ordered, 0.50),
+        "q1": select_sorted_value(ordered, 0.25),
+        "q3": select_sorted_value(ordered, 0.75),
+    }
+
+
+def clamp_weaviate_int(value):
+    return max(WEAVIATE_SAFE_INT_MIN, min(WEAVIATE_SAFE_INT_MAX, int(value)))
+
+
+def normalize_scalar_for_compare(ftype, value):
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    if ftype == FieldType.INT:
+        return int(value)
+    if ftype == FieldType.NUMBER:
+        fv = float(value)
+        return 0.0 if fv == 0.0 else fv
+    if ftype == FieldType.BOOL:
+        return bool(value)
+    if ftype == FieldType.TEXT:
+        return None if value == "" else str(value)
+    if ftype == FieldType.DATE:
+        return canonicalize_date_string(value)
+    return value
+
+
+def extract_expr_fields(expr, schema_config):
+    if not expr:
+        return []
+    matched = []
+    for field in schema_config:
+        if re.search(rf"\b{re.escape(field['name'])}\b", expr):
+            matched.append(field)
+    return matched
+
+
 class DataManager:
-    def __init__(self):
+    def __init__(self, seed):
+        self.seed = int(seed)
         self.df = None
         self.vectors = None
         self.schema_config = []
         self.filterable_fields = set()  # Populated by reset_collection
-        self.null_ratio = random.uniform(0.05, 0.15)
-        self.array_capacity = random.randint(5, 20)
-        self.int_range = random.randint(5000, 100000)
-        self.double_scale = random.uniform(100, 10000)
+        self.py_rng = random.Random(self.seed ^ 0x5EEDFACE)
+        self.value_rng = np.random.default_rng(self.seed ^ 0xA17E)
+        self.vector_rng = np.random.default_rng(self.seed ^ 0xC0FFEE)
+        self.id_counter = 0
+        self.null_ratio = self.py_rng.uniform(0.05, 0.15)
+        self.array_capacity = self.py_rng.randint(5, 20)
+        self.int_range = self.py_rng.randint(5000, 100000)
+        self.double_scale = self.py_rng.uniform(100, 10000)
 
-    def _random_string(self, min_len=1, max_len=10):
-        chars = string.ascii_letters + string.digits
-        return ''.join(random.choices(chars, k=random.randint(min_len, max_len)))
+    def _next_uuid(self):
+        self.id_counter += 1
+        return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"weaviate-fuzz-{self.seed}-{self.id_counter}"))
+
+    def _random_string(self, min_len=1, max_len=10, boundary=False):
+        if boundary and BOUNDARY_INJECTION_RATE and self.py_rng.random() < BOUNDARY_INJECTION_RATE:
+            return self.py_rng.choice(TEXT_BOUNDARY_VALUES)
+
+        mode = self.py_rng.choices(
+            ["clustered", "symbolic", "mixed_case", "random"],
+            weights=[0.45, 0.15, 0.20, 0.20],
+            k=1,
+        )[0]
+        if mode == "clustered":
+            stem = self.py_rng.choice(TEXT_STEMS)
+            suffix = self.py_rng.choice(["", "", "", "_01", "-A", ".v2", str(self.py_rng.randint(0, 999))])
+            return f"{stem}{suffix}"
+        if mode == "symbolic":
+            alphabet = string.ascii_letters + string.digits + "_-./@"
+        elif mode == "mixed_case":
+            stem = self.py_rng.choice(TEXT_STEMS)
+            suffix = ''.join(self.py_rng.choices(string.ascii_letters + string.digits, k=self.py_rng.randint(0, 4)))
+            return f"{stem}{suffix}"
+        else:
+            alphabet = string.ascii_letters + string.digits
+        return ''.join(self.py_rng.choices(alphabet, k=self.py_rng.randint(min_len, max_len)))
+
+    def _random_bool(self):
+        return self.py_rng.choice([True, False])
+
+    def _random_int(self, boundary=True):
+        if boundary and BOUNDARY_INJECTION_RATE and self.py_rng.random() < BOUNDARY_INJECTION_RATE:
+            return clamp_weaviate_int(self.py_rng.choice(INT_BOUNDARY_VALUES))
+
+        mode = self.py_rng.choices(["uniform", "cluster", "hotspot"], weights=[0.35, 0.35, 0.30], k=1)[0]
+        if mode == "hotspot":
+            return clamp_weaviate_int(self.py_rng.choice([-1024, -100, -10, -1, 0, 1, 2, 10, 100, 1024]))
+        if mode == "cluster":
+            center = self.py_rng.choice([-10000, -1000, -100, -1, 0, 1, 100, 1000, 10000])
+            jitter = self.py_rng.randint(-5, 5)
+            return clamp_weaviate_int(np.clip(center + jitter, -self.int_range, self.int_range))
+        return clamp_weaviate_int(self.py_rng.randint(-self.int_range, self.int_range))
+
+    def _random_number(self, boundary=True):
+        if boundary and BOUNDARY_INJECTION_RATE and self.py_rng.random() < BOUNDARY_INJECTION_RATE:
+            return float(self.py_rng.choice(NUMBER_BOUNDARY_VALUES))
+
+        mode = self.py_rng.choices(["uniform", "cluster", "hotspot", "rounded"], weights=[0.30, 0.30, 0.20, 0.20], k=1)[0]
+        if mode == "hotspot":
+            return float(self.py_rng.choice([-1e6, -1.0, -0.1, -0.0, 0.0, 0.1, 1.0, 1e6]))
+        if mode == "cluster":
+            center = self.py_rng.choice([-1000.0, -10.0, -1.0, 0.0, 1.0, 10.0, 1000.0])
+            return float(center + self.py_rng.uniform(-1e-3, 1e-3) * max(abs(center), 1.0))
+        if mode == "rounded":
+            return float(round(self.py_rng.uniform(-self.double_scale, self.double_scale), self.py_rng.choice([0, 1, 2, 6])))
+        return float(self.py_rng.uniform(-self.double_scale, self.double_scale))
+
+    def _format_timestamp(self, ts):
+        offset_minutes = self.py_rng.choice([0, 0, 0, 60, 330, -480])
+        tz = timezone(timedelta(minutes=offset_minutes))
+        dt = ts.to_pydatetime().astimezone(tz)
+        out = dt.isoformat(timespec="seconds")
+        return out.replace("+00:00", "Z")
+
+    def _random_date(self, boundary=True):
+        if boundary and BOUNDARY_INJECTION_RATE and self.py_rng.random() < BOUNDARY_INJECTION_RATE:
+            return self.py_rng.choice(DATE_BOUNDARY_VALUES)
+
+        mode = self.py_rng.choices(["boundary", "cluster", "uniform"], weights=[0.30, 0.35, 0.35], k=1)[0]
+        if mode == "boundary":
+            return self.py_rng.choice(DATE_BOUNDARY_VALUES)
+
+        if mode == "cluster":
+            anchor = to_utc_timestamp(self.py_rng.choice(DATE_BOUNDARY_VALUES))
+            if anchor is None:
+                anchor = pd.Timestamp("2024-01-01T00:00:00Z")
+            ts = anchor + pd.Timedelta(days=self.py_rng.randint(-3, 3), hours=self.py_rng.randint(-6, 6))
+        else:
+            year = self.py_rng.randint(1998, 2026)
+            month = self.py_rng.randint(1, 12)
+            day = self.py_rng.randint(1, 28)
+            hour = self.py_rng.randint(0, 23)
+            minute = self.py_rng.randint(0, 59)
+            second = self.py_rng.randint(0, 59)
+            ts = pd.Timestamp(year=year, month=month, day=day, hour=hour, minute=minute, second=second, tz="UTC")
+        return self._format_timestamp(ts)
+
+    def _random_array_length(self):
+        if self.py_rng.random() < 0.35:
+            candidates = [0, 1, 2, max(0, self.array_capacity - 1), self.array_capacity]
+            return int(self.py_rng.choice(candidates))
+        return self.py_rng.randint(0, min(self.array_capacity, 5))
+
+    def _generate_array_value(self, element_type):
+        arr_len = self._random_array_length()
+        if arr_len <= 0:
+            return None
+
+        values = []
+        for _ in range(arr_len):
+            if element_type == FieldType.INT:
+                values.append(self._random_int(boundary=True))
+            elif element_type == FieldType.NUMBER:
+                values.append(self._random_number(boundary=True))
+            elif element_type == FieldType.BOOL:
+                values.append(self._random_bool())
+            else:
+                values.append(self._random_string(1, 12, boundary=True))
+        return values if values else None
+
+    def _generate_object_value(self, field):
+        if self.py_rng.random() < self.null_ratio:
+            return None
+
+        obj = {}
+        for nf in field.get("nested", []):
+            if self.py_rng.random() < self.null_ratio:
+                continue
+            if nf["type"] == FieldType.INT:
+                obj[nf["name"]] = self._random_int(boundary=True)
+            elif nf["type"] == FieldType.NUMBER:
+                obj[nf["name"]] = self._random_number(boundary=True)
+            elif nf["type"] == FieldType.BOOL:
+                obj[nf["name"]] = self._random_bool()
+            elif nf["type"] == FieldType.TEXT:
+                obj[nf["name"]] = self._random_string(2, 12, boundary=True)
+        return obj if obj else None
+
+    def _generate_scalar_value(self, ftype):
+        if ftype == FieldType.INT:
+            return self._random_int(boundary=True)
+        if ftype == FieldType.NUMBER:
+            return self._random_number(boundary=True)
+        if ftype == FieldType.BOOL:
+            return self._random_bool()
+        if ftype == FieldType.TEXT:
+            return self._random_string(1, 48, boundary=True)
+        if ftype == FieldType.DATE:
+            return self._random_date(boundary=True)
+        return None
+
+    def normalize_dataframe_types(self):
+        if self.df is None:
+            return
+        for field in self.schema_config:
+            fname = field["name"]
+            ftype = field["type"]
+            if fname not in self.df.columns:
+                continue
+            if ftype == FieldType.INT:
+                normalized = [
+                    None if is_null_like(v) else int(v)
+                    for v in self.df[fname].tolist()
+                ]
+                self.df[fname] = pd.Series(normalized, index=self.df.index, dtype="object")
+
+    def rows_to_dataframe(self, rows):
+        frame = pd.DataFrame(rows)
+        for field in self.schema_config:
+            fname = field["name"]
+            if fname not in frame.columns:
+                continue
+            if field["type"] == FieldType.INT:
+                frame[fname] = pd.Series(
+                    [row.get(fname) for row in rows],
+                    index=frame.index,
+                    dtype="object",
+                )
+        return frame
 
     def generate_schema(self):
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
-        num_fields = random.randint(3, 15)
+        num_fields = self.py_rng.randint(5, 18)
         types_pool = [FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE]
+        weights = [0.26, 0.24, 0.14, 0.24, 0.12]
 
         for i in range(num_fields):
-            ftype = random.choice(types_pool)
+            ftype = self.py_rng.choices(types_pool, weights=weights, k=1)[0]
             self.schema_config.append({"name": f"c{i}", "type": ftype})
 
         self.schema_config.append({"name": "tagsArray", "type": FieldType.INT_ARRAY, "max_capacity": self.array_capacity})
         self.schema_config.append({"name": "labelsArray", "type": FieldType.TEXT_ARRAY, "max_capacity": self.array_capacity})
         self.schema_config.append({"name": "scoresArray", "type": FieldType.NUMBER_ARRAY, "max_capacity": self.array_capacity})
         self.schema_config.append({"name": "flagsArray", "type": FieldType.BOOL_ARRAY, "max_capacity": self.array_capacity})
-
-        # Nested Object field (对标 Milvus JSON field)
         self.schema_config.append({"name": "metaObj", "type": FieldType.OBJECT, "nested": [
             {"name": "price", "type": FieldType.INT},
             {"name": "color", "type": FieldType.TEXT},
@@ -228,175 +537,59 @@ class DataManager:
         for f in self.schema_config:
             print(f"      - {f['name']:<20} : {f['type']}")
 
-    def generate_single_row(self, id_override=None):
-        row = {}
-        row["id"] = id_override if id_override else str(uuid.uuid4())
-        row["row_num"] = -1
+    def generate_single_row(self, id_override=None, row_num=-1):
+        row = {
+            "id": str(id_override) if id_override is not None else self._next_uuid(),
+            "row_num": int(row_num),
+        }
 
         for field in self.schema_config:
             fname = field["name"]
             ftype = field["type"]
-            if random.random() < self.null_ratio:
-                row[fname] = None
-                continue
-            if ftype == FieldType.INT:
-                row[fname] = random.randint(-self.int_range, self.int_range)
-            elif ftype == FieldType.NUMBER:
-                row[fname] = random.random() * self.double_scale
-            elif ftype == FieldType.BOOL:
-                row[fname] = random.choice([True, False])
-            elif ftype == FieldType.TEXT:
-                row[fname] = self._random_string(1, random.randint(5, 30))
-            elif ftype == FieldType.DATE:
-                y = random.randint(2000, 2025)
-                m = random.randint(1, 12)
-                d = random.randint(1, 28)
-                row[fname] = f"{y:04d}-{m:02d}-{d:02d}T00:00:00Z"
+
+            if ftype in {FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE}:
+                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_scalar_value(ftype)
             elif ftype == FieldType.INT_ARRAY:
-                arr = [random.randint(0, 100) for _ in range(random.randint(0, 5))]
-                row[fname] = arr if arr else None  # empty array → null (Weaviate semantics)
+                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.INT)
             elif ftype == FieldType.TEXT_ARRAY:
-                arr = [self._random_string(2, 8) for _ in range(random.randint(0, 5))]
-                row[fname] = arr if arr else None
+                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.TEXT)
             elif ftype == FieldType.NUMBER_ARRAY:
-                arr = [random.random() * 100 for _ in range(random.randint(0, 5))]
-                row[fname] = arr if arr else None
+                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.NUMBER)
             elif ftype == FieldType.BOOL_ARRAY:
-                arr = [random.choice([True, False]) for _ in range(random.randint(0, 5))]
-                row[fname] = arr if arr else None
+                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.BOOL)
             elif ftype == FieldType.OBJECT:
-                if random.random() < self.null_ratio:
-                    row[fname] = None
-                else:
-                    nested = field.get("nested", [])
-                    obj = {}
-                    for nf in nested:
-                        if random.random() < self.null_ratio:
-                            continue
-                        if nf["type"] == FieldType.INT:
-                            obj[nf["name"]] = random.randint(-self.int_range, self.int_range)
-                        elif nf["type"] == FieldType.NUMBER:
-                            obj[nf["name"]] = random.random() * self.double_scale
-                        elif nf["type"] == FieldType.BOOL:
-                            obj[nf["name"]] = random.choice([True, False])
-                        elif nf["type"] == FieldType.TEXT:
-                            obj[nf["name"]] = self._random_string(2, 10)
-                    row[fname] = obj if obj else None
+                row[fname] = self._generate_object_value(field)
         return row
 
     def generate_single_vector(self):
-        vec = np.random.random(DIM).astype(np.float32)
-        vec /= np.linalg.norm(vec)
-        return vec
+        vec = self.vector_rng.random(DIM, dtype=np.float32)
+        norm = np.linalg.norm(vec)
+        if norm == 0:
+            vec[0] = 1.0
+            norm = 1.0
+        vec /= norm
+        return vec.astype(np.float32)
 
     def generate_data(self):
         print(f"🌊 2. Generating {N} rows (Vector Dim={DIM})...")
-        rng = np.random.default_rng(42)
-        self.vectors = rng.random((N, DIM), dtype=np.float32)
-        self.vectors /= np.linalg.norm(self.vectors, axis=1)[:, np.newaxis]
+        self.vectors = self.vector_rng.random((N, DIM), dtype=np.float32)
+        norms = np.linalg.norm(self.vectors, axis=1)
+        norms[norms == 0] = 1.0
+        self.vectors = (self.vectors / norms[:, np.newaxis]).astype(np.float32)
 
-        data = {"id": [str(uuid.uuid4()) for _ in range(N)]}
-        data["row_num"] = list(range(N))
+        rows = [self.generate_single_row(row_num=i) for i in range(N)]
+        self.df = self.rows_to_dataframe(rows)
 
-        for field in self.schema_config:
-            fname = field["name"]
-            ftype = field["type"]
-
-            if ftype == FieldType.INT:
-                values = rng.integers(-self.int_range, self.int_range, size=N).tolist()
-                data[fname] = self._apply_nulls(values, rng)
-            elif ftype == FieldType.NUMBER:
-                values = (rng.random(N) * self.double_scale).tolist()
-                data[fname] = self._apply_nulls(values, rng)
-            elif ftype == FieldType.BOOL:
-                values = rng.choice([True, False], size=N).tolist()
-                data[fname] = self._apply_nulls(values, rng)
-            elif ftype == FieldType.TEXT:
-                values = [self._random_string(1, random.randint(5, 30)) for _ in range(N)]
-                data[fname] = self._apply_nulls(values, rng)
-            elif ftype == FieldType.DATE:
-                values = []
-                for _ in range(N):
-                    y = random.randint(2000, 2025)
-                    m = random.randint(1, 12)
-                    d = random.randint(1, 28)
-                    values.append(f"{y:04d}-{m:02d}-{d:02d}T00:00:00Z")
-                data[fname] = self._apply_nulls(values, rng)
-            elif ftype == FieldType.INT_ARRAY:
-                arr_list = []
-                for _ in range(N):
-                    if rng.random() < self.null_ratio:
-                        arr_list.append(None)
-                    else:
-                        length = random.randint(0, 5)
-                        arr_list.append([int(x) for x in rng.integers(0, 100, size=length)])
-                data[fname] = arr_list
-            elif ftype == FieldType.TEXT_ARRAY:
-                arr_list = []
-                for _ in range(N):
-                    if rng.random() < self.null_ratio:
-                        arr_list.append(None)
-                    else:
-                        length = random.randint(0, 5)
-                        arr_list.append([self._random_string(2, 8) for _ in range(length)])
-                data[fname] = arr_list
-            elif ftype == FieldType.NUMBER_ARRAY:
-                arr_list = []
-                for _ in range(N):
-                    if rng.random() < self.null_ratio:
-                        arr_list.append(None)
-                    else:
-                        length = random.randint(0, 5)
-                        arr_list.append([float(x) for x in rng.random(length) * 100])
-                data[fname] = arr_list
-            elif ftype == FieldType.BOOL_ARRAY:
-                arr_list = []
-                for _ in range(N):
-                    if rng.random() < self.null_ratio:
-                        arr_list.append(None)
-                    else:
-                        length = random.randint(0, 5)
-                        arr_list.append([bool(rng.choice([True, False])) for _ in range(length)])
-                data[fname] = arr_list
-            elif ftype == FieldType.OBJECT:
-                obj_list = []
-                nested = field.get("nested", [])
-                for _ in range(N):
-                    if rng.random() < self.null_ratio:
-                        obj_list.append(None)
-                    else:
-                        obj = {}
-                        for nf in nested:
-                            if rng.random() < self.null_ratio:
-                                continue
-                            if nf["type"] == FieldType.INT:
-                                obj[nf["name"]] = int(rng.integers(-self.int_range, self.int_range))
-                            elif nf["type"] == FieldType.NUMBER:
-                                obj[nf["name"]] = float(rng.random() * self.double_scale)
-                            elif nf["type"] == FieldType.BOOL:
-                                obj[nf["name"]] = bool(rng.choice([True, False]))
-                            elif nf["type"] == FieldType.TEXT:
-                                obj[nf["name"]] = self._random_string(2, 10)
-                        obj_list.append(obj if obj else None)
-                data[fname] = obj_list
-
-        self.df = pd.DataFrame(data)
-        # WORKAROUND: Weaviate treats empty arrays as null, normalize in oracle
         for field in self.schema_config:
             if field["type"] in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]:
                 self.df[field["name"]] = self.df[field["name"]].apply(
-                    lambda x: None if isinstance(x, list) and len(x) == 0 else x)
+                    lambda x: None if isinstance(x, list) and len(x) == 0 else x
+                )
+        self.normalize_dataframe_types()
+
         print("✅ Data Generation Complete.")
         null_counts = {col: self.df[col].isna().sum() for col in self.df.columns}
         print(f"   -> Null counts (sample): {dict(list(null_counts.items())[:5])}")
-
-    def _apply_nulls(self, values, rng):
-        if not isinstance(values, list):
-            values = list(values)
-        for idx in range(len(values)):
-            if rng.random() < self.null_ratio:
-                values[idx] = None
-        return values
 
 
 # --- 2. Weaviate Manager ---
@@ -577,7 +770,12 @@ class WeaviateManager:
 
             for attempt in range(3):
                 try:
-                    collection.data.insert_many(data_objects)
+                    result = collection.data.insert_many(data_objects)
+                    batch_errors = getattr(result, "errors", None)
+                    if not batch_errors and isinstance(result, dict):
+                        batch_errors = result.get("errors")
+                    if batch_errors:
+                        raise RuntimeError(f"batch insert partially failed: {batch_errors}")
                     break
                 except Exception as e:
                     if attempt == 2: raise e
@@ -600,18 +798,41 @@ class OracleQueryGenerator:
             self.schema = dm.schema_config
         self.df = dm.df
         self.dm = dm
+        self.scalar_schema = [f for f in self.schema if f["type"] in [FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE]]
+        self.array_schema = [f for f in self.schema if f["type"] in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]]
+        self._field_values = {}
         self._field_stats = {}
-        for field in self.schema:
+        for field in self.scalar_schema:
             fname, ftype = field["name"], field["type"]
-            series = self.df[fname].dropna()
-            if ftype in [FieldType.INT, FieldType.NUMBER] and not series.empty:
+            valid_values = self._extract_valid_values(fname, ftype)
+            if not valid_values:
+                continue
+            self._field_values[fname] = valid_values
+            if ftype == FieldType.INT:
+                stats = build_int_stats(valid_values)
+                if stats is not None:
+                    self._field_stats[fname] = stats
+            elif ftype == FieldType.NUMBER:
+                arr = np.array(valid_values, dtype=np.float64)
                 self._field_stats[fname] = {
-                    "min": series.min(), "max": series.max(),
-                    "median": series.median(), "q1": series.quantile(0.25), "q3": series.quantile(0.75)
+                    "min": float(np.min(arr)),
+                    "max": float(np.max(arr)),
+                    "median": float(np.median(arr)),
+                    "q1": float(np.quantile(arr, 0.25)),
+                    "q3": float(np.quantile(arr, 0.75)),
                 }
+            elif ftype == FieldType.DATE:
+                parsed = pd.Series(valid_values).apply(to_utc_timestamp).dropna()
+                if not parsed.empty:
+                    self._field_stats[fname] = {
+                        "min_ts": parsed.min(),
+                        "max_ts": parsed.max(),
+                        "samples": list(valid_values[:32]),
+                    }
 
     def _random_string(self, min_len=5, max_len=10):
-        return ''.join(random.choices(string.ascii_letters + string.digits, k=random.randint(min_len, max_len)))
+        alphabet = string.ascii_letters + string.digits + "_-./@"
+        return ''.join(random.choices(alphabet, k=random.randint(min_len, max_len)))
 
     @staticmethod
     def _convert_to_native(val):
@@ -622,33 +843,108 @@ class OracleQueryGenerator:
         elif isinstance(val, list): return [OracleQueryGenerator._convert_to_native(x) for x in val]
         return val
 
+    def _is_effectively_null_value(self, value, ftype):
+        if is_null_like(value):
+            return True
+        if ftype == FieldType.TEXT and value == "":
+            return True
+        return False
+
+    def _effective_null_mask(self, series, ftype):
+        return series.apply(lambda x, ft=ftype: self._is_effectively_null_value(x, ft))
+
+    def _valid_series(self, fname, ftype):
+        series = self.df[fname]
+        return series[~self._effective_null_mask(series, ftype)]
+
+    def _extract_valid_values(self, fname, ftype):
+        values = []
+        for value in self.df[fname].tolist():
+            if self._is_effectively_null_value(value, ftype):
+                continue
+            if ftype == FieldType.INT:
+                values.append(int(value))
+            elif ftype == FieldType.NUMBER:
+                fv = float(value)
+                if np.isfinite(fv):
+                    values.append(fv)
+            elif ftype == FieldType.BOOL:
+                values.append(bool(value))
+            elif ftype in (FieldType.TEXT, FieldType.DATE):
+                values.append(str(value))
+            else:
+                values.append(value)
+        return values
+
+    def _date_cmp_mask(self, series, op, target):
+        target_ts = to_utc_timestamp(target)
+        if target_ts is None:
+            return pd.Series(False, index=series.index)
+
+        def comp(x):
+            ts = to_utc_timestamp(x)
+            if ts is None:
+                return False
+            if op == "==": return ts == target_ts
+            if op == ">": return ts > target_ts
+            if op == "<": return ts < target_ts
+            if op == ">=": return ts >= target_ts
+            if op == "<=": return ts <= target_ts
+            return False
+
+        return series.apply(comp)
+
     def get_value_for_query(self, fname, ftype):
-        valid = self.df[fname].dropna()
-        if not valid.empty and random.random() < 0.8:
-            val = random.choice(valid.values)
-            return val.item() if hasattr(val, "item") else val
+        valid_values = self._field_values.get(fname, [])
+
+        if BOUNDARY_INJECTION_RATE and random.random() < BOUNDARY_INJECTION_RATE:
+            if ftype == FieldType.INT:
+                return clamp_weaviate_int(random.choice(INT_BOUNDARY_VALUES))
+            if ftype == FieldType.NUMBER:
+                return float(random.choice(NUMBER_BOUNDARY_VALUES))
+            if ftype == FieldType.TEXT:
+                candidates = [v for v in TEXT_BOUNDARY_VALUES if v != ""]
+                return random.choice(candidates or TEXT_BOUNDARY_VALUES)
+            if ftype == FieldType.DATE:
+                return random.choice(DATE_BOUNDARY_VALUES)
+
+        if valid_values and random.random() < 0.8:
+            return random.choice(valid_values)
         if ftype == FieldType.INT:
-            if not valid.empty:
-                return random.choice([int(valid.max()) + 100000, int(valid.min()) - 100000])
-            return random.randint(-200000, 200000)
+            stats = self._field_stats.get(fname)
+            if stats:
+                hi = min(int(stats["max"]) + 100000, WEAVIATE_SAFE_INT_MAX)
+                lo = max(int(stats["min"]) - 100000, WEAVIATE_SAFE_INT_MIN)
+                candidates = []
+                if hi > int(stats["max"]):
+                    candidates.append(hi)
+                if lo < int(stats["min"]):
+                    candidates.append(lo)
+                if candidates:
+                    return random.choice(candidates)
+                return random.choice(INT_BOUNDARY_VALUES)
+            return clamp_weaviate_int(random.randint(-200000, 200000))
         elif ftype == FieldType.NUMBER:
-            if not valid.empty:
-                return random.choice([float(valid.max()) + 1e5, float(valid.min()) - 1e5])
-            return random.random() * 200000.0
+            stats = self._field_stats.get(fname)
+            if stats:
+                return random.choice([float(stats["max"]) + 1e5, float(stats["min"]) - 1e5])
+            return random.uniform(-200000.0, 200000.0)
         elif ftype == FieldType.BOOL:
             return random.choice([True, False])
         elif ftype == FieldType.TEXT:
-            return ''.join(random.choices(string.ascii_letters + string.digits + "!@#$%", k=random.randint(15, 30)))
+            return ''.join(random.choices(string.ascii_letters + string.digits + "_-./@", k=random.randint(15, 30)))
         elif ftype == FieldType.DATE:
-            y, m, d = random.randint(2000, 2025), random.randint(1, 12), random.randint(1, 28)
-            return f"{y:04d}-{m:02d}-{d:02d}T00:00:00Z"
+            if fname in self._field_stats and "max_ts" in self._field_stats[fname]:
+                anchor = self._field_stats[fname]["max_ts"] + pd.Timedelta(days=30)
+                return anchor.isoformat().replace("+00:00", "Z")
+            return "2030-01-01T00:00:00Z"
         return None
 
     def gen_boundary_expr(self):
-        numeric_fields = [f for f in self.schema if f["name"] in self._field_stats]
-        if not numeric_fields:
+        boundary_fields = [f for f in self.scalar_schema if f["name"] in self._field_stats and f["type"] in [FieldType.INT, FieldType.NUMBER, FieldType.DATE]]
+        if not boundary_fields:
             return None, None, None
-        field = random.choice(numeric_fields)
+        field = random.choice(boundary_fields)
         fname, ftype = field["name"], field["type"]
         stats = self._field_stats[fname]
         series = self.df[fname]
@@ -676,9 +972,13 @@ class OracleQueryGenerator:
             elif bt == "exact_max":
                 return Filter.by_property(fname).equal(max_v), series.apply(safe_cmp("==", max_v)), f"{fname} == {max_v} (max)"
             elif bt == "below_min":
+                if min_v <= WEAVIATE_SAFE_INT_MIN:
+                    return Filter.by_property(fname).equal(min_v), series.apply(safe_cmp("==", min_v)), f"{fname} == {min_v} (min)"
                 v = min_v - 1
                 return Filter.by_property(fname).less_than(v), series.apply(safe_cmp("<", v)), f"{fname} < {v} (below min)"
             elif bt == "above_max":
+                if max_v >= WEAVIATE_SAFE_INT_MAX:
+                    return Filter.by_property(fname).equal(max_v), series.apply(safe_cmp("==", max_v)), f"{fname} == {max_v} (max)"
                 v = max_v + 1
                 return Filter.by_property(fname).greater_than(v), series.apply(safe_cmp(">", v)), f"{fname} > {v} (above max)"
             elif bt == "at_median":
@@ -694,10 +994,12 @@ class OracleQueryGenerator:
         elif ftype == FieldType.NUMBER:
             min_v, max_v, med = float(stats["min"]), float(stats["max"]), float(stats["median"])
             if bt in ["exact_min", "exact_max", "at_median"]:
-                eps = 1e-6
                 t = min_v if bt == "exact_min" else (max_v if bt == "exact_max" else med)
-                fc = Filter.by_property(fname).greater_or_equal(t - eps) & Filter.by_property(fname).less_or_equal(t + eps)
-                return fc, series.apply(lambda x: (t - eps) <= x <= (t + eps) if pd.notna(x) else False), f"{fname} ≈ {t}"
+                lo, hi = float_window(t)
+                if lo is None:
+                    return None, None, None
+                fc = Filter.by_property(fname).greater_or_equal(lo) & Filter.by_property(fname).less_or_equal(hi)
+                return fc, series.apply(lambda x: lo <= x <= hi if pd.notna(x) else False), f"{fname} ≈ {t}"
             elif bt == "below_min":
                 v = min_v - 1.0
                 return Filter.by_property(fname).less_than(v), series.apply(safe_cmp("<", v)), f"{fname} < {v}"
@@ -709,6 +1011,24 @@ class OracleQueryGenerator:
                 delta = max(0.001, (max_v - min_v) / 10)
                 fc = Filter.by_property(fname).greater_or_equal(mid - delta) & Filter.by_property(fname).less_or_equal(mid + delta)
                 return fc, series.apply(lambda x: (mid - delta) <= x <= (mid + delta) if pd.notna(x) else False), f"{fname} [{mid-delta:.2f},{mid+delta:.2f}]"
+        elif ftype == FieldType.DATE:
+            min_ts = stats["min_ts"]
+            max_ts = stats["max_ts"]
+            if bt == "exact_min":
+                target = min_ts.isoformat().replace("+00:00", "Z")
+                return Filter.by_property(fname).equal(target), self._date_cmp_mask(series, "==", target), f"{fname} == {target} (min)"
+            elif bt == "exact_max":
+                target = max_ts.isoformat().replace("+00:00", "Z")
+                return Filter.by_property(fname).equal(target), self._date_cmp_mask(series, "==", target), f"{fname} == {target} (max)"
+            elif bt == "below_min":
+                target = (min_ts - pd.Timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+                return Filter.by_property(fname).less_than(target), self._date_cmp_mask(series, "<", target), f"{fname} < {target}"
+            elif bt == "above_max":
+                target = (max_ts + pd.Timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+                return Filter.by_property(fname).greater_than(target), self._date_cmp_mask(series, ">", target), f"{fname} > {target}"
+            else:
+                sample = random.choice(stats["samples"])
+                return Filter.by_property(fname).equal(sample), self._date_cmp_mask(series, "==", sample), f"{fname} == {sample}"
         return None, None, None
 
     def gen_multi_array_expr(self):
@@ -779,6 +1099,7 @@ class OracleQueryGenerator:
         f = random.choice(non_obj)
         name, ftype = f["name"], f["type"]
         series = self.df[name]
+        null_mask = self._effective_null_mask(series, ftype)
         strat = random.choice(["not_cmp", "not_eq_text", "not_range", "not_contains", "not_null"])
 
         if strat == "not_cmp" and ftype in [FieldType.INT, FieldType.NUMBER]:
@@ -807,7 +1128,7 @@ class OracleQueryGenerator:
             if val is None: return None, None, None
             fc = Filter.not_(Filter.by_property(name).equal(val))
             # Tokenization.FIELD → 精确比较, 不再需要 .lower()
-            return fc, series.apply(lambda x: str(x) != str(val) if pd.notna(x) else True), f'NOT({name} == "{val}")'
+            return fc, series.apply(lambda x: str(x) != str(val) if x is not None and not (isinstance(x, float) and np.isnan(x)) else True), f'NOT({name} == "{val}")'
 
         elif strat == "not_range" and ftype in [FieldType.INT, FieldType.NUMBER]:
             v1 = self.get_value_for_query(name, ftype)
@@ -836,7 +1157,7 @@ class OracleQueryGenerator:
 
         elif strat == "not_null" and ENABLE_NULL_FILTER:
             fc = Filter.not_(Filter.by_property(name).is_none(True))
-            return fc, series.notnull(), f"NOT({name} is null)"
+            return fc, ~null_mask, f"NOT({name} is null)"
 
         # fallback: NOT(bool == val)
         for ff in self.schema:
@@ -844,37 +1165,38 @@ class OracleQueryGenerator:
                 v = self.get_value_for_query(ff["name"], FieldType.BOOL)
                 if v is not None:
                     fc = Filter.not_(Filter.by_property(ff["name"]).equal(bool(v)))
-                    return fc, self.df[ff["name"]].apply(lambda x, vv=bool(v): x != vv if pd.notna(x) else True), f"NOT({ff['name']} == {bool(v)})"
+                    return fc, self.df[ff["name"]].apply(lambda x, vv=bool(v): x != vv if x is not None and not (isinstance(x, float) and np.isnan(x)) else True), f"NOT({ff['name']} == {bool(v)})"
         return None, None, None
 
     def gen_atomic_expr(self):
-        # Exclude OBJECT fields - they can only be queried via gen_nested_object_expr (is_none only)
-        filterable_schema = [f for f in self.schema if f["type"] != FieldType.OBJECT]
+        # 标量优先，降低数组/OBJECT 语义噪声对 Oracle 的影响
+        non_obj = [f for f in self.schema if f["type"] != FieldType.OBJECT]
+        if self.scalar_schema and random.random() < SCALAR_QUERY_PRIORITY:
+            filterable_schema = self.scalar_schema
+        else:
+            filterable_schema = non_obj
         if not filterable_schema:
             return None, None, None
         f = random.choice(filterable_schema)
         name, ftype = f["name"], f["type"]
         series = self.df[name]
+        null_mask = self._effective_null_mask(series, ftype)
 
         if ENABLE_NULL_FILTER and random.random() < 0.15:
-            # OBJECT fields: is_none(False) is broken in Weaviate, only allow is_none(True)
-            if ftype == FieldType.OBJECT:
-                return Filter.by_property(name).is_none(True), series.isnull(), f"{name} is null"
             if random.random() < 0.5:
-                return Filter.by_property(name).is_none(True), series.isnull(), f"{name} is null"
+                return Filter.by_property(name).is_none(True), null_mask, f"{name} is null"
             else:
-                return Filter.by_property(name).is_none(False), series.notnull(), f"{name} is not null"
+                return Filter.by_property(name).is_none(False), ~null_mask, f"{name} is not null"
 
         val = self.get_value_for_query(name, ftype)
         if val is None:
             if ENABLE_NULL_FILTER:
-                # For OBJECT fields, only is_none(True) works
-                return Filter.by_property(name).is_none(True), series.isnull(), f"{name} is null"
+                return Filter.by_property(name).is_none(True), null_mask, f"{name} is null"
             return None, None, None
 
         def safe_cmp(op, tv):
             def comp(x):
-                if pd.isna(x): return False
+                if x is None or (isinstance(x, float) and np.isnan(x)): return False
                 try:
                     if op == "==": return x == tv
                     if op == "!=": return x != tv
@@ -892,7 +1214,7 @@ class OracleQueryGenerator:
             vb = bool(val)
             if random.random() < 0.3:
                 fc = Filter.by_property(name).not_equal(vb)
-                mask = series.apply(safe_cmp("!=", vb)) | series.isnull()
+                mask = series.apply(safe_cmp("!=", vb)) | null_mask
                 es = f"{name} != {vb}"
             else:
                 fc = Filter.by_property(name).equal(vb)
@@ -906,7 +1228,7 @@ class OracleQueryGenerator:
             fc = getattr(Filter.by_property(name), op_map[op])(vi)
             mask = series.apply(safe_cmp(op, vi))
             if op == "!=":
-                mask = mask | series.isnull()  # Weaviate not_equal includes null rows
+                mask = mask | null_mask  # Weaviate not_equal includes null rows
             es = f"{name} {op} {vi}"
 
         elif ftype == FieldType.NUMBER:
@@ -916,7 +1238,7 @@ class OracleQueryGenerator:
             fc = getattr(Filter.by_property(name), op_map[op])(vf)
             mask = series.apply(safe_cmp(op, vf))
             if op == "!=":
-                mask = mask | series.isnull()  # Weaviate not_equal includes null rows
+                mask = mask | null_mask  # Weaviate not_equal includes null rows
             es = f"{name} {op} {vf}"
 
         elif ftype == FieldType.TEXT:
@@ -925,32 +1247,32 @@ class OracleQueryGenerator:
             if op == "==":
                 fc = Filter.by_property(name).equal(val)
                 # Tokenization.FIELD → 精确匹配, 区分大小写
-                mask = series.apply(lambda x, v=sv: str(x) == v if pd.notna(x) else False)
+                mask = series.apply(lambda x, v=sv: str(x) == v if x is not None and not (isinstance(x, float) and np.isnan(x)) else False)
                 es = f'{name} == "{val}"'
             elif op == "!=":
                 fc = Filter.by_property(name).not_equal(val)
                 # Weaviate not_equal includes null rows (二值逻辑)
-                mask = series.apply(lambda x, v=sv: str(x) != v if pd.notna(x) else True)
+                mask = series.apply(lambda x, v=sv: str(x) != v if x is not None and not (isinstance(x, float) and np.isnan(x)) else True)
                 es = f'{name} != "{val}"'
             elif op == "like_prefix":
                 k = random.randint(1, min(4, max(1, len(sv))))
                 prefix = ''.join(c for c in sv[:k] if c.isalnum()) or "a"
                 fc = Filter.by_property(name).like(f"{prefix}*")
                 # Tokenization.FIELD → like 也区分大小写
-                mask = series.apply(lambda x, p=prefix: str(x).startswith(p) if pd.notna(x) else False)
+                mask = series.apply(lambda x, p=prefix: str(x).startswith(p) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False)
                 es = f'{name} like "{prefix}*"'
             elif op == "like_suffix" and len(sv) >= 2:
                 k = random.randint(1, min(4, len(sv)))
                 suffix = ''.join(c for c in sv[-k:] if c.isalnum()) or "z"
                 fc = Filter.by_property(name).like(f"*{suffix}")
-                mask = series.apply(lambda x, s=suffix: str(x).endswith(s) if pd.notna(x) else False)
+                mask = series.apply(lambda x, s=suffix: str(x).endswith(s) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False)
                 es = f'{name} like "*{suffix}"'
             elif op == "like_contains" and len(sv) >= 3:
                 i_start = random.randint(0, len(sv) - 2)
                 j_end = random.randint(i_start + 1, min(i_start + 5, len(sv)))
                 sub = ''.join(c for c in sv[i_start:j_end] if c.isalnum()) or "a"
                 fc = Filter.by_property(name).like(f"*{sub}*")
-                mask = series.apply(lambda x, s=sub: s in str(x) if pd.notna(x) else False)
+                mask = series.apply(lambda x, s=sub: s in str(x) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False)
                 es = f'{name} like "*{sub}*"'
             elif op == "like_single" and len(sv) >= 2:
                 pos = random.randint(0, len(sv) - 1)
@@ -959,20 +1281,20 @@ class OracleQueryGenerator:
                 import re as _re
                 # Tokenization.FIELD → 区分大小写, 不用 IGNORECASE
                 regex = _re.compile("^" + _re.escape(sv[:pos]) + "." + _re.escape(sv[pos+1:]) + "$")
-                mask = series.apply(lambda x, r=regex: bool(r.match(str(x))) if pd.notna(x) else False)
+                mask = series.apply(lambda x, r=regex: bool(r.match(str(x))) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False)
                 es = f'{name} like "{pat}"'
             else:
                 # fallback to prefix
                 prefix = ''.join(c for c in sv[:3] if c.isalnum()) or "a"
                 fc = Filter.by_property(name).like(f"{prefix}*")
-                mask = series.apply(lambda x, p=prefix: str(x).startswith(p) if pd.notna(x) else False)
+                mask = series.apply(lambda x, p=prefix: str(x).startswith(p) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False)
                 es = f'{name} like "{prefix}*"'
 
         elif ftype == FieldType.DATE:
             op = random.choice([">", "<", ">=", "<=", "=="])
             op_map = {"==": "equal", ">": "greater_than", "<": "less_than", ">=": "greater_or_equal", "<=": "less_or_equal"}
             fc = getattr(Filter.by_property(name), op_map[op])(val)
-            mask = series.apply(safe_cmp(op, val))
+            mask = self._date_cmp_mask(series, op, val)
             es = f"{name} {op} {val}"
 
         elif ftype in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]:
@@ -988,7 +1310,7 @@ class OracleQueryGenerator:
             else:
                 if ENABLE_NULL_FILTER:
                     fc = Filter.by_property(name).is_none(True)
-                    mask = series.isnull()
+                    mask = null_mask
                     es = f'{name} is null'
                 else:
                     fc = Filter.by_property(name).contains_any(["__impossible__"])
@@ -998,14 +1320,15 @@ class OracleQueryGenerator:
         if fc is not None and mask is not None:
             return fc, mask, es
         if ENABLE_NULL_FILTER:
-            return Filter.by_property(name).is_none(False), series.notnull(), f"{name} is not null"
+            return Filter.by_property(name).is_none(False), ~null_mask, f"{name} is not null"
         int_fields = [ff for ff in self.schema if ff["type"] == FieldType.INT]
         if int_fields:
             fn = int_fields[0]["name"]
             s = self.df[fn]
-            mn = int(s.min()) if not s.isna().all() else 0
-            mx = int(s.max()) if not s.isna().all() else 0
-            return (Filter.by_property(fn).greater_or_equal(mn - 1000000) & Filter.by_property(fn).less_or_equal(mx + 1000000)), s.notna(), f"{fn} range (fallback)"
+            stats = self._field_stats.get(fn)
+            mn = int(stats["min"]) if stats else 0
+            mx = int(stats["max"]) if stats else 0
+            return (Filter.by_property(fn).greater_or_equal(clamp_weaviate_int(mn - 1000000)) & Filter.by_property(fn).less_or_equal(clamp_weaviate_int(mx + 1000000))), ~self._effective_null_mask(s, FieldType.INT), f"{fn} range (fallback)"
         return None, None, None
 
     def gen_constant_expr(self):
@@ -1013,17 +1336,25 @@ class OracleQueryGenerator:
         if int_fields:
             fn = int_fields[0]["name"]
             s = self.df[fn]
-            mn = int(s.min()) if not s.isna().all() else 0
-            mx = int(s.max()) if not s.isna().all() else 0
+            stats = self._field_stats.get(fn)
+            mn = int(stats["min"]) if stats else 0
+            mx = int(stats["max"]) if stats else 0
         else:
             float_fields = [f for f in self.schema if f["type"] == FieldType.NUMBER]
             if not float_fields: return None, None, None
             fn = float_fields[0]["name"]
             s = self.df[fn]
-            mn = float(s.min()) if not s.isna().all() else 0
-            mx = float(s.max()) if not s.isna().all() else 0
+            stats = self._field_stats.get(fn)
+            mn = float(stats["min"]) if stats else 0
+            mx = float(stats["max"]) if stats else 0
         if random.random() < 0.5:
-            return (Filter.by_property(fn).greater_or_equal(mn - 1e6) & Filter.by_property(fn).less_or_equal(mx + 1e6)), s.notna(), f"{fn} wide range (true)"
+            if int_fields:
+                lo = clamp_weaviate_int(mn - 1000000)
+                hi = clamp_weaviate_int(mx + 1000000)
+            else:
+                lo = mn - 1e6
+                hi = mx + 1e6
+            return (Filter.by_property(fn).greater_or_equal(lo) & Filter.by_property(fn).less_or_equal(hi)), s.notna(), f"{fn} wide range (true)"
         else:
             imp = mx + 1e7
             return Filter.by_property(fn).greater_than(imp), pd.Series(False, index=self.df.index), f"{fn} > {imp} (false)"
@@ -1040,19 +1371,19 @@ class OracleQueryGenerator:
     def gen_complex_expr(self, depth):
         if depth == 0 or random.random() < 0.2:
             r = random.random()
-            if r < 0.02:
+            if r < 0.04:
                 res = self.gen_constant_expr()
                 if res[0]: return res
-            elif r < 0.10:
+            elif r < 0.22:
                 res = self.gen_boundary_expr()
                 if res[0] is not None: return res
-            elif r < 0.18:
+            elif r < 0.28 and self.array_schema:
                 res = self.gen_multi_array_expr()
                 if res[0] is not None: return res
-            elif r < 0.28:
+            elif r < 0.42:
                 res = self.gen_not_expr()
                 if res[0] is not None: return res
-            elif r < 0.38:
+            elif r < 0.45:
                 res = self.gen_nested_object_expr()
                 if res[0] is not None: return res
             fc, m, e = self.gen_atomic_expr()
@@ -1098,21 +1429,27 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
     def _find_tautology_field(self):
         for f in self.schema:
             if f["type"] == FieldType.INT:
-                s = self.df[f["name"]].dropna()
-                if not s.empty:
-                    return {"name": f["name"], "min": int(s.min()), "max": int(s.max())}
+                stats = self._field_stats.get(f["name"])
+                if stats:
+                    return {"name": f["name"], "min": int(stats["min"]), "max": int(stats["max"])}
         for f in self.schema:
             if f["type"] == FieldType.NUMBER:
-                s = self.df[f["name"]].dropna()
-                if not s.empty:
-                    return {"name": f["name"], "min": float(s.min()), "max": float(s.max())}
+                stats = self._field_stats.get(f["name"])
+                if stats:
+                    return {"name": f["name"], "min": float(stats["min"]), "max": float(stats["max"])}
         return None
 
     def _gen_tautology_filter(self):
         if self._tautology_field:
             n = self._tautology_field["name"]
             mn, mx = self._tautology_field["min"], self._tautology_field["max"]
-            wide = Filter.by_property(n).greater_or_equal(mn - 1e6) & Filter.by_property(n).less_or_equal(mx + 1e6)
+            if isinstance(mn, int) and isinstance(mx, int):
+                lo = clamp_weaviate_int(mn - 1000000)
+                hi = clamp_weaviate_int(mx + 1000000)
+            else:
+                lo = mn - 1e6
+                hi = mx + 1e6
+            wide = Filter.by_property(n).greater_or_equal(lo) & Filter.by_property(n).less_or_equal(hi)
             if ENABLE_NULL_FILTER:
                 # Include null rows to make it a true tautology
                 return wide | Filter.by_property(n).is_none(True), f"({n} wide|null)"
@@ -1122,7 +1459,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
     def _gen_false_filter(self):
         for f in self.schema:
             if f["type"] == FieldType.INT:
-                return Filter.by_property(f["name"]).greater_than(2e5) & Filter.by_property(f["name"]).less_than(-2e5), f"({f['name']} impossible)"
+                return Filter.by_property(f["name"]).greater_than(200000) & Filter.by_property(f["name"]).less_than(-200000), f"({f['name']} impossible)"
         for f in self.schema:
             if f["type"] == FieldType.TEXT:
                 return Filter.by_property(f["name"]).equal("__impossible__"), f'{f["name"]} impossible'
@@ -1182,9 +1519,10 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             # Approximate partition using two tautology halves via known field ranges
             for f in self.schema:
                 if f['type'] == FieldType.INT and f['name'] != 'row_num':
-                    s = self.df[f['name']].dropna()
-                    if len(s) > 10:
-                        med = int(s.median())
+                    values = self._field_values.get(f["name"], [])
+                    stats = self._field_stats.get(f["name"])
+                    if len(values) > 10 and stats:
+                        med = int(stats["median"])
                         left_part = Filter.by_property(f['name']).less_or_equal(med)
                         right_part = Filter.by_property(f['name']).greater_than(med)
                         null_part = Filter.by_property(f['name']).is_none(True) if ENABLE_NULL_FILTER else None
@@ -1210,26 +1548,32 @@ class PQSQueryGenerator(OracleQueryGenerator):
         for f in self.schema:
             if f["type"] == FieldType.INT:
                 n = f["name"]
-                if self.df[n].isna().sum() == 0:
-                    s = self.df[n]
-                    return {"name": n, "min": int(s.min()), "max": int(s.max())}
+                stats = self._field_stats.get(n)
+                if stats and self._effective_null_mask(self.df[n], FieldType.INT).sum() == 0:
+                    return {"name": n, "min": int(stats["min"]), "max": int(stats["max"])}
         for f in self.schema:
             if f["type"] == FieldType.INT:
-                s = self.df[f["name"]].dropna()
-                if not s.empty:
-                    return {"name": f["name"], "min": int(s.min()), "max": int(s.max())}
+                stats = self._field_stats.get(f["name"])
+                if stats:
+                    return {"name": f["name"], "min": int(stats["min"]), "max": int(stats["max"])}
         for f in self.schema:
             if f["type"] == FieldType.NUMBER:
-                s = self.df[f["name"]].dropna()
-                if not s.empty:
-                    return {"name": f["name"], "min": float(s.min()), "max": float(s.max())}
+                stats = self._field_stats.get(f["name"])
+                if stats:
+                    return {"name": f["name"], "min": float(stats["min"]), "max": float(stats["max"])}
         return None
 
     def _gen_tautology(self):
         if self._tautology_field:
             n = self._tautology_field["name"]
             mn, mx = self._tautology_field["min"], self._tautology_field["max"]
-            wide = Filter.by_property(n).greater_or_equal(mn - 1e6) & Filter.by_property(n).less_or_equal(mx + 1e6)
+            if isinstance(mn, int) and isinstance(mx, int):
+                lo = clamp_weaviate_int(mn - 1000000)
+                hi = clamp_weaviate_int(mx + 1000000)
+            else:
+                lo = mn - 1e6
+                hi = mx + 1e6
+            wide = Filter.by_property(n).greater_or_equal(lo) & Filter.by_property(n).less_or_equal(hi)
             if ENABLE_NULL_FILTER:
                 return wide | Filter.by_property(n).is_none(True), f"({n} wide|null)"
             return wide, f"({n} wide)"
@@ -1238,7 +1582,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
     def _gen_false(self):
         for f in self.schema:
             if f["type"] == FieldType.INT:
-                return Filter.by_property(f["name"]).greater_than(2e5) & Filter.by_property(f["name"]).less_than(-2e5), f"({f['name']} impossible)"
+                return Filter.by_property(f["name"]).greater_than(200000) & Filter.by_property(f["name"]).less_than(-200000), f"({f['name']} impossible)"
         return None, None
 
     def gen_pqs_filter(self, pivot_row, depth):
@@ -1393,8 +1737,10 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 exprs.append(f"{fname}=={vi}")
             elif ftype == FieldType.NUMBER:
                 vf = float(val)
-                eps = 1e-5
-                filters.append(Filter.by_property(fname).greater_than(vf - eps) & Filter.by_property(fname).less_than(vf + eps))
+                lo, hi = float_window(vf)
+                if lo is None:
+                    continue
+                filters.append(Filter.by_property(fname).greater_or_equal(lo) & Filter.by_property(fname).less_or_equal(hi))
                 exprs.append(f"{fname}≈{vf}")
             elif ftype in (FieldType.TEXT, FieldType.DATE):
                 filters.append(Filter.by_property(fname).equal(str(val)))
@@ -1436,16 +1782,18 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 elif strat == "not_lt":
                     return Filter.not_(Filter.by_property(fname).less_than(vi)) & Filter.not_(Filter.by_property(fname).greater_than(vi)), f"NOT({fname}<{vi}) AND NOT({fname}>{vi})"
                 else:  # neq_fake
-                    fake = vi + random.choice([100000, -100000])
+                    fake = clamp_weaviate_int(vi + random.choice([100000, -100000]))
                     return Filter.by_property(fname).not_equal(fake) & Filter.by_property(fname).equal(vi), f"{fname} != {fake} AND {fname} == {vi}"
             elif ftype == FieldType.NUMBER:
                 vf = float(val)
-                eps = 1e-5
                 strat = random.choice(["range", "not_gt"])
+                lo, hi = float_window(vf)
+                if lo is None:
+                    continue
                 if strat == "range":
-                    return Filter.by_property(fname).greater_than(vf - eps) & Filter.by_property(fname).less_than(vf + eps), f"{fname} ≈ {vf}"
+                    return Filter.by_property(fname).greater_or_equal(lo) & Filter.by_property(fname).less_or_equal(hi), f"{fname} ≈ {vf}"
                 else:
-                    return Filter.not_(Filter.by_property(fname).greater_than(vf + eps)) & Filter.by_property(fname).greater_or_equal(vf - eps), f"NOT({fname}>{vf+eps}) AND {fname}>={vf-eps}"
+                    return Filter.not_(Filter.by_property(fname).greater_than(hi)) & Filter.by_property(fname).greater_or_equal(lo), f"NOT({fname}>{hi}) AND {fname}>={lo}"
             elif ftype == FieldType.TEXT:
                 sv = str(val)
                 strat = random.choice(["eq", "like_prefix", "like_suffix", "like_contains", "like_single", "neq_fake"])
@@ -1505,22 +1853,27 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
 # --- 6. Main Execution ---
 
-def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
-    global VECTOR_CHECK_RATIO, VECTOR_TOPK, VECTOR_INDEX_TYPE, DISTANCE_METRIC
+def initialize_seeded_run(seed=None):
+    global VECTOR_CHECK_RATIO, VECTOR_TOPK, VECTOR_INDEX_TYPE, DISTANCE_METRIC, BOUNDARY_INJECTION_RATE
     current_seed = seed if seed is not None else random.randint(0, 2**31 - 1)
     random.seed(current_seed)
     np.random.seed(current_seed)
-    print(f"🔒 Seed: {current_seed}")
-
     VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
     VECTOR_TOPK = random.randint(50, 200)
+    BOUNDARY_INJECTION_RATE = random.uniform(0.10, 0.18)
     VECTOR_INDEX_TYPE = random.choice(ALL_VECTOR_INDEX_TYPES)
     DISTANCE_METRIC = random.choice(ALL_DISTANCE_METRICS)
+    return current_seed
+
+def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
+    current_seed = initialize_seeded_run(seed)
+    print(f"🔒 Seed: {current_seed}")
+
     cl_list = [consistency] if consistency else ALL_CONSISTENCY_LEVELS
     _cl_rng = random.Random(current_seed + 7)
-    print(f"   VecIndex: {VECTOR_INDEX_TYPE}, Dist: {DISTANCE_METRIC}, VecRatio: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}")
+    print(f"   VecIndex: {VECTOR_INDEX_TYPE}, Dist: {DISTANCE_METRIC}, VecRatio: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}, BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
 
-    dm = DataManager()
+    dm = DataManager(current_seed)
     dm.generate_schema()
     dm.generate_data()
     wm = WeaviateManager()
@@ -1551,6 +1904,28 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                 if not ids: return []
                 return dm.df[dm.df["id"].isin(list(ids))].to_dict("records")[:lim]
 
+            def diagnose_id_mismatch(target_id, expr):
+                row_df = dm.df[dm.df["id"] == target_id]
+                row_data = row_df.iloc[0].to_dict() if not row_df.empty else None
+                try:
+                    obj = col.query.fetch_object_by_id(target_id)
+                except Exception:
+                    obj = None
+                props = obj.properties if obj is not None else {}
+                relevant = [ff for ff in extract_expr_fields(expr, dm.schema_config) if ff["type"] in [FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE]]
+                diffs = []
+                for ff in relevant[:8]:
+                    name = ff["name"]
+                    pv = normalize_scalar_for_compare(ff["type"], row_data.get(name) if row_data else None)
+                    wv = normalize_scalar_for_compare(ff["type"], props.get(name))
+                    if pv != wv:
+                        diffs.append(f"{name}: pandas={pv!r} weaviate={wv!r}")
+                if not relevant:
+                    return "no_relevant_scalar_fields", []
+                if diffs:
+                    return "LIKELY_ORACLE_OR_DATA_SYNC", diffs
+                return "LIKELY_ENGINE_OR_QUERY_BUG", []
+
             flog(f"Start: {rounds} rounds | Seed: {current_seed} | VecIdx: {VECTOR_INDEX_TYPE} | Dist: {DISTANCE_METRIC}")
             flog("=" * 50)
 
@@ -1572,9 +1947,15 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                             for r, v in zip(rows, vecs):
                                 p = {k: vv for k, vv in r.items() if k != "id" and vv is not None}
                                 objs.append(DataObject(uuid=r["id"], properties=p, vector=v.tolist()))
-                            col.data.insert_many(objs)
-                            dm.df = pd.concat([dm.df, pd.DataFrame(rows)], ignore_index=True)
+                            dyn_result = col.data.insert_many(objs)
+                            dyn_errors = getattr(dyn_result, "errors", None)
+                            if not dyn_errors and isinstance(dyn_result, dict):
+                                dyn_errors = dyn_result.get("errors")
+                            if dyn_errors:
+                                raise RuntimeError(f"dynamic batch insert partially failed: {dyn_errors}")
+                            dm.df = pd.concat([dm.df, dm.rows_to_dataframe(rows)], ignore_index=True)
                             dm.vectors = np.vstack([dm.vectors, np.array(vecs)])
+                            dm.normalize_dataframe_types()
                             dynamic_ids.update(r["id"] for r in rows)
                             qg = OracleQueryGenerator(dm)
                             flog(f"[Dyn] Inserted {bc}")
@@ -1601,6 +1982,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 ki = dm.df[keep].index.to_numpy()
                                 dm.df = dm.df[keep].reset_index(drop=True)
                                 dm.vectors = dm.vectors[ki]
+                                dm.normalize_dataframe_types()
                                 qg = OracleQueryGenerator(dm)
                                 flog(f"[Dyn] Deleted {len(dids)}")
                                 time.sleep(SLEEP_INTERVAL * 2)
@@ -1618,6 +2000,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 for k, v in nr.items():
                                     dm.df.at[ui, k] = v
                                 dm.vectors[ui] = nv
+                                dm.normalize_dataframe_types()
                                 dynamic_ids.add(uid)
                                 # Post-update verification
                                 try:
@@ -1629,12 +2012,11 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                                 if isinstance(pv, float):
                                                     if abs(float(av) - pv) > 1e-3:
                                                         flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
-                                                elif isinstance(pv, str) and ("T" in pv and pv.endswith("Z")):
-                                                    # DATE field: Weaviate returns '2022-10-26 00:00:00+00:00'
-                                                    # but we store '2022-10-26T00:00:00Z'. Normalize both before compare.
-                                                    norm_pv = pv.replace("T", " ").replace("Z", "+00:00")
-                                                    if str(av) != norm_pv:
-                                                        flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
+                                                elif isinstance(pv, str) and to_utc_timestamp(pv) is not None:
+                                                    norm_pv = canonicalize_date_string(pv)
+                                                    norm_av = canonicalize_date_string(av)
+                                                    if norm_pv != norm_av:
+                                                        flog(f"[Dyn] ❌ Update mismatch: {pk} expected={norm_pv} actual={norm_av}")
                                                 elif isinstance(pv, list):
                                                     # Array fields: compare sorted to avoid order issues
                                                     if sorted(str(x) for x in av) != sorted(str(x) for x in pv) if isinstance(av, list) else True:
@@ -1664,7 +2046,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                             if use_existing:
                                 target_id = random.choice(dm.df["id"].tolist())
                             else:
-                                target_id = str(uuid.uuid4())
+                                target_id = dm._next_uuid()
                             row = dm.generate_single_row(id_override=target_id)
                             vec = dm.generate_single_vector()
                             upsert_rows.append(row)
@@ -1689,8 +2071,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                     new_vecs.append(vec)
                             dynamic_ids.update(r["id"] for r in upsert_rows)
                             if new_rows:
-                                dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
+                                dm.df = pd.concat([dm.df, dm.rows_to_dataframe(new_rows)], ignore_index=True)
                                 dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
+                            dm.normalize_dataframe_types()
                             qg = OracleQueryGenerator(dm)
                             flog(f"[Dyn] Upserted {len(upsert_rows)} (new:{len(new_rows)})")
                             time.sleep(SLEEP_INTERVAL * 2)  # Allow index to stabilize
@@ -1774,18 +2157,24 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                             if mi: flog(f"  Missing: {sample(mi)}")
                             if ex: flog(f"  Extra: {sample(ex)}")
                             # Per-ID verification for extra IDs
-                            for eid in list(ex)[:3]:
+                            for eid in list(ex)[:2]:
                                 try:
                                     obj = col.query.fetch_object_by_id(eid)
                                     exists = obj is not None
-                                    flog(f"    ExtraID {eid}: exists={exists}")
-                                    if exists:
-                                        row_data = dm.df[dm.df['id'] == eid]
-                                        if not row_data.empty:
-                                            null_cols = [c for c in row_data.columns if row_data[c].isna().any()]
-                                            flog(f"    ExtraID null_cols: {null_cols}")
+                                    verdict, diffs = diagnose_id_mismatch(eid, es)
+                                    flog(f"    ExtraID {eid}: exists={exists} verdict={verdict}")
+                                    for d in diffs[:4]:
+                                        flog(f"      {d}")
                                 except Exception as ve:
                                     flog(f"    ExtraID verify err: {ve}")
+                            for mid in list(mi)[:2]:
+                                try:
+                                    verdict, diffs = diagnose_id_mismatch(mid, es)
+                                    flog(f"    MissingID {mid}: verdict={verdict}")
+                                    for d in diffs[:4]:
+                                        flog(f"      {d}")
+                                except Exception as ve:
+                                    flog(f"    MissingID verify err: {ve}")
                             fails.append({"id": i, "expr": es, "detail": dm_, "seed": current_seed})
                             stats.record(False, ms, depth, "mismatch")
 
@@ -1903,16 +2292,12 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
 
 
 def run_equivalence_mode(rounds=100, seed=None):
-    global VECTOR_CHECK_RATIO, VECTOR_TOPK, VECTOR_INDEX_TYPE, DISTANCE_METRIC
-    if seed is None: seed = random.randint(0, 1000000)
-    random.seed(seed); np.random.seed(seed)
-    VECTOR_INDEX_TYPE = random.choice(ALL_VECTOR_INDEX_TYPES)
-    DISTANCE_METRIC = random.choice(ALL_DISTANCE_METRICS)
+    seed = initialize_seeded_run(seed)
 
     logf = f"weaviate_equiv_test_{int(time.time())}.log"
-    print(f"\n👯 Equivalence Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE}")
+    print(f"\n👯 Equivalence Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
 
-    dm = DataManager(); dm.generate_schema(); dm.generate_data()
+    dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
         dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
@@ -1963,16 +2348,12 @@ def run_equivalence_mode(rounds=100, seed=None):
 
 
 def run_pqs_mode(rounds=100, seed=None):
-    global VECTOR_CHECK_RATIO, VECTOR_TOPK, VECTOR_INDEX_TYPE, DISTANCE_METRIC
-    if seed is None: seed = random.randint(0, 1000000)
-    random.seed(seed); np.random.seed(seed)
-    VECTOR_INDEX_TYPE = random.choice(ALL_VECTOR_INDEX_TYPES)
-    DISTANCE_METRIC = random.choice(ALL_DISTANCE_METRICS)
+    seed = initialize_seeded_run(seed)
 
     logf = f"weaviate_pqs_test_{int(time.time())}.log"
-    print(f"\n🚀 PQS Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE}")
+    print(f"\n🚀 PQS Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
 
-    dm = DataManager(); dm.generate_schema(); dm.generate_data()
+    dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
         dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
@@ -2023,16 +2404,12 @@ def run_pqs_mode(rounds=100, seed=None):
 
 
 def run_groupby_mode(rounds=100, seed=None):
-    global VECTOR_CHECK_RATIO, VECTOR_TOPK, VECTOR_INDEX_TYPE, DISTANCE_METRIC
-    if seed is None: seed = random.randint(0, 1000000)
-    random.seed(seed); np.random.seed(seed)
-    VECTOR_INDEX_TYPE = random.choice(ALL_VECTOR_INDEX_TYPES)
-    DISTANCE_METRIC = random.choice(ALL_DISTANCE_METRICS)
+    seed = initialize_seeded_run(seed)
 
     logf = f"weaviate_groupby_test_{int(time.time())}.log"
-    print(f"\n📦 GroupBy Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE}")
+    print(f"\n📦 GroupBy Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
 
-    dm = DataManager(); dm.generate_schema(); dm.generate_data()
+    dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
         dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
