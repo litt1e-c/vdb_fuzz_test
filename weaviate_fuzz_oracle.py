@@ -23,6 +23,7 @@ Notes:
   version-specific probes that still reproduce locally.
 """
 import time
+import os
 import random
 import string
 import numpy as np
@@ -148,6 +149,25 @@ DISTANCE_METRIC = None
 
 # 一致性等级
 ALL_CONSISTENCY_LEVELS = [ConsistencyLevel.ONE, ConsistencyLevel.QUORUM, ConsistencyLevel.ALL]
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "weaviate_log")
+
+
+def ensure_log_dir():
+    os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
+    return DEFAULT_LOG_DIR
+
+
+def make_log_path(filename: str) -> str:
+    return os.path.join(ensure_log_dir(), filename)
+
+
+def display_path(path: str) -> str:
+    try:
+        return os.path.relpath(path, start=os.getcwd())
+    except Exception:
+        return path
 
 
 # --- 1. Data Manager ---
@@ -1882,8 +1902,8 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
         dm.filterable_fields = wm.reset_collection(dm.schema_config)
         wm.insert(dm)
         ts = int(time.time())
-        logf = f"weaviate_fuzz_test_{ts}.log"
-        print(f"\n📝 Log: {logf}")
+        logf = make_log_path(f"weaviate_fuzz_test_{ts}.log")
+        print(f"\n📝 Log: {display_path(logf)}")
         print(f"   🔑 Reproduce: python weaviate_fuzz_oracle.py --seed {current_seed}")
         print("🚀 Testing...")
 
@@ -2285,7 +2305,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
             print(f"🚫 {len(fails)} failures!")
             for c in fails[:10]:
                 print(f"  🔴 T{c['id']}: {c.get('detail','')[:100]}")
-        print(f"📄 Log: {logf}")
+        print(f"📄 Log: {display_path(logf)}")
         print(f"🔑 Reproduce: python weaviate_fuzz_oracle.py --seed {current_seed}")
     finally:
         wm.close()
@@ -2294,8 +2314,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
 def run_equivalence_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
-    logf = f"weaviate_equiv_test_{int(time.time())}.log"
+    logf = make_log_path(f"weaviate_equiv_test_{int(time.time())}.log")
     print(f"\n👯 Equivalence Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
@@ -2342,7 +2363,7 @@ def run_equivalence_mode(rounds=100, seed=None):
                             flog(f"  {mut['type']}: ERR {e}")
                 except Exception as e:
                     flog(f"  ERR: {e}")
-        print(f"\n{'✅ All passed' if not fails else f'🚫 {len(fails)} failures'}. Log: {logf}")
+        print(f"\n{'✅ All passed' if not fails else f'🚫 {len(fails)} failures'}. Log: {display_path(logf)}")
     finally:
         wm.close()
 
@@ -2350,8 +2371,9 @@ def run_equivalence_mode(rounds=100, seed=None):
 def run_pqs_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
-    logf = f"weaviate_pqs_test_{int(time.time())}.log"
+    logf = make_log_path(f"weaviate_pqs_test_{int(time.time())}.log")
     print(f"\n🚀 PQS Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
@@ -2398,7 +2420,7 @@ def run_pqs_mode(rounds=100, seed=None):
                     flog(f"  ERR: {e}")
                     errs.append({"id": i, "error": str(e)})
         print(f"\n📊 PQS: ok={ok} skip={skip} err={len(errs)}")
-        print(f"{'✅ All passed' if not errs else f'🚫 {len(errs)} failures'}. Log: {logf}")
+        print(f"{'✅ All passed' if not errs else f'🚫 {len(errs)} failures'}. Log: {display_path(logf)}")
     finally:
         wm.close()
 
@@ -2406,8 +2428,9 @@ def run_pqs_mode(rounds=100, seed=None):
 def run_groupby_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
-    logf = f"weaviate_groupby_test_{int(time.time())}.log"
+    logf = make_log_path(f"weaviate_groupby_test_{int(time.time())}.log")
     print(f"\n📦 GroupBy Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
@@ -2463,7 +2486,7 @@ def run_groupby_mode(rounds=100, seed=None):
                         flog(f"  ERR: {err_str[:200]}")
                         errs.append({"id": i, "error": err_str[:100]})
         print(f"\n📊 GroupBy: ok={ok} err={len(errs)}")
-        print(f"{'✅ All passed' if not errs else f'🚫 {len(errs)} failures'}. Log: {logf}")
+        print(f"{'✅ All passed' if not errs else f'🚫 {len(errs)} failures'}. Log: {display_path(logf)}")
     finally:
         wm.close()
 
