@@ -149,6 +149,7 @@ DISTANCE_METRIC = None
 
 # 一致性等级
 ALL_CONSISTENCY_LEVELS = [ConsistencyLevel.ONE, ConsistencyLevel.QUORUM, ConsistencyLevel.ALL]
+DEFAULT_CONSISTENCY_LEVEL = ConsistencyLevel.ALL
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "weaviate_log")
@@ -168,6 +169,30 @@ def display_path(path: str) -> str:
         return os.path.relpath(path, start=os.getcwd())
     except Exception:
         return path
+
+
+def consistency_label(consistency, randomize=False):
+    if randomize:
+        return "RANDOM(ONE/QUORUM/ALL)"
+    return str(consistency or DEFAULT_CONSISTENCY_LEVEL)
+
+
+def parse_consistency_arg(value: str):
+    mapping = {
+        "one": ConsistencyLevel.ONE,
+        "quorum": ConsistencyLevel.QUORUM,
+        "all": ConsistencyLevel.ALL,
+    }
+    return mapping[value.lower()]
+
+
+def format_repro_command(seed, consistency, randomize_consistency=False):
+    parts = [f"python weaviate_fuzz_oracle.py --seed {seed}"]
+    if randomize_consistency:
+        parts.append("--random-consistency")
+    elif (consistency or DEFAULT_CONSISTENCY_LEVEL) != DEFAULT_CONSISTENCY_LEVEL:
+        parts.append(f"--consistency {(consistency or DEFAULT_CONSISTENCY_LEVEL).name.lower()}")
+    return " ".join(parts)
 
 
 # --- 1. Data Manager ---
@@ -1885,12 +1910,14 @@ def initialize_seeded_run(seed=None):
     DISTANCE_METRIC = random.choice(ALL_DISTANCE_METRICS)
     return current_seed
 
-def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
+def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONSISTENCY_LEVEL, randomize_consistency=False):
     current_seed = initialize_seeded_run(seed)
     print(f"🔒 Seed: {current_seed}")
 
-    cl_list = [consistency] if consistency else ALL_CONSISTENCY_LEVELS
+    resolved_consistency = consistency or DEFAULT_CONSISTENCY_LEVEL
+    cl_list = ALL_CONSISTENCY_LEVELS if randomize_consistency else [resolved_consistency]
     _cl_rng = random.Random(current_seed + 7)
+    print(f"   Consistency: {consistency_label(resolved_consistency, randomize=randomize_consistency)}")
     print(f"   VecIndex: {VECTOR_INDEX_TYPE}, Dist: {DISTANCE_METRIC}, VecRatio: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}, BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
 
     dm = DataManager(current_seed)
@@ -1903,8 +1930,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
         wm.insert(dm)
         ts = int(time.time())
         logf = make_log_path(f"weaviate_fuzz_test_{ts}.log")
+        repro_cmd = format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)
         print(f"\n📝 Log: {display_path(logf)}")
-        print(f"   🔑 Reproduce: python weaviate_fuzz_oracle.py --seed {current_seed}")
+        print(f"   🔑 Reproduce: {repro_cmd}")
         print("🚀 Testing...")
 
         qg = OracleQueryGenerator(dm)
@@ -1946,11 +1974,15 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                     return "LIKELY_ORACLE_OR_DATA_SYNC", diffs
                 return "LIKELY_ENGINE_OR_QUERY_BUG", []
 
-            flog(f"Start: {rounds} rounds | Seed: {current_seed} | VecIdx: {VECTOR_INDEX_TYPE} | Dist: {DISTANCE_METRIC}")
+            flog(
+                f"Start: {rounds} rounds | Seed: {current_seed} | "
+                f"Consistency: {consistency_label(resolved_consistency, randomize=randomize_consistency)} | "
+                f"VecIdx: {VECTOR_INDEX_TYPE} | Dist: {DISTANCE_METRIC}"
+            )
             flog("=" * 50)
 
             for i in range(rounds):
-                cl = _cl_rng.choice(cl_list)
+                cl = _cl_rng.choice(cl_list) if randomize_consistency else cl_list[0]
                 print(f"\r⏳ Test {i+1}/{rounds} [CL={cl}]       ", end="", flush=True)
 
                 # Dynamic ops
@@ -2171,8 +2203,8 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                             stats.weaviate_bugs = getattr(stats, 'weaviate_bugs', 0) + 1
                         else:
                             print(f"\n❌ [T{i}] MISMATCH! {dm_}")
-                            print(f"   Expr: {es[:200]}")
-                            print(f"   🔑 --seed {current_seed}")
+                            print(f"   Expr: {es}")
+                            print(f"   🔑 {repro_cmd}")
                             flog(f"  -> MISMATCH! {dm_}")
                             if mi: flog(f"  Missing: {sample(mi)}")
                             if ex: flog(f"  Extra: {sample(ex)}")
@@ -2244,12 +2276,18 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
                                     if len(pr.objects) < ps: break
                                 n_pages = (len(all_sorted) - 1) // ps + 1 if all_sorted else 0
                                 if dup_sorted > 0:
-                                    flog(f"  Page(sort={sf['name']}): FAIL {dup_sorted} dups in {n_pages} pages (BUG: sort should guarantee determinism)")
-                                    stats.record_fail()
+                                    if cl != ConsistencyLevel.ALL:
+                                        flog(f"  Page(sort={sf['name']}): WARN CL={cl} {dup_sorted} dups in {n_pages} pages")
+                                    else:
+                                        flog(f"  Page(sort={sf['name']}): FAIL {dup_sorted} dups in {n_pages} pages (BUG: sort should guarantee determinism)")
+                                        stats.record_fail()
                                 elif seen_sorted and not seen_sorted.issubset(exp):
                                     extras = seen_sorted - exp
-                                    flog(f"  Page(sort={sf['name']}): FAIL {len(extras)} extras not in expected")
-                                    stats.record_fail()
+                                    if cl != ConsistencyLevel.ALL:
+                                        flog(f"  Page(sort={sf['name']}): WARN CL={cl} {len(extras)} extras not in expected")
+                                    else:
+                                        flog(f"  Page(sort={sf['name']}): FAIL {len(extras)} extras not in expected")
+                                        stats.record_fail()
                                 else:
                                     flog(f"  Page(sort={sf['name']}): PASS ({len(seen_sorted)} in {n_pages}p)")
 
@@ -2306,7 +2344,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=None):
             for c in fails[:10]:
                 print(f"  🔴 T{c['id']}: {c.get('detail','')[:100]}")
         print(f"📄 Log: {display_path(logf)}")
-        print(f"🔑 Reproduce: python weaviate_fuzz_oracle.py --seed {current_seed}")
+        print(f"🔑 Reproduce: {format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)}")
     finally:
         wm.close()
 
@@ -2497,6 +2535,17 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=500, help="Test rounds (default: 500)")
     parser.add_argument("--mode", choices=["oracle", "equiv", "pqs", "groupby"], default="oracle", help="Test mode")
     parser.add_argument("--no-dynamic", action="store_true", help="Disable dynamic ops")
+    parser.add_argument(
+        "--consistency",
+        choices=["all", "quorum", "one"],
+        default="all",
+        help="Consistency level for oracle mode (default: all)",
+    )
+    parser.add_argument(
+        "--random-consistency",
+        action="store_true",
+        help="Randomize oracle consistency across ONE/QUORUM/ALL",
+    )
     parser.add_argument("--host", type=str, default=None, help="Weaviate host")
     parser.add_argument("--port", type=int, default=None, help="Weaviate port")
     parser.add_argument("-N", type=int, default=None, help="Data rows")
@@ -2506,8 +2555,14 @@ if __name__ == "__main__":
     if args.port: PORT = args.port
     if args.N: N = args.N
 
+    resolved_consistency = parse_consistency_arg(args.consistency)
+
     print("=" * 80)
-    print(f"🚀 Weaviate Fuzz Oracle V2 | Mode: {args.mode} | Rounds: {args.rounds} | Seed: {args.seed or '(random)'} | Dynamic: {'OFF' if args.no_dynamic else 'ON'}")
+    print(
+        f"🚀 Weaviate Fuzz Oracle V2 | Mode: {args.mode} | Rounds: {args.rounds} | "
+        f"Seed: {args.seed or '(random)'} | Dynamic: {'OFF' if args.no_dynamic else 'ON'} | "
+        f"Consistency: {consistency_label(resolved_consistency, randomize=args.random_consistency)}"
+    )
     print("=" * 80)
 
     if args.mode == "equiv":
@@ -2517,4 +2572,10 @@ if __name__ == "__main__":
     elif args.mode == "groupby":
         run_groupby_mode(rounds=args.rounds, seed=args.seed)
     else:
-        run(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=not args.no_dynamic)
+        run(
+            rounds=args.rounds,
+            seed=args.seed,
+            enable_dynamic_ops=not args.no_dynamic,
+            consistency=resolved_consistency,
+            randomize_consistency=args.random_consistency,
+        )
