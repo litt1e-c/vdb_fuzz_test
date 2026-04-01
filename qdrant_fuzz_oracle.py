@@ -9,10 +9,12 @@ Features:
 6. Equivalence Testing: Query transformation validation
 """
 import time
+import os
 import random
 import string
 import math
 import copy
+import re
 import numpy as np
 import pandas as pd
 import json
@@ -60,6 +62,26 @@ def _init_vector_check_config():
     VECTOR_TOPK = random.randint(50, 200)
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "qdrant_log")
+
+
+def ensure_log_dir():
+    os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
+    return DEFAULT_LOG_DIR
+
+
+def make_log_path(filename: str) -> str:
+    return os.path.join(ensure_log_dir(), filename)
+
+
+def display_path(path: str) -> str:
+    try:
+        return os.path.relpath(path, start=os.getcwd())
+    except Exception:
+        return path
+
+
 def is_qdrant_format_error(exc):
     """识别 Qdrant 400 JSON filter 格式错误（通常由无效条件或越界值触发）。"""
     msg = str(exc)
@@ -74,6 +96,35 @@ MAX_EVOLVED_FIELDS = 5
 # Schema Evolution: 是否为未回填行显式回写 NULL
 # 默认关闭：演进字段查询统一走 is_empty 语义，避免对全量点逐条 upsert 导致性能/一致性漂移。
 SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = False
+
+# 已知 Qdrant v1.17.0 在 int64 极值附近的 range 比较存在异常。
+# 通用 fuzz 默认不注入这些值，避免把已知 server bug 误判成新的逻辑错误。
+INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES = False
+KNOWN_UNSTABLE_INT64_VALUES = {
+    -(2 ** 63),
+    -(2 ** 63) + 1,
+    -(2 ** 63) + 2,
+    (2 ** 63) - 3,
+    (2 ** 63) - 2,
+    (2 ** 63) - 1,
+}
+
+
+def is_known_unstable_int64_value(value) -> bool:
+    try:
+        iv = int(value)
+    except Exception:
+        return False
+    return iv in KNOWN_UNSTABLE_INT64_VALUES
+
+
+def expr_mentions_known_unstable_int64(expr: str) -> bool:
+    if not expr:
+        return False
+    for token in re.findall(r"-?\d+", expr):
+        if is_known_unstable_int64_value(token):
+            return True
+    return False
 
 
 def evolved_field_use_empty_semantics() -> bool:
@@ -144,11 +195,14 @@ class DataManager:
         epoch_2025 = int(datetime(2025, 1, 1).timestamp())
 
         if ftype == FieldType.INT:
-            return [
+            pool = [
                 -self.int_range, -1, 0, 1, self.int_range,
                 -2147483648, 2147483647,
                 -9223372036854775807, 9223372036854775806
             ]
+            if not INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES:
+                pool = [v for v in pool if not is_known_unstable_int64_value(v)]
+            return pool
         if ftype == FieldType.FLOAT:
             return [
                 -0.0, 0.0, -1.0, 1.0,
@@ -197,11 +251,19 @@ class DataManager:
                 },
             ]
         if ftype == FieldType.ARRAY_INT:
-            return [
+            pool = [
                 [], [0], [-1, 0, 1],
                 [-2147483648, 2147483647],
                 [-9223372036854775807, 9223372036854775806]
             ]
+            if not INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES:
+                filtered = []
+                for arr in pool:
+                    if isinstance(arr, list) and any(is_known_unstable_int64_value(v) for v in arr):
+                        continue
+                    filtered.append(arr)
+                pool = filtered
+            return pool
         if ftype == FieldType.ARRAY_STR:
             return [
                 [], [""], [" ", "0", "A"],
@@ -1541,6 +1603,10 @@ class OracleQueryGenerator:
                 return boundary_val
 
         valid_series = self.df[fname].dropna()
+        if ftype == FieldType.INT and not valid_series.empty and not INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES:
+            valid_series = valid_series[
+                valid_series.apply(lambda x: not is_known_unstable_int64_value(self._convert_to_native(x)))
+            ]
         if not valid_series.empty and random.random() < 0.8:
             val = random.choice(valid_series.values)
             if hasattr(val, "item"): val = val.item()
@@ -1722,7 +1788,7 @@ class OracleQueryGenerator:
                 valid_vals = []
                 for x in self.df[name].dropna().unique()[:50]:
                     nx = self._normalize_int_scalar(self._convert_to_native(x))
-                    if nx is not None:
+                    if nx is not None and (INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES or not is_known_unstable_int64_value(nx)):
                         valid_vals.append(nx)
                 valid_vals = list(dict.fromkeys(valid_vals))
                 sample_size = min(random.randint(2, 6), len(valid_vals))
@@ -1742,7 +1808,7 @@ class OracleQueryGenerator:
                 valid_vals = []
                 for x in self.df[name].dropna().unique()[:50]:
                     nx = self._normalize_int_scalar(self._convert_to_native(x))
-                    if nx is not None:
+                    if nx is not None and (INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES or not is_known_unstable_int64_value(nx)):
                         valid_vals.append(nx)
                 valid_vals = list(dict.fromkeys(valid_vals))
                 sample_size = min(random.randint(2, 6), len(valid_vals))
@@ -4235,13 +4301,14 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
 
     # 2. 日志设置
     timestamp = int(time.time())
-    log_filename = f"qdrant_fuzz_test_{timestamp}.log"
-    print(f"\n📝 详细日志将写入: {log_filename}")
+    log_filename = make_log_path(f"qdrant_fuzz_test_{timestamp}.log")
+    print(f"\n📝 详细日志将写入: {display_path(log_filename)}")
     print(f"   🔑 如需复现此次测试，运行: python qdrant_fuzz_oracle.py --seed {current_seed}")
     print(f"🚀 开始测试 (控制台仅显示失败案例)...")
 
     qg = OracleQueryGenerator(dm)
     failed_cases = []
+    known_bug_cases = []
     total_test = rounds
 
     with open(log_filename, "w", encoding="utf-8") as f:
@@ -4322,6 +4389,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                 if expected_ids == actual_ids:
                     file_log("  -> MATCH")
                 else:
+                    known_boundary_bug = expr_mentions_known_unstable_int64(expr_str)
                     print(f"\n❌ [Test {i}] MISMATCH!")
                     print(f"   Expr: {expr_str}")
                     print(f"   Expected: {len(expected_ids)} vs Actual: {len(actual_ids)}")
@@ -4337,6 +4405,13 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
 
                     file_log(f"  -> MISMATCH! {diff_msg}")
                     file_log(f"  -> REPRODUCTION SEED: {current_seed}")
+                    if known_boundary_bug:
+                        known_msg = (
+                            "  -> KNOWN-BOUNDARY-BUG-CANDIDATE: expression mentions unstable int64 extreme "
+                            "literals; Qdrant v1.17.0 range comparisons near int64 limits are known unreliable."
+                        )
+                        print("   Note: known int64 extreme boundary bug candidate; do not classify this as logic-only evidence.")
+                        file_log(known_msg)
 
                     if missing:
                         missing_rows = sample_rows(missing)
@@ -4353,12 +4428,16 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                             print(f"     {r}")
                         print_diff_evidence(dm, qm, extra, "EXTRA (in Qdrant but not Pandas)", expr_str, file_log)
 
-                    failed_cases.append({
+                    case_payload = {
                         "id": i,
                         "expr": expr_str,
                         "detail": f"Exp: {len(expected_ids)} vs Act: {len(actual_ids)}. {diff_msg}",
                         "seed": current_seed
-                    })
+                    }
+                    if known_boundary_bug:
+                        known_bug_cases.append(case_payload)
+                    else:
+                        failed_cases.append(case_payload)
 
                 # 向量 + 标量联合校验
                 if expected_ids and random.random() < VECTOR_CHECK_RATIO:
@@ -4417,9 +4496,13 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
     print("\n" + "="*60)
     if not failed_cases:
         print(f"✅ 所有 {total_test} 轮测试全部通过！")
-        print(f"📄 详细记录请查看: {log_filename}")
+        if known_bug_cases:
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，未计入新的逻辑失败。")
+        print(f"📄 详细记录请查看: {display_path(log_filename)}")
     else:
         print(f"🚫 发现 {len(failed_cases)} 个失败案例！(已保存至日志)")
+        if known_bug_cases:
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，单独记录，不计入上述失败数。")
         print("-" * 60)
         for case in failed_cases:
             print(f"🔴 Case {case['id']}:")
@@ -4428,7 +4511,14 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
             if 'seed' in case:
                 print(f"   🔑 复现: python qdrant_fuzz_oracle.py --seed {case['seed']}")
             print("-" * 30)
-        print(f"📄 请查看 {log_filename} 获取完整上下文。")
+        for case in known_bug_cases:
+            print(f"🟡 KnownBoundary Case {case['id']}:")
+            print(f"   Expr: {case['expr']}")
+            print(f"   Issue: {case['detail']}")
+            if 'seed' in case:
+                print(f"   🔑 复现: python qdrant_fuzz_oracle.py --seed {case['seed']}")
+            print("-" * 30)
+        print(f"📄 请查看 {display_path(log_filename)} 获取完整上下文。")
         print(f"🔑 全局复现命令: python qdrant_fuzz_oracle.py --seed {current_seed}")
 
 
@@ -4451,12 +4541,12 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     _init_vector_check_config()
 
     timestamp = int(time.time())
-    log_filename = f"qdrant_equiv_test_{timestamp}.log"
+    log_filename = make_log_path(f"qdrant_equiv_test_{timestamp}.log")
     print("\n" + "="*60)
     print(f"👯 启动 Equivalence Mode (等价性测试)")
     print(f"   原理: Query(A) 应该等于 Query(Transformation(A))")
     print(f"   Seed: {seed}")
-    print(f"📄 日志: {log_filename}")
+    print(f"📄 日志: {display_path(log_filename)}")
     print("="*60)
 
     # 初始化
@@ -4474,6 +4564,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
     qg = EquivalenceQueryGenerator(dm)
     failed_cases = []
+    known_bug_cases = []
 
     with open(log_filename, "w", encoding="utf-8") as f:
         def file_log(msg):
@@ -4553,6 +4644,10 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                     if base_ids == mut_ids:
                         file_log(f"  ✅ [{m_type}] Match")
                     else:
+                        known_boundary_bug = (
+                            expr_mentions_known_unstable_int64(base_expr)
+                            or expr_mentions_known_unstable_int64(m_expr)
+                        )
                         print(f"\n\n❌ EQUIVALENCE FAILURE [Test {i}]")
                         print(f"   Type: {m_type}")
                         print(f"   Base Expr: {base_expr}")
@@ -4569,6 +4664,11 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
                         file_log(f"  ❌ [{m_type}] FAIL! {diff_msg}")
                         file_log(f"     Mut Expr: {m_expr}")
+                        if known_boundary_bug:
+                            file_log(
+                                "     KNOWN-BOUNDARY-BUG-CANDIDATE: base or mutation expression mentions unstable "
+                                "int64 extreme literals; do not classify this as a pure logic rewrite failure."
+                            )
 
                         # 详细证据对比
                         if missing:
@@ -4576,13 +4676,17 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                         if extra:
                             print_diff_evidence(dm, qm, extra, f"Mutation EXTRA [{m_type}]", m_expr, file_log)
 
-                        failed_cases.append({
+                        case_payload = {
                             "id": i,
                             "type": m_type,
                             "base": base_expr,
                             "mut": m_expr,
                             "diff": diff_msg
-                        })
+                        }
+                        if known_boundary_bug:
+                            known_bug_cases.append(case_payload)
+                        else:
+                            failed_cases.append(case_payload)
 
                 except Exception as e:
                     if is_qdrant_format_error(e):
@@ -4597,8 +4701,13 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     print("\n" + "="*60)
     if failed_cases:
         print(f"🚫 发现 {len(failed_cases)} 个等价性错误！请检查日志。")
+        if known_bug_cases:
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，未计入新的等价性错误。")
     else:
         print(f"✅ 所有等价性测试通过。")
+        if known_bug_cases:
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，未计入新的等价性错误。")
+    print(f"📄 详细日志请查看: {display_path(log_filename)}")
 
 
 def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
@@ -4621,11 +4730,11 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     _init_vector_check_config()
 
     timestamp = int(time.time())
-    log_filename = f"qdrant_pqs_test_{timestamp}.log"
+    log_filename = make_log_path(f"qdrant_pqs_test_{timestamp}.log")
     print("\n" + "="*60)
     print(f"🚀 启动 PQS (Pivot Query Synthesis) 模式测试")
     print(f"   Seed: {seed}")
-    print(f"📄 详细日志将写入: {log_filename}")
+    print(f"📄 详细日志将写入: {display_path(log_filename)}")
     print("="*60)
 
     # 初始化
@@ -4779,7 +4888,9 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             print(f"⚠️  警告：没有成功执行任何测试（全部跳过）")
     else:
         print(f"🚫 PQS 测试完成。发现 {len(errors)} 个潜在 Bug！")
-        print(f"📄 详细数据已记录至日志: {log_filename}")
+        print(f"📄 详细数据已记录至日志: {display_path(log_filename)}")
+    if not errors:
+        print(f"📄 详细日志请查看: {display_path(log_filename)}")
 
 
 def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
@@ -4802,11 +4913,11 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
     _init_vector_check_config()
 
     timestamp = int(time.time())
-    log_filename = f"qdrant_group_test_{timestamp}.log"
+    log_filename = make_log_path(f"qdrant_group_test_{timestamp}.log")
     print("\n" + "="*60)
     print(f"📊 启动 GroupBy 逻辑专项测试")
     print(f"   Seed: {seed}")
-    print(f"   日志: {log_filename}")
+    print(f"   日志: {display_path(log_filename)}")
     print("="*60)
 
     # 初始化
@@ -4912,6 +5023,7 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
         print(f"✅ GroupBy 测试完成。未发现显式逻辑违规。")
     else:
         print(f"🚫 GroupBy 测试发现 {len(errors)} 个问题！请查看日志。")
+    print(f"📄 详细日志请查看: {display_path(log_filename)}")
 
 
 # ---------------------------------------------------------------------------
@@ -4991,6 +5103,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Schema Evolution 时为未回填行显式写入 NULL（演进字段采用严格 IsNull 语义）",
     )
+    p.add_argument(
+        "--include-known-int64-boundaries",
+        action="store_true",
+        help="允许通用 fuzz 注入已知不稳定的 int64 极值边界（默认关闭，以减少误报）",
+    )
 
     return p.parse_args(argv)
 
@@ -4999,6 +5116,7 @@ def main(argv: list[str] | None = None) -> None:
     global CHAOS_RATE
     global SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC
     global HOST, PORT, GRPC_PORT, PREFER_GRPC
+    global INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES
 
     args = parse_args(argv)
 
@@ -5009,6 +5127,7 @@ def main(argv: list[str] | None = None) -> None:
         CHAOS_RATE = 0.1
 
     SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = bool(args.evo_null_sync)
+    INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES = bool(args.include_known_int64_boundaries)
     HOST = args.host
     PORT = int(args.port)
     GRPC_PORT = int(args.grpc_port)
@@ -5030,6 +5149,14 @@ def main(argv: list[str] | None = None) -> None:
         "   演进空值语义: "
         + ("严格 IsNull（显式NULL回填）" if SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC else "IsEmpty（缺失/null/[]统一）")
     )
+    if not INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES:
+        print("   已知边界保护: 通用 fuzz 默认跳过已知不稳定的 int64 极值附近字面量")
+    if args.dynamic:
+        effective_rounds = args.pqs_rounds if args.mode == "pqs" else args.rounds
+        if effective_rounds < 30:
+            print("   ⚠️  提示: 当前 dynamic 轮次 < 30，Schema Evolution 不会触发，missing-field 语义覆盖有限")
+        else:
+            print("   Missing覆盖: 将在第 30 轮触发 Schema Evolution，覆盖真正 missing field 路径")
     print("=" * 80)
 
     # Dispatch
