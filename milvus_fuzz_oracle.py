@@ -7,6 +7,7 @@ Features:
 4. Robust Query: Handles Bool/String types correctly.
 """
 import time
+import os
 import random
 import string
 import numpy as np
@@ -17,6 +18,25 @@ from pymilvus import (
 )
 import sys
 import argparse
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "milvus_log")
+
+
+def ensure_log_dir():
+    os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
+    return DEFAULT_LOG_DIR
+
+
+def make_log_path(filename):
+    return os.path.join(ensure_log_dir(), filename)
+
+
+def display_path(path):
+    try:
+        return os.path.relpath(path, start=os.getcwd())
+    except Exception:
+        return path
 
 # --- Configuration (User Specified) ---
 HOST = "127.0.0.1"
@@ -2680,12 +2700,12 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
 
     # --- 日志设置 ---
     timestamp = int(time.time())
-    log_filename = f"equiv_test_{timestamp}.log"
+    log_filename = make_log_path(f"equiv_test_{timestamp}.log")
     print("\n" + "="*60)
     print(f"👯 启动 Equivalence Mode (等价性测试)")
     print(f"   原理: Query(A) 应该等于 Query(Transformation(A))")
     print(f"   Seed: {seed}")
-    print(f"📄 日志: {log_filename}")
+    print(f"📄 日志: {display_path(log_filename)}")
     print("="*60)
 
     # 1. 初始化
@@ -3053,8 +3073,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
 
     # 2. 日志设置
     timestamp = int(time.time())
-    log_filename = f"fuzz_test_{timestamp}.log"
-    print(f"\n📝 详细日志将写入: {log_filename}")
+    log_filename = make_log_path(f"fuzz_test_{timestamp}.log")
+    print(f"\n📝 详细日志将写入: {display_path(log_filename)}")
     print(f"   🔑 如需复现此次测试，运行: python milvus_fuzz_oracle.py --seed {current_seed}")
     print(f"🚀 开始测试 (控制台仅显示失败案例)...")
 
@@ -3716,7 +3736,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
     print("\n" + "="*60)
     if not failed_cases:
         print(f"✅ 所有 {total_test} 轮测试全部通过！")
-        print(f"📄 详细记录请查看: {log_filename}")
+        print(f"📄 详细记录请查看: {display_path(log_filename)}")
     else:
         print(f"🚫 发现 {len(failed_cases)} 个失败案例！(已保存至日志)")
         print("-" * 60)
@@ -3728,7 +3748,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
             if 'seed' in case:
                 print(f"   🔑 复现: python milvus_fuzz_oracle.py --seed {case['seed']}")
             print("-" * 30)
-        print(f"📄 请查看 {log_filename} 获取完整上下文。")
+        print(f"📄 请查看 {display_path(log_filename)} 获取完整上下文。")
         print(f"🔑 全局复现命令: python milvus_fuzz_oracle.py --seed {current_seed}")
 
 class PQSQueryGenerator(OracleQueryGenerator):
@@ -4586,10 +4606,10 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
 
     # --- 日志设置 ---
     timestamp = int(time.time())
-    log_filename = f"pqs_test_{timestamp}.log"
+    log_filename = make_log_path(f"pqs_test_{timestamp}.log")
     print("\n" + "="*60)
     print(f"🚀 启动 PQS (Pivot Query Synthesis) 模式测试")
-    print(f"📄 详细日志将写入: {log_filename}")
+    print(f"📄 详细日志将写入: {display_path(log_filename)}")
     print("="*60)
 
     # 1. 初始化
@@ -4933,7 +4953,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
         print(f"✅ PQS 测试完成。未发现错误。")
     else:
         print(f"🚫 PQS 测试完成。发现 {len(errors)} 个潜在 Bug！")
-        print(f"📄 详细数据已记录至日志: {log_filename}")
+        print(f"📄 详细数据已记录至日志: {display_path(log_filename)}")
 
 def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     """
@@ -4956,10 +4976,10 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     print(f"   标量索引概率: {SCALAR_INDEX_PROBABILITY:.2f}")
     
     timestamp = int(time.time())
-    log_filename = f"groupby_test_{timestamp}.log"
+    log_filename = make_log_path(f"groupby_test_{timestamp}.log")
     print("\n" + "="*60)
     print(f"📊 启动 GroupBy 逻辑专项测试")
-    print(f"   日志: {log_filename}")
+    print(f"   日志: {display_path(log_filename)}")
     print("="*60)
 
     # 1. 初始化 (复用现有的 Manager)
