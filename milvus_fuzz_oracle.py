@@ -1285,6 +1285,86 @@ class OracleQueryGenerator:
         return ''.join(random.choices(chars, k=random.randint(min_len, max_len)))
 
     @staticmethod
+    def _to_native_scalar(value):
+        return value.item() if hasattr(value, "item") else value
+
+    @staticmethod
+    def _is_numeric_scalar(value):
+        return isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(
+            value, (bool, np.bool_)
+        )
+
+    def _format_scalar_literal(self, value):
+        value = self._to_native_scalar(value)
+        if isinstance(value, (bool, np.bool_)):
+            return str(bool(value)).lower()
+        if isinstance(value, str):
+            safe = value.replace("\\", "\\\\").replace('"', '\\"')
+            return f'"{safe}"'
+        return str(value)
+
+    def _scalar_values_equal(self, left, right):
+        left = self._to_native_scalar(left)
+        right = self._to_native_scalar(right)
+        if left is None or right is None:
+            return False
+        if self._is_numeric_scalar(left) and self._is_numeric_scalar(right):
+            return left == right
+        return type(left) == type(right) and left == right
+
+    def _build_membership_candidates(self, value, include_value=True):
+        value = self._to_native_scalar(value)
+        if value is None:
+            return []
+
+        items = [value] if include_value else []
+        noise = []
+
+        if isinstance(value, (bool, np.bool_)):
+            noise = [not bool(value)]
+        elif isinstance(value, str):
+            base = value if value else "x"
+            noise = [f"{base}_alt", self._random_string(max(3, len(base)), max(4, len(base) + 2))]
+        elif isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
+            base = int(value)
+            noise = [base + 1, base - 1 if base != -1 else base + 2]
+        elif isinstance(value, (float, np.floating)):
+            base = float(value)
+            delta = 1.0 if abs(base) < 1e6 else max(1.0, abs(base) * 0.01)
+            noise = [base + delta, base - delta]
+
+        for candidate in noise:
+            candidate = self._to_native_scalar(candidate)
+            if any(self._scalar_values_equal(candidate, existing) for existing in items):
+                continue
+            items.append(candidate)
+
+        if not include_value:
+            items = [item for item in items if not self._scalar_values_equal(item, value)]
+
+        return items[:3]
+
+    def _gen_true_membership_strategies(self, fname, value):
+        value = self._to_native_scalar(value)
+        if value is None or isinstance(value, (dict, list)):
+            return []
+        if isinstance(value, float) and (np.isnan(value) or np.isinf(value)):
+            return []
+
+        strategies = []
+        include_items = self._build_membership_candidates(value, include_value=True)
+        exclude_items = self._build_membership_candidates(value, include_value=False)
+
+        if include_items:
+            in_list = ", ".join(self._format_scalar_literal(item) for item in include_items)
+            strategies.append(f"{fname} in [{in_list}]")
+        if exclude_items:
+            not_in_list = ", ".join(self._format_scalar_literal(item) for item in exclude_items)
+            strategies.append(f"not ({fname} in [{not_in_list}])")
+
+        return strategies
+
+    @staticmethod
     def _float_safe_range(result, is_float32):
         """
         生成经过 Milvus FLOAT 字面量隐式降精度后仍然正确的范围边界。
@@ -1773,39 +1853,73 @@ class OracleQueryGenerator:
                 if isinstance(query_val, (int, float, str, bool)):
                     path_str = "".join([f'["{p}"]' if isinstance(p, str) else f'[{p}]' for p in path_keys])
 
-                    # [WORKAROUND: Milvus JSON != Bug]
-                    # Milvus 已确认 Bug: JSON 键缺失/值为 null 时 != 返回 TRUE (应为 FALSE/UNKNOWN)
-                    # 原始代码:
-                    #   if isinstance(query_val, bool):
-                    #       op = random.choice(["==", "!="])
-                    #   else:
-                    #       op = random.choice(["==", "!=", ">", "<", ">=", "<="])
+                    membership_ops = ["in", "not in"]
                     if isinstance(query_val, bool):
-                        op = "=="
+                        op = random.choice(["=="] + membership_ops)
                     else:
-                        op = random.choice(["==", ">", "<", ">=", "<="])
+                        op = random.choice(["==", ">", "<", ">=", "<="] + membership_ops)
 
-                    if isinstance(query_val, bool): val_str = str(query_val).lower()
-                    elif isinstance(query_val, str): val_str = f'"{query_val}"'
-                    else: val_str = str(query_val)
+                    if op in {"in", "not in"}:
+                        include_value = (op == "in")
+                        targets = self._build_membership_candidates(query_val, include_value=include_value)
+                        if not targets:
+                            return (f"{name} is not null", milvus_notnull_mask(series))
 
-                    expr = f'{name}{path_str} {op} {val_str}'
+                        list_str = ", ".join(self._format_scalar_literal(item) for item in targets)
+                        expr_in = f'{name}{path_str} in [{list_str}]'
 
-                    # --- 🛡️ JSON 安全比较 ---
-                    # 【关键修复】使用默认参数绑定，避免闭包捕获问题
-                    def safe_check_json(x, _path_keys=path_keys, _op=op, _query_val=query_val):
-                        try:
-                            if x is None: return None  # 整个JSON字段为NULL → UNKNOWN (3VL)
-                            v = self._get_json_val(x, _path_keys)
+                        def safe_check_json_in(x, _path_keys=path_keys, _targets=tuple(targets)):
+                            try:
+                                if x is None:
+                                    return None  # 整个JSON字段为NULL → UNKNOWN (3VL)
+                                v = self._get_json_val(x, _path_keys)
 
-                            # (A) 基础判空 — 键不存在于非空JSON → Milvus返回FALSE(2VL)
-                            if v is None:
+                                # 维持当前 fuzzer 的 JSON 下钻约定：
+                                # 缺失键/路径不存在于非空 JSON 中时，inner IN 结果按 FALSE 处理。
+                                if v is None:
+                                    return False
+
+                                return any(self._scalar_values_equal(v, t) for t in _targets)
+                            except:
                                 return False
 
-                            is_v_num = isinstance(v, (int, float)) and not isinstance(v, bool)
-                            is_q_num = isinstance(_query_val, (int, float)) and not isinstance(_query_val, bool)
+                        inner_mask = series.apply(safe_check_json_in).astype("boolean")
+                        if op == "in":
+                            expr = expr_in
+                            mask = inner_mask
+                        else:
+                            expr = f"not ({expr_in})"
+                            mask = ~inner_mask
+                    else:
+                        val_str = self._format_scalar_literal(query_val)
+                        expr = f'{name}{path_str} {op} {val_str}'
 
-                            if is_v_num and is_q_num:
+                        # --- 🛡️ JSON 安全比较 ---
+                        # 【关键修复】使用默认参数绑定，避免闭包捕获问题
+                        def safe_check_json(x, _path_keys=path_keys, _op=op, _query_val=query_val):
+                            try:
+                                if x is None: return None  # 整个JSON字段为NULL → UNKNOWN (3VL)
+                                v = self._get_json_val(x, _path_keys)
+
+                                # (A) 基础判空 — 键不存在于非空JSON → Milvus返回FALSE(2VL)
+                                if v is None:
+                                    return False
+
+                                is_v_num = isinstance(v, (int, float)) and not isinstance(v, bool)
+                                is_q_num = isinstance(_query_val, (int, float)) and not isinstance(_query_val, bool)
+
+                                if is_v_num and is_q_num:
+                                    if _op == "==": return v == _query_val
+                                    if _op == "!=": return v != _query_val
+                                    if _op == ">": return v > _query_val
+                                    if _op == "<": return v < _query_val
+                                    if _op == ">=": return v >= _query_val
+                                    if _op == "<=": return v <= _query_val
+                                    return False
+
+                                if type(v) != type(_query_val):
+                                    return False  # 类型不匹配 → Milvus返回FALSE
+
                                 if _op == "==": return v == _query_val
                                 if _op == "!=": return v != _query_val
                                 if _op == ">": return v > _query_val
@@ -1813,21 +1927,10 @@ class OracleQueryGenerator:
                                 if _op == ">=": return v >= _query_val
                                 if _op == "<=": return v <= _query_val
                                 return False
+                            except:
+                                return False  # JSON访问异常 → Milvus返回FALSE
 
-                            if type(v) != type(_query_val):
-                                return False  # 类型不匹配 → Milvus返回FALSE
-
-                            if _op == "==": return v == _query_val
-                            if _op == "!=": return v != _query_val
-                            if _op == ">": return v > _query_val
-                            if _op == "<": return v < _query_val
-                            if _op == ">=": return v >= _query_val
-                            if _op == "<=": return v <= _query_val
-                            return False
-                        except:
-                            return False  # JSON访问异常 → Milvus返回FALSE
-
-                    mask = series.apply(safe_check_json).astype("boolean")
+                        mask = series.apply(safe_check_json).astype("boolean")
                 else:
                     return (f"{name} is not null", milvus_notnull_mask(series))
 
@@ -4044,6 +4147,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         strategies.append(f"{fname} == {val}")
         strategies.append(f"{fname} >= {val}")
         strategies.append(f"{fname} <= {val}")
+        strategies.extend(self._gen_true_membership_strategies(fname, val))
 
         # 1.5 当值刚好是类型边界时，生成更具针对性的策略
         ftype = self._get_field_type(fname) if '"' not in fname else None
@@ -4238,6 +4342,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         random.shuffle(candidates)
         in_list = ", ".join([f'"{s}"' for s in candidates])
         strategies.append(f'{fname} in [{in_list}]')
+        strategies.extend(self._gen_true_membership_strategies(fname, val))
 
         return random.choice(strategies)
 
@@ -4349,13 +4454,9 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         # Case 3: 标量值 (Scalar) -> 调用高强度边界测试
         if isinstance(current, bool):
-            val_str = str(current).lower()
-            # [WORKAROUND: Milvus JSON != Bug]
-            # 原始代码:
-            #   op = random.choice(["==", "!="])
-            #   if op == "!=": return f"{full_field} != {str(not current).lower()}"
-            #   else: return f"{full_field} == {val_str}"
-            return f"{full_field} == {val_str}"
+            strategies = [f"{full_field} == {str(current).lower()}"]
+            strategies.extend(self._gen_true_membership_strategies(full_field, current))
+            return random.choice(strategies)
 
         elif isinstance(current, int):
             return self._gen_boundary_int(full_field, current)
