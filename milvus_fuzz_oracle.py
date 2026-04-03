@@ -10,6 +10,7 @@ import time
 import os
 import random
 import string
+import re
 import numpy as np
 import pandas as pd
 import json
@@ -1303,6 +1304,71 @@ class OracleQueryGenerator:
             return f'"{safe}"'
         return str(value)
 
+    @staticmethod
+    def _escape_string_literal(value):
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _like_pattern_to_regex(pattern):
+        pieces = ["^"]
+        for ch in pattern:
+            if ch == "%":
+                pieces.append(".*")
+            elif ch == "_":
+                pieces.append(".")
+            else:
+                pieces.append(re.escape(ch))
+        pieces.append("$")
+        return "".join(pieces)
+
+    def _like_matches(self, value, pattern):
+        value = self._to_native_scalar(value)
+        pattern = self._to_native_scalar(pattern)
+        if not isinstance(value, str) or not isinstance(pattern, str):
+            return False
+        try:
+            return bool(re.match(self._like_pattern_to_regex(pattern), value))
+        except re.error:
+            return False
+
+    def _build_true_like_patterns(self, value):
+        value = self._to_native_scalar(value)
+        if not isinstance(value, str) or value == "":
+            return []
+
+        # 保守策略：当原值本身带有通配/转义敏感字符时，不扩展 LIKE。
+        if any(ch in value for ch in ['"', "'", "\\", "%", "_"]):
+            return []
+
+        patterns = []
+
+        def add(pattern):
+            if not isinstance(pattern, str) or pattern == "":
+                return
+            if not pattern.strip("%_"):
+                return
+            if pattern not in patterns:
+                patterns.append(pattern)
+
+        prefix_len = max(1, min(len(value), len(value) // 2 or 1))
+        suffix_len = max(1, min(len(value), len(value) // 2 or 1))
+        add(value[:prefix_len] + "%")
+        add("%" + value[-suffix_len:])
+
+        if len(value) >= 3:
+            inner = value[1:-1]
+            if inner:
+                add(f"%{inner}%")
+
+        if len(value) >= 2:
+            pos = len(value) // 2
+            add(f"{value[:pos]}_{value[pos + 1:]}")
+
+        if len(value) >= 4:
+            add(f"_{value[1:-1]}%")
+
+        return patterns
+
     def _scalar_values_equal(self, left, right):
         left = self._to_native_scalar(left)
         right = self._to_native_scalar(right)
@@ -1653,8 +1719,14 @@ class OracleQueryGenerator:
                     )
                 except Exception:
                     target_set = set()
+            elif op == "like":
+                try:
+                    like_re = re.compile(self._like_pattern_to_regex(str(target_val)))
+                except re.error:
+                    like_re = None
             else:
                 target_set = None
+                like_re = None
             def comp(x):
                 # 3VL: NULL 比较返回 Unknown
                 if x is None: return None
@@ -1665,6 +1737,10 @@ class OracleQueryGenerator:
                         return x in target_set
                     if op == "not in":
                         return x not in target_set
+                    if op == "like":
+                        if like_re is None or not isinstance(x, str):
+                            return False
+                        return bool(like_re.match(x))
                     if op == "==": return x == target_val
                     if op == "!=": return x != target_val
                     if op == ">": return x > target_val
@@ -1760,11 +1836,14 @@ class OracleQueryGenerator:
         elif ftype == DataType.VARCHAR:
             op = random.choice(["==", "!=", ">", "<", "like", "in", "not in"])
             if op == "like":
-                raw_p = val[0] if val else 'a'
-                p = 'a' if raw_p in ['%', '_'] else raw_p
-                expr = f'{name} like "{p}%"'
-                base_mask = series.astype(str).str.startswith(p)
-                mask = base_mask.astype("boolean").where(series.notnull(), pd.NA)
+                patterns = self._build_true_like_patterns(val)
+                if not patterns:
+                    expr = f'{name} == "{self._escape_string_literal(val)}"'
+                    mask = series.apply(safe_compare_scalar("==", val)).astype("boolean")
+                else:
+                    pattern = random.choice(patterns)
+                    expr = f'{name} like "{self._escape_string_literal(pattern)}"'
+                    mask = series.apply(safe_compare_scalar("like", pattern)).astype("boolean")
             elif op in {"in", "not in"}:
                 items = _sample_in_list(max_items=5)
                 if not items:
@@ -1856,6 +1935,12 @@ class OracleQueryGenerator:
                     membership_ops = ["in", "not in"]
                     if isinstance(query_val, bool):
                         op = random.choice(["=="] + membership_ops)
+                    elif isinstance(query_val, str):
+                        like_patterns = self._build_true_like_patterns(query_val)
+                        op_choices = ["==", ">", "<", ">=", "<="] + membership_ops
+                        if like_patterns:
+                            op_choices.append("like")
+                        op = random.choice(op_choices)
                     else:
                         op = random.choice(["==", ">", "<", ">=", "<="] + membership_ops)
 
@@ -1891,12 +1976,17 @@ class OracleQueryGenerator:
                             expr = f"not ({expr_in})"
                             mask = ~inner_mask
                     else:
-                        val_str = self._format_scalar_literal(query_val)
-                        expr = f'{name}{path_str} {op} {val_str}'
+                        compare_val = query_val
+                        if op == "like":
+                            compare_val = random.choice(like_patterns)
+                            expr = f'{name}{path_str} like "{self._escape_string_literal(compare_val)}"'
+                        else:
+                            val_str = self._format_scalar_literal(compare_val)
+                            expr = f'{name}{path_str} {op} {val_str}'
 
                         # --- 🛡️ JSON 安全比较 ---
                         # 【关键修复】使用默认参数绑定，避免闭包捕获问题
-                        def safe_check_json(x, _path_keys=path_keys, _op=op, _query_val=query_val):
+                        def safe_check_json(x, _path_keys=path_keys, _op=op, _query_val=compare_val):
                             try:
                                 if x is None: return None  # 整个JSON字段为NULL → UNKNOWN (3VL)
                                 v = self._get_json_val(x, _path_keys)
@@ -1904,6 +1994,9 @@ class OracleQueryGenerator:
                                 # (A) 基础判空 — 键不存在于非空JSON → Milvus返回FALSE(2VL)
                                 if v is None:
                                     return False
+
+                                if _op == "like":
+                                    return self._like_matches(v, _query_val)
 
                                 is_v_num = isinstance(v, (int, float)) and not isinstance(v, bool)
                                 is_q_num = isinstance(_query_val, (int, float)) and not isinstance(_query_val, bool)
@@ -4539,88 +4632,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
         针对字符串生成复杂的 LIKE 查询。
         覆盖: 前缀、后缀、包含、单字符通配符(_)。
         """
-        # 基础检查和预处理
-        if not isinstance(val, str):
+        patterns = self._build_true_like_patterns(val)
+        if not patterns:
             return None
-
-        # 简化处理：长度太短或包含复杂转义字符时，使用相等查询
-        if len(val) < 3:
-            return None
-
-    # 【关键修正】处理特殊字符：引号、反斜杠和通配符
-    # 如果包含这些特殊字符，直接使用相等查询避免复杂转义
-        if any(c in val for c in ['"', "'", "\\", "%", "_"]):
-            safe_val = val.replace('\\', '\\\\').replace('"', '\\"').replace("'", "\\'")
-            return f'{fname} == "{safe_val}"'
-
-        # 随机选择 LIKE 策略
-        strategy = random.choice(["prefix", "suffix", "contains", "underscore", "mixed"])
-
-        # 根据策略生成模式
-        try:
-            if strategy == "prefix":
-                # "abcde" -> "ab%"
-                cut_len = random.randint(1, len(val) - 1)
-                pat = val[:cut_len] + "%"
-
-            elif strategy == "suffix":
-                # "abcde" -> "%de"
-                cut_len = random.randint(1, len(val) - 1)
-                pat = "%" + val[-cut_len:]
-
-            elif strategy == "contains":
-                # "abcde" -> "%bc%"
-                if len(val) >= 4:
-                    start = random.randint(0, len(val) - 3)
-                    end = random.randint(start + 2, len(val))
-                    pat = "%" + val[start:end] + "%"
-                else:
-                    pat = val[:len(val)-1] + "%"
-
-            elif strategy == "underscore":
-                # "abcde" -> "ab_de"
-                if len(val) >= 2:
-                    pos = random.randint(0, len(val) - 1)
-                    pat = val[:pos] + "_" + val[pos+1:]
-                else:
-                    pat = "_"
-
-            else:  # mixed
-                # "abcde" -> "_b%e"
-                if len(val) >= 4:
-                    parts = []
-                    remaining = val
-                    split_point = random.randint(1, len(val) - 2)
-
-                    # 1. 用 _ 替换首字符: "A..." -> "_..."
-                    parts.append("_" + remaining[1:split_point])
-
-                    # 2. 中间部分，50%概率插入 %
-                    if random.choice([True, False]):
-                        parts.append(remaining[split_point:-1])
-                    else:
-                        parts.append(remaining[split_point:-1] + "%")
-
-                    # 3. 尾字符
-                    parts.append(remaining[-1])
-                    pat = "".join(parts)
-                else:
-                    pat = val[0] + "%" + val[-1] if len(val) >= 2 else "%"
-
-        except Exception:
-            # 兜底：任何生成错误都回退到相等
-            safe_val = val.replace('"', '\\"')
-            return f'{fname} == "{safe_val}"'
-
-        # 安全转义构造出的模式
-        safe_pat = pat.replace('"', '\\"')
-
-        # 确保模式有效
-        if not safe_pat.strip("%_"):
-            safe_val = val.replace('"', '\\"')
-            return f'{fname} == "{safe_val}"'
-
-        return f'{fname} like "{safe_pat}"'
+        pat = random.choice(patterns)
+        return f'{fname} like "{self._escape_string_literal(pat)}"'
 
     def _gen_pqs_json(self, fname, json_obj):
         """
