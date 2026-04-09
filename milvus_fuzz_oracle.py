@@ -41,7 +41,7 @@ def display_path(path):
 
 # --- Configuration (User Specified) ---
 HOST = "127.0.0.1"
-PORT = "19531"           # 你的自定义端口
+PORT = "19532"           # 你的自定义端口
 COLLECTION_NAME = "fuzz_stable_v3"
 VECTOR_INDEX_NAME = "vector_idx"  # 显式命名向量索引，避免多索引时 AmbiguousIndexName
 N = 5000                 # 数据量（磁盘满了，先用 1000 测试功能）
@@ -207,6 +207,50 @@ def milvus_notnull_mask(series):
     """返回一个 boolean mask，True 表示该值在 Milvus 中被视为非 null。
     用于替代 series.notnull()，并与当前观测到的 Milvus 语义保持一致。"""
     return (~series.apply(milvus_is_empty)).astype("boolean")
+
+
+def milvus_json_value_has_content(val):
+    """Observed local exists semantics: explicit null and empty/all-null containers do not exist."""
+    if hasattr(val, "item"):
+        try:
+            val = val.item()
+        except Exception:
+            pass
+
+    if milvus_is_empty(val):
+        return False
+    if isinstance(val, (bool, int, float, str)):
+        return True
+    if isinstance(val, dict):
+        return any(milvus_json_value_has_content(item) for item in val.values())
+    if isinstance(val, (list, np.ndarray)):
+        return any(milvus_json_value_has_content(item) for item in val)
+    return False
+
+
+def milvus_json_path_exists(obj, keys):
+    """Follow a JSON path and apply the locally observed exists semantics to the resolved value."""
+    if milvus_is_empty(obj):
+        return False
+
+    current = obj
+    for key in keys:
+        if hasattr(current, "item"):
+            try:
+                current = current.item()
+            except Exception:
+                return False
+
+        if isinstance(key, int):
+            if not isinstance(current, list) or key < 0 or key >= len(current):
+                return False
+            current = current[key]
+        else:
+            if not isinstance(current, dict) or key not in current:
+                return False
+            current = current[key]
+
+    return milvus_json_value_has_content(current)
 
 
 def is_json_contains_candidate(val):
@@ -1927,10 +1971,7 @@ class OracleQueryGenerator:
                 expr = f'exists({name}["{tk}"])'
                 # 【修复】使用默认参数绑定
                 def check_exists(x, _tk=tk):
-                    if x is None: return False
-                    if not isinstance(x, dict): return False
-                    # 探测结果 V1: exists 排除了显式 Null 值
-                    return _tk in x and x[_tk] is not None
+                    return milvus_json_path_exists(x, [_tk])
                 mask = series.apply(check_exists).astype("boolean")
 
             # --- 策略 B: json_contains 查询 ---
@@ -4066,20 +4107,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         递归检查对象是否包含至少一个非 Null 的标量。
         解决 {"a": null} 或 [null] 被 Milvus 视为不存在的问题。
         """
-        if obj is None:
-            return False
-        if isinstance(obj, (int, float, str, bool)):
-            return True
-        if hasattr(obj, "item"): # Numpy scalar
-            return True
-
-        # 递归检查容器
-        if isinstance(obj, dict):
-            return any(self._has_valid_content(v) for v in obj.values())
-        if isinstance(obj, (list, np.ndarray)):
-            return any(self._has_valid_content(v) for v in obj)
-
-        return False
+        return milvus_json_value_has_content(obj)
 
     def gen_multi_field_true_expr(self, row, n=None, min_fields=2, prefer_non_id=True):
         """
