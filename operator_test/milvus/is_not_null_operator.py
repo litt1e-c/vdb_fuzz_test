@@ -12,7 +12,7 @@ from pymilvus import (
 
 HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
 PORT = os.getenv("MILVUS_PORT", "19531")
-COLLECTION_NAME = "is_null_operator_validation"
+COLLECTION_NAME = "is_not_null_operator_validation"
 
 
 def query_ids(collection, expr):
@@ -88,21 +88,9 @@ def main():
         tests = [
             (
                 "normal",
-                "scalar_is_null",
-                "scalar_txt is null",
-                [2, 3],
-            ),
-            (
-                "normal",
                 "scalar_is_not_null",
                 "scalar_txt is not null",
                 [1, 4, 5],
-            ),
-            (
-                "normal",
-                "json_is_null",
-                "meta is null",
-                [2, 3],
             ),
             (
                 "normal",
@@ -112,21 +100,9 @@ def main():
             ),
             (
                 "normal",
-                "array_is_null",
-                "tags is null",
-                [2, 3],
-            ),
-            (
-                "normal",
                 "array_is_not_null",
                 "tags is not null",
                 [1, 4, 5],
-            ),
-            (
-                "normal",
-                "json_path_is_null_observed",
-                'meta["role"] is null',
-                [2, 3, 4, 5],
             ),
             (
                 "normal",
@@ -136,19 +112,13 @@ def main():
             ),
             (
                 "expected_error",
-                "array_subscript_is_null_unsupported",
-                "tags[0] is null",
-                None,
-            ),
-            (
-                "expected_error",
                 "array_subscript_is_not_null_unsupported",
                 "tags[0] is not null",
                 None,
             ),
         ]
 
-        print("--- IS NULL operator validation ---")
+        print("--- IS NOT NULL operator validation ---")
         for mode, name, expr, expected_ids in tests:
             try:
                 actual_ids = query_ids(col, expr)
