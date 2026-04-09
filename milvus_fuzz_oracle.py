@@ -455,7 +455,8 @@ def reconcile_pandas_oracle_with_milvus(mm, dm, file_log=None, reason="unknown")
                 dm.vectors = vec_arr
             added = len(new_rows)
 
-    # 对齐后做一次空值语义规范化，避免 {} / [] 引发 Oracle 偏差
+    # 对齐后做一次空值语义规范化，仅将当前 Milvus 语义下的 null 值
+    #（None / NaN）规范化为 None，同时保留 {} / [] 作为非 null 值。
     normalize_empty_to_none(dm.df, dm.schema_config)
 
     if added or dropped:
@@ -555,11 +556,10 @@ class DataManager:
             elif ftype == DataType.ARRAY:
                 # 与schema中的array_capacity一致
                 elem_type = field.get("element_type", DataType.INT64)
-                arr_len = rng.integers(1, min(self.array_capacity, 10) + 1)
+                arr_len = rng.integers(0, min(self.array_capacity, 10) + 1)
                 arr_val = self._gen_array_data(rng, elem_type, arr_len)
-                # Milvus 将 [] 视为 null，不放入 row（同 None 处理）
-                if arr_val:
-                    row[fname] = arr_val
+                # 当前本地验证下，字段级空数组 [] 是非 null，动态写入时应保留。
+                row[fname] = arr_val
         return row
 
     def generate_single_vector(self):
@@ -790,8 +790,8 @@ class DataManager:
             data[fname] = temp_arr
 
         self.df = pd.DataFrame(data)
-        # 【关键】Milvus 将空数组 [] 和空 JSON {} 视为 null
-        # 规范化 pandas 数据使 Oracle 模型与 Milvus 一致
+        # 规范化 pandas 数据使 Oracle 模型与当前验证过的字段级 Milvus 语义一致：
+        # 仅 None / NaN 视为 null，空数组 [] 与空 JSON {} 保持非 null。
         normalize_empty_to_none(self.df, self.schema_config)
         print("✅ Data Generation Complete.")
 
@@ -846,7 +846,7 @@ class DataManager:
         elif ftype == DataType.ARRAY:
             elem_type = field_config.get("element_type", DataType.INT64)
             rng = np.random.default_rng(random.randint(0, 2**31))
-            arr_len = random.randint(1, min(self.array_capacity, 10))
+            arr_len = random.randint(0, min(self.array_capacity, 10))
             return self._gen_array_data(rng, elem_type, int(arr_len))
         return None
 
