@@ -2625,13 +2625,6 @@ class OracleQueryGenerator:
         """递归生成：同时返回 Milvus 字符串 和 Pandas Mask"""
         # 递归终止
         if depth == 0 or random.random() < 0.2:
-            # 【新增】2% 概率生成安全的常数表达式（NULL is/is not null）
-            # 【注意】纯数字常数表达式（1<2 等）会导致 Milvus 崩溃，已排除
-            if random.random() < 0.02:
-                res = self.gen_constant_expr()
-                if res[0]:
-                    return res
-
             if random.random() < 0.3:
                 res = self.gen_json_advanced_expr()
                 # 只有当成功生成了非空表达式时才返回
