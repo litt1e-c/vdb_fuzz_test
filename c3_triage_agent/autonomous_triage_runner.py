@@ -359,9 +359,12 @@ def format_history_catalog(items: list[dict]) -> str:
 def build_initial_prompt(report_text: str, run_dir: Path, history_items: list[dict], history_prompt_mode: str, run_mode: str) -> str:
     report = truncate_text(report_text, 6000)
     mode_section = (
-        "- discovery mode: stay inside c3_triage_agent, do not use history_find_bug, derive a fresh repro yourself\n\n"
+        "- discovery mode: stay inside c3_triage_agent, do not use history_find_bug, derive a fresh repro yourself\n"
+        "- discovery mode accepted commands: `python repros/...`, `python auto_cases/...`, `python incidents/...`, plus `ls/find/cat/head/tail` inside c3_triage_agent\n"
+        "- discovery mode rejected patterns: `echo`, `python -c`, shell pipelines, or any path outside c3_triage_agent\n\n"
         if run_mode == "discovery"
-        else "- dedup mode: you may search history_find_bug and compare with existing POCs\n\n"
+        else "- dedup mode: you may search history_find_bug and compare with existing POCs\n"
+        "- dedup mode accepted commands: `python`, `python3`, `rg`, `sed`, `cat`, `head`, `tail`, `ls`, `find`\n\n"
     )
     if run_mode == "discovery":
         history_section = (

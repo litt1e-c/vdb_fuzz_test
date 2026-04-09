@@ -1,0 +1,11 @@
+[Test 71] Expr: ((NOT (scores_array is null) OR meta_json.config.version == 5) AND c15 <= -3.4028234663852886e+38)
+  Pandas: 43 | Qdrant: 30 | Time: 3.9ms
+  -> MISMATCH! Missing IDs: [1573, 4230, 1800, 2121, 1610, 1554, 3897, 3350, 951, 3958]
+  -> REPRODUCTION SEED: 1171171189
+  --- ID: 1573 ---
+    [Pandas] {"id": 1573, "c15": -3.4028234663852886e+38, "meta_json": null, "labels_array": null, "scores_array": [981.9, 876.28, 366.23, 628.71]}
+    [Qdrant] {"c15": -3.402823466385289e+38, "meta_json": null, "labels_array": null, "scores_array": [981.9, 876.28, 366.23, 628.71]}
+  --- ID: 4230 ---
+    [Pandas] {"id": 4230, "c15": -3.4028234663852886e+38, "scores_array": []}
+    [Qdrant] {"c15": -3.402823466385289e+38, "scores_array": []}
+  VectorCheck: PASS (30 hits subset of scalar filter)

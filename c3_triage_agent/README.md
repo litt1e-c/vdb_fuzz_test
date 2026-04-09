@@ -133,12 +133,15 @@ python c3_triage_agent/autonomous_triage_runner.py \
 
 - [auto_cases](/home/caihao/compare_test/c3_triage_agent/auto_cases)
   agent 如果要自动生成 case 文件，会写到这里。
+  这是运行时输出目录，可以随时清空。
 
 - [repros](/home/caihao/compare_test/c3_triage_agent/repros)
   agent 如果要自动生成临时复现脚本，会写到这里。
+  这是运行时输出目录，可以随时清空。
 
 - [runs](/home/caihao/compare_test/c3_triage_agent/runs)
   每次运行的完整记录目录。
+  这是运行时输出目录，可以随时清空。
 
 - [.env.example](/home/caihao/compare_test/c3_triage_agent/.env.example)
   环境变量模板。

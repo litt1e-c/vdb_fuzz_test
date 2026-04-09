@@ -37,3 +37,11 @@ volumes/
 .env
 .env.*
 c3_triage_agent/runs/
+c3_triage_agent/repros/
+c3_triage_agent/auto_cases/
+
+# ===== C3 tracked fixtures =====
+!c3_triage_agent/.env.example
+!c3_triage_agent/history_issue_catalog.json
+!c3_triage_agent/incidents/
+!c3_triage_agent/incidents/*.txt

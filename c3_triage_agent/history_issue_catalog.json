@@ -1,0 +1,138 @@
+[
+  {
+    "engine": "milvus",
+    "issue_id": "46972",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue46972_boolean_or_collapse.py",
+    "title": "boolean OR collapse",
+    "summary": "A complex OR expression can incorrectly evaluate to match even when both sides should be false.",
+    "keywords": ["boolean", "or", "logical", "collapse", "complex expression"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "47116",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue47116_3vl_logical_ops.py",
+    "title": "3VL logical ops with NULL",
+    "summary": "Logical expressions involving NULL boolean fields violate expected three-valued logic semantics.",
+    "keywords": ["3vl", "null", "logical", "boolean", "or", "and", "not"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "47164",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue47164_3vl_null.py",
+    "title": "JSON NULL treated as TRUE in !=",
+    "summary": "A JSON not-equal comparison can incorrectly treat NULL or missing values as true instead of unknown.",
+    "keywords": ["json", "null", "!=", "3vl", "missing"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "47285",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue47285_crash_div_zero.py",
+    "title": "division by zero crash",
+    "summary": "An arithmetic expression involving division by zero can crash or destabilize Milvus.",
+    "keywords": ["crash", "division", "zero", "arithmetic"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "47994",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue47994_implicit_downcast_precision.py",
+    "title": "implicit downcast precision leakage",
+    "summary": "Float expressions can be implicitly downcast to float32, changing comparison truth values near precision boundaries.",
+    "keywords": ["float32", "precision", "downcast", "comparison", "boundary"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "48330",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue48330_unvalidated_index_params.py",
+    "title": "unvalidated index params poison collection",
+    "summary": "Large or malicious index parameters can be accepted and then leave the collection in a bad state.",
+    "keywords": ["index", "params", "validation", "hang", "deadlock"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "48440",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue48440_int64_overflow_eval.py",
+    "title": "int64 overflow evaluation",
+    "summary": "Arithmetic on large int64 values can overflow during expression evaluation and produce wrong filter results.",
+    "keywords": ["int64", "overflow", "arithmetic", "evaluation"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "48441",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue48441_3vl_complex_logical_ops.py",
+    "title": "3VL complex logical ops",
+    "summary": "A complex NOT/AND/OR expression with nullable fields can lose rows that should remain under three-valued logic.",
+    "keywords": ["3vl", "null", "complex logical", "not", "and", "or"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "48442",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue48442_int64_to_float_precision_loss.py",
+    "title": "int64 to float precision loss in JSON",
+    "summary": "Large int64 values inside JSON can lose precision and alias during comparison or membership checks.",
+    "keywords": ["json", "int64", "float", "precision", "aliasing"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "48443",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue48443_parser_rejects_valid_json_expr.py",
+    "title": "parser rejects valid JSON expr",
+    "summary": "The parser can reject a valid JSON expression when it is combined with other boolean structure.",
+    "keywords": ["parser", "json", "valid expression", "ast"]
+  },
+  {
+    "engine": "milvus",
+    "issue_id": "48614",
+    "file": "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue48614_ieee754_signed_zero_inverted_index.py",
+    "title": "signed zero with inverted index",
+    "summary": "Indexed float filtering can mishandle +0.0 and -0.0, violating IEEE 754 expectations.",
+    "keywords": ["signed zero", "+0.0", "-0.0", "float", "index", "ieee754"]
+  },
+  {
+    "engine": "qdrant",
+    "issue_id": "8538",
+    "file": "/home/caihao/compare_test/history_find_bug/qdrant/poc_qdrant_issue8538_int64_float_precision_loss.py",
+    "title": "int64 closed-range aliasing",
+    "summary": "Closed-range filtering on very large integers can alias neighboring values due to precision loss.",
+    "keywords": ["int64", "range", "precision", "aliasing", "boundary"]
+  },
+  {
+    "engine": "qdrant",
+    "issue_id": "8539",
+    "file": "/home/caihao/compare_test/history_find_bug/qdrant/poc_qdrant_issue8539_geo_bounding_box_boundary.py",
+    "title": "geo bounding box boundary",
+    "summary": "A point on the exact geo bounding box boundary can be handled inconsistently.",
+    "keywords": ["geo", "bounding box", "boundary", "location"]
+  },
+  {
+    "engine": "qdrant",
+    "issue_id": "8617",
+    "file": "/home/caihao/compare_test/history_find_bug/qdrant/poc_qdrant_issue8617_float32_min_boundary_filtering.py",
+    "title": "float32 minimum boundary filtering",
+    "summary": "Filtering at the float32 minimum finite value can be wrong for ==, <, <=, >, and >=, with REST/gRPC inconsistencies.",
+    "keywords": ["float32", "minimum", "boundary", "range", "equality", "rest", "grpc"]
+  },
+  {
+    "engine": "weaviate",
+    "issue_id": "10642",
+    "file": "/home/caihao/compare_test/history_find_bug/weaviate/poc_weaviate_issue10642_unimplemented_filter_false_negative.py",
+    "title": "OBJECT is_none false negative",
+    "summary": "Filtering an OBJECT field with is_none(False) can produce false negatives when explicit null is involved.",
+    "keywords": ["object", "is_none", "null", "false negative"]
+  },
+  {
+    "engine": "weaviate",
+    "issue_id": "10771",
+    "file": "/home/caihao/compare_test/history_find_bug/weaviate/poc_weaviate_issue10771_pq_negative_segments_validation.py",
+    "title": "negative PQ segments validation bypass",
+    "summary": "Schema creation can accept invalid negative PQ segment parameters instead of rejecting them.",
+    "keywords": ["pq", "segments", "validation", "negative", "schema"]
+  },
+  {
+    "engine": "weaviate",
+    "issue_id": "10917",
+    "file": "/home/caihao/compare_test/history_find_bug/weaviate/poc_weaviate_issue10917_signed_zero_approx_zero.py",
+    "title": "signed zero approximate zero filtering",
+    "summary": "Number filters can mishandle +0.0 and -0.0 around approximate zero comparisons.",
+    "keywords": ["signed zero", "+0.0", "-0.0", "approx zero", "number filters"]
+  }
+]
