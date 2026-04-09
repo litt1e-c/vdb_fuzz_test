@@ -12,7 +12,7 @@ from pymilvus import (
 
 HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
 PORT = os.getenv("MILVUS_PORT", "19531")
-COLLECTION_NAME = "int64_add_overflow_operator_validation"
+COLLECTION_NAME = "int64_add_overflow_repro"
 MAX_INT64 = 9223372036854775807
 
 
@@ -83,7 +83,7 @@ def main():
             ),
         ]
 
-        print("--- INT64 add overflow probe ---")
+        print("--- INT64 add overflow repro ---")
         print(f"host={HOST} port={PORT}")
         for name, expr, expected_ids, note in tests:
             actual = query_ids(col, expr)
