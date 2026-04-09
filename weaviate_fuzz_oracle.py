@@ -90,7 +90,8 @@ NUMBER_BOUNDARY_VALUES = [
     -1e6,
     -1.0,
     -1e-12,
-    -0.0,
+    # -0.0,
+    # 暂时注释掉-0.0，避免重复问题反复出现
     0.0,
     np.finfo(np.float64).smallest_subnormal,
     np.finfo(np.float64).tiny,
@@ -435,7 +436,9 @@ class DataManager:
 
         mode = self.py_rng.choices(["uniform", "cluster", "hotspot", "rounded"], weights=[0.30, 0.30, 0.20, 0.20], k=1)[0]
         if mode == "hotspot":
-            return float(self.py_rng.choice([-1e6, -1.0, -0.1, -0.0, 0.0, 0.1, 1.0, 1e6]))
+            #, -0.0 暂时注释掉-0.0，避免重复问题反复出现
+            # return float(self.py_rng.choice([-1e6, -1.0,-0.0,-0.1, 0.0, 0.1, 1.0, 1e6]))
+            return float(self.py_rng.choice([-1e6, -1.0, -0.1, 0.0, 0.1, 1.0, 1e6]))
         if mode == "cluster":
             center = self.py_rng.choice([-1000.0, -10.0, -1.0, 0.0, 1.0, 10.0, 1000.0])
             return float(center + self.py_rng.uniform(-1e-3, 1e-3) * max(abs(center), 1.0))

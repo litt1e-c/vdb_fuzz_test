@@ -1,0 +1,82 @@
+version: '3.5'
+
+services:
+  # --- Etcd ---
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.23
+    environment:
+      ETCD_AUTO_COMPACTION_MODE: revision
+      ETCD_AUTO_COMPACTION_RETENTION: "1000"
+      ETCD_QUOTA_BACKEND_BYTES: "1073741824"  # 限制为 1GB
+      ETCD_SNAPSHOT_COUNT: "50000"
+    command: >
+      etcd
+      -advertise-client-urls=http://127.0.0.1:2379
+      -listen-client-urls http://0.0.0.0:2379
+      --data-dir /etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # --- MinIO ---
+  minio:
+    image: minio/minio:RELEASE.2025-04-22T22-12-26Z
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    tmpfs:
+      - /minio_data:size=2G  # 使用内存作为临时存储以节省空间
+    ports:
+      - "19000:9000"
+      - "19001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # --- Milvus Standalone (使用修复后的 Master 镜像) ---
+  milvus:
+    # 修改此处以匹配官方验证通过的版本
+    image: milvusdb/milvus:master-20260330-31a01c81-amd64
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    ulimits:
+      core:
+        soft: -1
+        hard: -1
+    volumes:
+      - ./milvus_logs:/milvus/logs
+      - ./milvus_core:/tmp/cores
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      MINIO_ADDRESS: minio:9000
+      # 建议增加日志级别以方便观察逻辑判断过程
+      COMMON_LOG_LEVEL: info
+      GOTRACEBACK: crash
+    ports:
+      - "19531:19530"   # gRPC
+      - "19091:9091"    # HTTP metrics / health
+    depends_on:
+      - etcd
+      - minio
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      start_period: 90s
+      timeout: 20s
+      retries: 3
+
+  # --- Attu (Milvus Web UI) ---
+  attu:
+    image: zilliz/attu:latest
+    ports:
+      - "3000:3000"
+    environment:
+      MILVUS_URL: milvus:19530
+    depends_on:
+      - milvus

@@ -40,7 +40,7 @@ services:
 
   # --- Milvus Standalone ---
   milvus:
-    image: milvusdb/milvus:v2.6.9
+    image: milvusdb/milvus:v2.6.10
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
