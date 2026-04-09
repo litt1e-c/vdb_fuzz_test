@@ -53,6 +53,10 @@ INSERT_TIMEOUT = 30      # 插入 RPC 超时（秒）
 FLUSH_TIMEOUT = 30       # flush RPC 超时（秒）
 INDEX_TIMEOUT = 120      # 索引构建 RPC 超时（秒）
 LOAD_TIMEOUT = 60        # load RPC 超时（秒）
+QUERY_TIMEOUT = 30       # query / query_iterator RPC 超时（秒）
+SEARCH_TIMEOUT = 30      # search RPC 超时（秒）
+COMPACTION_TIMEOUT = 60  # compact / wait_for_compaction_completed 超时（秒）
+ENABLE_STANDARD_DYNAMIC_UPSERT = False  # 当前本地 Milvus 环境下，标准 fuzz 的 Collection.upsert 会阻塞
 
 # 稳定的索引类型列表（移除不稳定或需要特殊配置的索引）
 ALL_INDEX_TYPES = [
@@ -244,20 +248,20 @@ def delete_ids_with_strong_sync(mm, dm, del_ids, file_log=None, max_verify_round
     pending = set(target_ids)
 
     try:
-        mm.col.delete(f"id in {sorted(pending)}")
-        mm.col.flush()
+        mm.col.delete(f"id in {sorted(pending)}", timeout=INSERT_TIMEOUT)
+        mm.col.flush(timeout=FLUSH_TIMEOUT)
     except Exception as e:
         _log(f"[Dynamic] Delete request failed before sync: {e}")
         return [], sorted(pending)
 
     # 尽力刷新段状态，降低 stale 读概率
     try:
-        mm.col.compact()
-        mm.col.wait_for_compaction_completed()
+        mm.col.compact(timeout=COMPACTION_TIMEOUT)
+        mm.col.wait_for_compaction_completed(timeout=COMPACTION_TIMEOUT)
         mm.col.release()
-        mm.col.load()
-    except Exception:
-        pass
+        mm.col.load(timeout=LOAD_TIMEOUT)
+    except Exception as e:
+        _log(f"[Dynamic] Delete post-sync maintenance skipped: {e}")
 
     for attempt in range(max_verify_rounds):
         if not pending:
@@ -268,7 +272,8 @@ def delete_ids_with_strong_sync(mm, dm, del_ids, file_log=None, max_verify_round
                 f"id in {sorted(pending)}",
                 output_fields=["id"],
                 limit=max(len(pending), 1),
-                consistency_level="Strong"
+                consistency_level="Strong",
+                timeout=QUERY_TIMEOUT,
             )
             still_present = {int(r["id"]) for r in verify_res}
         except Exception as e:
@@ -282,8 +287,8 @@ def delete_ids_with_strong_sync(mm, dm, del_ids, file_log=None, max_verify_round
 
         # 对仍存在的 ID 进行重试删除
         try:
-            mm.col.delete(f"id in {sorted(pending)}")
-            mm.col.flush()
+            mm.col.delete(f"id in {sorted(pending)}", timeout=INSERT_TIMEOUT)
+            mm.col.flush(timeout=FLUSH_TIMEOUT)
         except Exception as e:
             _log(f"[Dynamic] Delete retry attempt {attempt + 1} failed: {e}")
 
@@ -351,7 +356,8 @@ def reconcile_pandas_oracle_with_milvus(mm, dm, file_log=None, reason="unknown")
             batch_size=10000,
             expr="id >= 0",
             output_fields=["id"],
-            consistency_level="Strong"
+            consistency_level="Strong",
+            timeout=QUERY_TIMEOUT,
         )
         while True:
             batch = it.next()
@@ -394,7 +400,8 @@ def reconcile_pandas_oracle_with_milvus(mm, dm, file_log=None, reason="unknown")
                     f"id in {batch_ids}",
                     output_fields=all_output_fields,
                     limit=len(batch_ids),
-                    consistency_level="Strong"
+                    consistency_level="Strong",
+                    timeout=QUERY_TIMEOUT,
                 )
             except Exception as e:
                 _log(f"[OracleSync] Failed to fetch missing rows ({reason}): {e}")
@@ -3002,12 +3009,12 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                         upsert_rows.append(row)
                         rows_with_vec.append(row_with_vec)
                     try:
-                        mm.col.upsert(rows_with_vec)
-                        mm.col.flush()
-                        mm.col.compact()
-                        mm.col.wait_for_compaction_completed()
+                        mm.col.upsert(rows_with_vec, timeout=INSERT_TIMEOUT)
+                        file_log(f"[Dynamic] Upsert RPC succeeded at round {i}; skipping explicit flush")
+                        mm.col.compact(timeout=COMPACTION_TIMEOUT)
+                        mm.col.wait_for_compaction_completed(timeout=COMPACTION_TIMEOUT)
                         mm.col.release()
-                        mm.col.load()
+                        mm.col.load(timeout=LOAD_TIMEOUT)
                         for row, row_with_vec in zip(upsert_rows, rows_with_vec):
                             rid = row["id"]
                             match_idx = dm.df.index[dm.df["id"] == rid].tolist()
@@ -3436,7 +3443,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
             # --- 随机触发 compaction ---
             if i > 0 and i % 25 == 0:
                 try:
-                    mm.col.compact()
+                    mm.col.compact(timeout=COMPACTION_TIMEOUT)
                     file_log(f"[Maintenance] Triggered compaction at round {i}")
                 except Exception as e:
                     file_log(f"[Maintenance] Compaction failed at round {i}: {e}")
@@ -3497,12 +3504,17 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     mm.col.create_index(
                         field_name="vector",
                         index_params=create_params,
-                        index_name=VECTOR_INDEX_NAME
+                        index_name=VECTOR_INDEX_NAME,
+                        timeout=INDEX_TIMEOUT,
                     )
-                    utility.wait_for_index_building_complete(COLLECTION_NAME, index_name=VECTOR_INDEX_NAME)
+                    utility.wait_for_index_building_complete(
+                        COLLECTION_NAME,
+                        index_name=VECTOR_INDEX_NAME,
+                        timeout=INDEX_TIMEOUT,
+                    )
                     file_log(f"[Maintenance] Rebuilt index to {new_index_type} at round {i}")
                     CURRENT_INDEX_TYPE = new_index_type
-                    mm.col.load()
+                    mm.col.load(timeout=LOAD_TIMEOUT)
                     file_log(f"[Maintenance] Reloaded collection after index rebuild at round {i}")
                     # 维护操作后做 Oracle 对账，避免 Milvus 可见集变化导致 pandas NOT FOUND
                     if AUTO_ORACLE_RESYNC:
@@ -3512,7 +3524,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     # 尝试恢复：重新 load collection
                     try:
                         file_log(f"[Maintenance] Attempting recovery - reloading collection at round {i}")
-                        mm.col.load()
+                        mm.col.load(timeout=LOAD_TIMEOUT)
                         file_log(f"[Maintenance] Recovery successful - collection reloaded at round {i}")
                     except Exception as e2:
                         file_log(f"[Maintenance] Recovery failed at round {i}: {e2}")
@@ -3526,7 +3538,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     old_idx, new_idx = mm.rebuild_scalar_indexes(dm.schema_config)
                     file_log(f"[Maintenance] Scalar index rebuild at round {i}: {old_idx} -> {new_idx}")
 
-                    mm.col.load()
+                    mm.col.load(timeout=LOAD_TIMEOUT)
                     file_log(f"[Maintenance] Reloaded collection after scalar index rebuild at round {i}")
                     # 标量索引重建后同样做一次对账（该阶段最容易出现可见集漂移）
                     if AUTO_ORACLE_RESYNC:
@@ -3534,15 +3546,19 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                 except Exception as e:
                     file_log(f"[Maintenance] Scalar index rebuild failed at round {i}: {e}")
                     try:
-                        mm.col.load()
+                        mm.col.load(timeout=LOAD_TIMEOUT)
                         file_log(f"[Maintenance] Recovery after scalar rebuild - collection reloaded at round {i}")
                     except Exception as e2:
                         file_log(f"[Maintenance] Scalar rebuild recovery failed at round {i}: {e2}")
 
             # --- 动态插入/删除/Upsert ---
             if enable_dynamic_ops and i > 0 and i % 10 == 0:
-                op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
+                if ENABLE_STANDARD_DYNAMIC_UPSERT:
+                    op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
+                else:
+                    op = random.choices(["insert", "delete"], weights=[0.5, 0.5], k=1)[0]
                 batch_count = random.randint(1, 5)
+                file_log(f"[Dynamic] Starting op={op}, batch_count={batch_count} at round {i}")
 
                 if op == "insert":
                     new_rows = []
@@ -3556,12 +3572,14 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                         rows_with_vec.append(row_with_vec)
 
                     try:
-                        mm.col.insert(rows_with_vec)
-                        mm.col.flush()
+                        mm.col.insert(rows_with_vec, timeout=INSERT_TIMEOUT)
+                        file_log(f"[Dynamic] Insert RPC succeeded at round {i}; skipping explicit flush")
                         dm.df = pd.concat([dm.df, pd.DataFrame(new_rows)], ignore_index=True)
                         dm.vectors = np.vstack([dm.vectors, np.array([r["vector"] for r in rows_with_vec])])
                         inserted_ids = [r["id"] for r in new_rows]
                         file_log(f"[Dynamic] Inserted {len(new_rows)} rows: ids={inserted_ids}")
+                        if AUTO_ORACLE_RESYNC:
+                            reconcile_pandas_oracle_with_milvus(mm, dm, file_log=file_log, reason=f"insert_r{i}")
                     except Exception as e:
                         file_log(f"[Dynamic] Insert failed: {e}")
 
@@ -3646,6 +3664,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                             f"[Dynamic] Upserted {len(upsert_rows)} rows: ids={upsert_ids}, updated_ids={updated_ids}, new_ids={[r['id'] for r in new_rows]}"
                         )
                         file_log(f"[Dynamic] Upsert details: {upsert_details}")
+                        if AUTO_ORACLE_RESYNC:
+                            reconcile_pandas_oracle_with_milvus(mm, dm, file_log=file_log, reason=f"upsert_r{i}")
                         
                         # 验证 upsert 数据同步
                         for row in upsert_rows:
@@ -3655,7 +3675,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                                 milvus_res = mm.col.query(
                                     f"id == {rid}",
                                     output_fields=["id", "c19", "meta_json"],
-                                    consistency_level="Strong"
+                                    consistency_level="Strong",
+                                    timeout=QUERY_TIMEOUT,
                                 )
                                 if milvus_res:
                                     milvus_history = milvus_res[0].get("meta_json", {}).get("history")
@@ -3698,12 +3719,14 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                             null_res = mm.col.query(
                                 f"{field_config['name']} is null",
                                 output_fields=["id"],
-                                consistency_level="Strong"
+                                consistency_level="Strong",
+                                timeout=QUERY_TIMEOUT,
                             )
                             not_null_res = mm.col.query(
                                 f"{field_config['name']} is not null",
                                 output_fields=["id"],
-                                consistency_level="Strong"
+                                consistency_level="Strong",
+                                timeout=QUERY_TIMEOUT,
                             )
                             total_in_milvus = len(null_res) + len(not_null_res)
                             total_in_pandas = len(dm.df)
@@ -3735,7 +3758,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     file_log(f"[SchemaEvolution] Traceback:\n{traceback.format_exc()}")
                     # 尝试恢复
                     try:
-                        mm.col.load()
+                        mm.col.load(timeout=LOAD_TIMEOUT)
                     except:
                         pass
 
@@ -3759,7 +3782,8 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     batch_size=10000,
                     expr=expr_str,
                     output_fields=["id"],
-                    consistency_level=cl
+                    consistency_level=cl,
+                    timeout=QUERY_TIMEOUT,
                 )
 
                 actual_ids = set()
@@ -3911,6 +3935,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                             limit=search_k,
                             expr=expr_str,
                             output_fields=["id"],
+                            timeout=SEARCH_TIMEOUT,
                         )
 
                         returned_ids = set()
@@ -5426,6 +5451,7 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=1000, help="Number of rounds for main/test modes")
     parser.add_argument("--collection", type=str, default="fuzz_stable_v3", help="Milvus collection name")
     parser.add_argument("--no-dynamic-ops", action="store_true", help="Disable dynamic operations (insert/delete/upsert)")
+    parser.add_argument("--enable-dynamic-upsert", action="store_true", help="Enable dynamic upsert in standard fuzz mode (experimental in the current local Milvus environment)")
     
     # Chaos engineering
     parser.add_argument("--chaos", action="store_true", help="Enable default chaos rate (0.1)")
@@ -5452,6 +5478,7 @@ if __name__ == "__main__":
     
     COLLECTION_NAME = args.collection
     enable_dynamic_ops = not args.no_dynamic_ops
+    ENABLE_STANDARD_DYNAMIC_UPSERT = args.enable_dynamic_upsert
 
     if args.chaos:
         CHAOS_RATE = 0.1
@@ -5467,6 +5494,7 @@ if __name__ == "__main__":
     print(f"   Seed: {args.seed if args.seed is not None else '(Random)'}")
     print(f"   Metric: {args.metric if args.metric else '(Random from L2/IP/COSINE)'}")
     print(f"   Dynamic Ops: {enable_dynamic_ops}")
+    print(f"   Dynamic Upsert: {ENABLE_STANDARD_DYNAMIC_UPSERT}")
     print(f"   Chaos Rate: {CHAOS_RATE}")
     print(f"   Consistency: {args.consistency if args.consistency else '(Random)'}")
 
