@@ -180,33 +180,29 @@ def get_type_name(dtype):
     return type_map.get(dtype, str(dtype))
 
 # --- Milvus 空值语义工具 ---
-# Milvus 将空 JSON {} 和空数组 [] 视为 null，pandas 不会。
-# 此工具函数确保 Oracle 模型与 Milvus 行为一致。
+# 当前本地验证下，Milvus 的字段级 IS NULL 将 None / NaN / 缺失(nullable) 视为 null，
+# 但空 JSON {} 与空数组 [] 仍视为非 null。
+# 此工具函数确保 Oracle 模型与当前观测到的 Milvus 行为一致。
 def milvus_is_empty(val):
-    """判断一个值在 Milvus 语义下是否为 null（None / NaN / [] / {}）"""
+    """判断一个值在当前 Milvus 语义下是否为 null（None / NaN）。"""
     if val is None:
         return True
     if isinstance(val, float) and np.isnan(val):
-        return True
-    if isinstance(val, list) and len(val) == 0:
-        return True
-    if isinstance(val, dict) and len(val) == 0:
         return True
     return False
 
 def milvus_null_mask(series):
     """返回一个 boolean mask，True 表示该值在 Milvus 中被视为 null。
-    用于替代 series.isnull()，额外处理 [] 和 {} 的情况。"""
+    用于替代 series.isnull()，并与当前观测到的 Milvus 语义保持一致。"""
     return series.apply(milvus_is_empty).astype("boolean")
 
 def milvus_notnull_mask(series):
     """返回一个 boolean mask，True 表示该值在 Milvus 中被视为非 null。
-    用于替代 series.notnull()，额外处理 [] 和 {} 的情况。"""
+    用于替代 series.notnull()，并与当前观测到的 Milvus 语义保持一致。"""
     return (~series.apply(milvus_is_empty)).astype("boolean")
 
 def normalize_empty_to_none(df, schema_config):
-    """将 DataFrame 中的空数组 [] 和空 JSON {} 规范化为 None。
-    这确保 pandas Oracle 与 Milvus 的空值语义一致。"""
+    """将 DataFrame 中当前 Milvus 语义下的 null 值规范化为 None。"""
     for fc in schema_config:
         fname = fc["name"]
         if fname not in df.columns:
@@ -1498,12 +1494,11 @@ class OracleQueryGenerator:
             # 兜底表达式，永远为真
             return ("id > 0", None)
         field = random.choice(json_fields); name = field["name"]; series = self.df[name]
-        # 【关键】使用 milvus_notnull_mask：Milvus 将 {} 视为 null
+        # 【关键】使用 milvus_notnull_mask：与当前观测到的字段级 null 语义保持一致
         # [WORKAROUND: Milvus NOT(UNKNOWN) Bug]
         # Milvus 对 NULL JSON 字段执行 NOT(UNKNOWN) 时可能错误返回 TRUE
         # 原始代码: 不使用 notnull_mask, 直接 return (expr, mask)
         # 现在: 所有 JSON 表达式包裹 (name is not null and (expr)), mask & notnull_mask
-        # 【关键】使用 milvus_notnull_mask：Milvus 将 {} 视为 null
         notnull_mask = milvus_notnull_mask(series)
         strategy = random.choice(["range", "nested", "index", "multi_key"])
 
@@ -1691,7 +1686,7 @@ class OracleQueryGenerator:
 
         # 1. Null Check
         # 【关键】使用 milvus_null_mask / milvus_notnull_mask 代替 pandas 原生方法
-        # 因为 Milvus 将 [] 和 {} 视为 null，但 pandas 不会
+        # 以匹配当前观测到的 Milvus 字段级 null 语义
         if random.random() < 0.15:
             if random.random() < 0.5:
                 return (f"{name} is null", milvus_null_mask(series))
@@ -2071,7 +2066,7 @@ class OracleQueryGenerator:
         strategy = random.choice([
             "contains", "length", "subscript", "contains_all", "contains_any"
         ])
-        # 【关键】使用 milvus_notnull_mask：Milvus 将 [] 视为 null
+        # 【关键】使用 milvus_notnull_mask：与当前观测到的字段级 null 语义保持一致
         notnull_mask = milvus_notnull_mask(series)
 
         def _sample_element(s, etype):
