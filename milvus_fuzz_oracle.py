@@ -56,7 +56,6 @@ LOAD_TIMEOUT = 60        # load RPC 超时（秒）
 QUERY_TIMEOUT = 30       # query / query_iterator RPC 超时（秒）
 SEARCH_TIMEOUT = 30      # search RPC 超时（秒）
 COMPACTION_TIMEOUT = 60  # compact / wait_for_compaction_completed 超时（秒）
-ENABLE_STANDARD_DYNAMIC_UPSERT = False  # 当前本地 Milvus 环境下，标准 fuzz 的 Collection.upsert 会阻塞
 
 # 稳定的索引类型列表（移除不稳定或需要特殊配置的索引）
 ALL_INDEX_TYPES = [
@@ -3553,10 +3552,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
 
             # --- 动态插入/删除/Upsert ---
             if enable_dynamic_ops and i > 0 and i % 10 == 0:
-                if ENABLE_STANDARD_DYNAMIC_UPSERT:
-                    op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
-                else:
-                    op = random.choices(["insert", "delete"], weights=[0.5, 0.5], k=1)[0]
+                op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
                 file_log(f"[Dynamic] Starting op={op}, batch_count={batch_count} at round {i}")
 
@@ -5451,7 +5447,6 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=1000, help="Number of rounds for main/test modes")
     parser.add_argument("--collection", type=str, default="fuzz_stable_v3", help="Milvus collection name")
     parser.add_argument("--no-dynamic-ops", action="store_true", help="Disable dynamic operations (insert/delete/upsert)")
-    parser.add_argument("--enable-dynamic-upsert", action="store_true", help="Enable dynamic upsert in standard fuzz mode (experimental in the current local Milvus environment)")
     
     # Chaos engineering
     parser.add_argument("--chaos", action="store_true", help="Enable default chaos rate (0.1)")
@@ -5478,7 +5473,6 @@ if __name__ == "__main__":
     
     COLLECTION_NAME = args.collection
     enable_dynamic_ops = not args.no_dynamic_ops
-    ENABLE_STANDARD_DYNAMIC_UPSERT = args.enable_dynamic_upsert
 
     if args.chaos:
         CHAOS_RATE = 0.1
@@ -5494,7 +5488,6 @@ if __name__ == "__main__":
     print(f"   Seed: {args.seed if args.seed is not None else '(Random)'}")
     print(f"   Metric: {args.metric if args.metric else '(Random from L2/IP/COSINE)'}")
     print(f"   Dynamic Ops: {enable_dynamic_ops}")
-    print(f"   Dynamic Upsert: {ENABLE_STANDARD_DYNAMIC_UPSERT}")
     print(f"   Chaos Rate: {CHAOS_RATE}")
     print(f"   Consistency: {args.consistency if args.consistency else '(Random)'}")
 
