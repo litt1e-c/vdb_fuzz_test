@@ -208,6 +208,30 @@ def milvus_notnull_mask(series):
     用于替代 series.notnull()，并与当前观测到的 Milvus 语义保持一致。"""
     return (~series.apply(milvus_is_empty)).astype("boolean")
 
+
+def is_json_contains_candidate(val):
+    """Return True when the value is safe to use in json_contains* expressions."""
+    if hasattr(val, "item"):
+        val = val.item()
+    if val is None:
+        return False
+    if isinstance(val, float) and not np.isfinite(val):
+        return False
+    if isinstance(val, (bool, int, float, str)):
+        return True
+    if isinstance(val, list):
+        return all(is_json_contains_candidate(item) for item in val)
+    return False
+
+
+def normalize_json_contains_candidate(val):
+    """Normalize numpy scalars inside json_contains* candidates into JSON-safe Python values."""
+    if hasattr(val, "item"):
+        val = val.item()
+    if isinstance(val, list):
+        return [normalize_json_contains_candidate(item) for item in val]
+    return val
+
 def normalize_empty_to_none(df, schema_config):
     """将 DataFrame 中当前 Milvus 语义下的 null 值规范化为 None。"""
     for fc in schema_config:
@@ -1908,24 +1932,59 @@ class OracleQueryGenerator:
                 list_keys = [k for k, v in val.items() if isinstance(v, list) and len(v) > 0]
                 if list_keys:
                     k = random.choice(list_keys)
-                    target_list = val[k]
-                    target_item = random.choice(target_list)
-                    if target_item is not None and isinstance(target_item, (int, float, str, bool)):
-                        item_str = json.dumps(target_item)
-                        if isinstance(target_item, bool):
-                            item_str = item_str.lower()
-                        expr = f'json_contains({name}["{k}"], {item_str})'
-                        # 【修复】3VL: NULL / 缺失键 / null值 → UNKNOWN (None → <NA>)
-                        def check_list_contains(x, _k=k, _target_item=target_item):
-                            if x is None: return None           # NULL JSON → UNKNOWN
-                            if not isinstance(x, dict): return None
-                            if _k not in x: return None         # 缺失键 → UNKNOWN
-                            val = x[_k]
-                            if val is None: return None          # 显式 null → UNKNOWN
-                            if not isinstance(val, list): return False  # 非数组 → FALSE
-                            return _target_item in val
-                        mask = series.apply(check_list_contains).astype("boolean")
-                    else: return (f"{name} is not null", milvus_notnull_mask(series))
+                    target_list = [
+                        normalize_json_contains_candidate(item)
+                        for item in val[k]
+                        if is_json_contains_candidate(item)
+                    ]
+                    if target_list:
+                        op_type = random.choice(["contains", "contains_all", "contains_any"])
+
+                        if op_type == "contains":
+                            target_item = random.choice(target_list)
+                            expr = f'json_contains({name}["{k}"], {json.dumps(target_item)})'
+
+                            def check_list_contains(x, _k=k, _target_item=target_item):
+                                if milvus_is_empty(x):
+                                    return None  # NULL JSON field / omitted field -> UNKNOWN
+                                if not isinstance(x, dict):
+                                    return None
+                                if _k not in x:
+                                    return False  # missing path inside non-null JSON -> FALSE
+                                path_val = x[_k]
+                                if path_val is None:
+                                    return False  # explicit null path inside non-null JSON -> FALSE
+                                if not isinstance(path_val, list):
+                                    return False  # non-array path -> FALSE
+                                return _target_item in path_val
+
+                            mask = series.apply(check_list_contains).astype("boolean")
+
+                        else:
+                            subset_size = random.randint(1, min(2, len(target_list)))
+                            target_items = random.sample(target_list, subset_size)
+                            op_name = "json_contains_all" if op_type == "contains_all" else "json_contains_any"
+                            expr = f'{op_name}({name}["{k}"], {json.dumps(target_items)})'
+
+                            def check_list_membership(x, _k=k, _target_items=target_items, _op=op_type):
+                                if milvus_is_empty(x):
+                                    return None  # NULL JSON field / omitted field -> UNKNOWN
+                                if not isinstance(x, dict):
+                                    return None
+                                if _k not in x:
+                                    return False
+                                path_val = x[_k]
+                                if path_val is None:
+                                    return False
+                                if not isinstance(path_val, list):
+                                    return False
+                                if _op == "contains_all":
+                                    return all(item in path_val for item in _target_items)
+                                return any(item in path_val for item in _target_items)
+
+                            mask = series.apply(check_list_membership).astype("boolean")
+                    else:
+                        return (f"{name} is not null", milvus_notnull_mask(series))
                 else: return (f"{name} is not null", milvus_notnull_mask(series))
 
             # --- 策略 C: 下钻 (Drill-down) ---
@@ -2074,7 +2133,7 @@ class OracleQueryGenerator:
                 return (guarded_expr, guarded_mask)
 
             if ftype == DataType.JSON:
-                if expr and not expr.startswith("exists(") and not expr.startswith("json_contains("):
+                if expr and not expr.startswith("exists(") and not expr.startswith("json_contains(") and not expr.startswith("json_contains_all(") and not expr.startswith("json_contains_any("):
                     notnull_mask = milvus_notnull_mask(series)
                     guarded_mask = mask.astype("boolean") & notnull_mask
                     guarded_expr = f"({name} is not null and ({expr}))"
@@ -4696,12 +4755,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
             val_list = json_obj[k]
 
             # 提取有效标量
-            valid_items = []
-            for x in val_list:
-                if x is not None and isinstance(x, (int, float, str, bool)):
-                    valid_items.append(x)
-                elif hasattr(x, "item"):
-                    valid_items.append(x.item())
+            valid_items = [
+                normalize_json_contains_candidate(x)
+                for x in val_list
+                if is_json_contains_candidate(x)
+            ]
 
             if valid_items:
                 target = random.choice(valid_items)
@@ -4718,7 +4776,8 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return f'json_contains_all({fname}["{safe_k}"], {json.dumps(subset)})'
 
                 elif op_type == "contains_any":
-                    subset = [target, "fake_val_999"] # 混入噪音
+                    subset_size = random.randint(1, min(2, len(valid_items)))
+                    subset = random.sample(valid_items, subset_size)
                     return f'json_contains_any({fname}["{safe_k}"], {json.dumps(subset)})'
 
         # --- 策略 2: 深度下钻 (调用上面的融合版函数) ---
