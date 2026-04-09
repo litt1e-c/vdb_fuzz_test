@@ -48,7 +48,11 @@ N = 5000                 # 数据量（磁盘满了，先用 1000 测试功能�
 DIM = 128                # 维度 128
 BATCH_SIZE = 200         # 批次大小（内存模式可以大一些）
 SLEEP_INTERVAL = 0.01    # 每次插入后暂停 10ms（内存模式更快）
-FLUSH_INTERVAL = 500     # 每 500 条刷盘
+FLUSH_INTERVAL = 0       # 0 表示禁用启动阶段显式 flush；当前本地 Milvus 在 flush 上容易长时间阻塞
+INSERT_TIMEOUT = 30      # 插入 RPC 超时（秒）
+FLUSH_TIMEOUT = 30       # flush RPC 超时（秒）
+INDEX_TIMEOUT = 120      # 索引构建 RPC 超时（秒）
+LOAD_TIMEOUT = 60        # load RPC 超时（秒）
 
 # 稳定的索引类型列表（移除不稳定或需要特殊配置的索引）
 ALL_INDEX_TYPES = [
@@ -969,7 +973,7 @@ class MilvusManager:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    self.col.insert(insert_rows)
+                    self.col.insert(insert_rows, timeout=INSERT_TIMEOUT)
                     break # Success
                 except Exception as e:
                     if attempt == max_retries - 1:
@@ -992,14 +996,22 @@ class MilvusManager:
             time.sleep(SLEEP_INTERVAL)
 
             # 2. Frequent Flush: Free up server memory
-            if end % FLUSH_INTERVAL == 0:
+            if FLUSH_INTERVAL and end % FLUSH_INTERVAL == 0:
                 try:
-                    self.col.flush()
-                except:
-                    pass
+                    print(f"   Flushing at {end}/{total}...", end="\r")
+                    self.col.flush(timeout=FLUSH_TIMEOUT)
+                except Exception as e:
+                    print(f"\n   ⚠️ Intermediate flush skipped at {end}/{total}: {e}")
 
         print("\n✅ Insert Complete. Building Index...")
-        self.col.flush()
+        if FLUSH_INTERVAL:
+            try:
+                print("🧹 Final flush before index build...")
+                self.col.flush(timeout=FLUSH_TIMEOUT)
+            except Exception as e:
+                print(f"   ⚠️ Final flush timed out or failed, continuing to index build: {e}")
+        else:
+            print("🧹 Skipping explicit flush before index build in the current local Milvus environment.")
 
         index_params = {}
 
@@ -1056,14 +1068,19 @@ class MilvusManager:
 
         try:
             # 创建向量索引
-            self.col.create_index("vector", index_params, index_name=VECTOR_INDEX_NAME)
+            self.col.create_index(
+                "vector",
+                index_params,
+                index_name=VECTOR_INDEX_NAME,
+                timeout=INDEX_TIMEOUT,
+            )
 
             # 创建标量字段索引
             self.create_scalar_indexes(dm.schema_config)
 
             # 加载数据 (必须在建索引后)
             print("📥 Loading collection into memory...")
-            self.col.load()
+            self.col.load(timeout=LOAD_TIMEOUT)
 
         except Exception as e:
             print(f"❌ Index build failed (Likely OOM or Config Error): {e}")
@@ -1107,7 +1124,12 @@ class MilvusManager:
                 index_params = {"index_type": chosen_type}
                 # 使用显式 index_name 避免 drop_index 时的 AmbiguousIndexName
                 idx_name = f"idx_{fname}"
-                self.col.create_index(field_name=fname, index_params=index_params, index_name=idx_name)
+                self.col.create_index(
+                    field_name=fname,
+                    index_params=index_params,
+                    index_name=idx_name,
+                    timeout=INDEX_TIMEOUT,
+                )
                 self.scalar_indexes[fname] = chosen_type
                 print(f"   ✅ {fname} ({get_type_name(ftype)}) -> {chosen_type}")
             except Exception as e:
