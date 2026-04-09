@@ -897,17 +897,20 @@ class DataManager:
 
     def backfill_evolved_field(self, field_config, fill_ratio=None):
         """
-        为现有数据的新演进字段生成回填值，并同步更新 pandas DataFrame。
+        为现有数据的新演进字段生成候选回填值。
 
         回填策略：随机选取部分现有行，为新字段填充对应类型的随机值。
         未被选中的行保持 None（与 Milvus 中 nullable 字段的原始状态一致）。
+        注意：此处只生成候选值，不立即改写 pandas DataFrame。
+        pandas 仅在对应 Milvus partial upsert 批次成功后才会同步更新，
+        避免 Milvus 回填失败时本地 Oracle 提前分叉。
 
         Args:
             field_config: 字段配置 dict
             fill_ratio: 填充比例 (0.0 - 1.0)，None 则随机选取
 
         Returns:
-            list of (pandas_index, row_id, value) tuples — 需要回填的具体数据
+            list of (pandas_index, row_id, value) tuples — 候选回填数据
         """
         if fill_ratio is None:
             fill_ratio = random.uniform(0.1, 0.4)
@@ -927,8 +930,6 @@ class DataManager:
             value = self.generate_field_value(field_config)
             row_id = int(self.df.at[idx, "id"])
             backfill_data.append((int(idx), row_id, value))
-            # 同步更新 pandas DataFrame
-            self.df.at[idx, field_name] = value
 
         return backfill_data
 
@@ -1219,7 +1220,7 @@ class MilvusManager:
         """
         通过 MilvusClient.upsert(partial_update=True) 回填部分现有行的新字段值。
         只需传递 主键ID + 新字段值，无需向量和其他字段。
-        pandas DataFrame 已由 dm.backfill_evolved_field() 提前同步更新。
+        仅当某个批次在 Milvus 中写入成功后，才同步更新 pandas DataFrame。
 
         Args:
             dm: DataManager
@@ -1250,11 +1251,16 @@ class MilvusManager:
                     partial_update=True
                 )
                 success_count += len(rows_to_upsert)
+                for pandas_idx, row_id, value in batch:
+                    dm.df.at[pandas_idx, field_name] = value
             except Exception as e:
-                print(f"   ⚠️ Backfill partial upsert failed: {e}")
+                print(
+                    f"   ⚠️ Backfill partial upsert failed for '{field_name}' "
+                    f"batch {start}-{start + len(batch)}: {e}"
+                )
 
         if success_count > 0:
-            self.col.flush()
+            self.col.flush(timeout=FLUSH_TIMEOUT)
         return success_count
 
     def rebuild_scalar_indexes(self, schema_config):
