@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+"""Small provider smoke-test utility for C3 triage.
+
+Use this before running the agent when you want to separate:
+- API / model / endpoint problems
+from
+- agent prompt / tool-use problems
+
+Typical usage:
+    python c3_triage_agent/provider_probe.py \
+      --model qwen3-coder-plus \
+      --endpoint chat \
+      --payload-mode both
+"""
 from __future__ import annotations
 
 import argparse

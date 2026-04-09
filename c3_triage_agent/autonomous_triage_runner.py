@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+"""Run the autonomous C3 triage loop from one raw mismatch report.
+
+Typical usage:
+    python c3_triage_agent/autonomous_triage_runner.py \
+      --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
+      --provider openai \
+      --model qwen3-coder-plus \
+      --max-steps 6
+
+What this script does:
+1. load `.env` and provider settings
+2. send the raw report plus workspace hints to the model
+3. let the model request `run` / `write_file` actions
+4. execute allowed local commands
+5. feed command outputs back to the model
+6. save the full trace under `c3_triage_agent/runs/<timestamp>/`
+"""
 from __future__ import annotations
 
 import argparse
@@ -166,6 +183,8 @@ def truncate_text(text: str, limit: int = 12000) -> str:
 
 
 def run_shell_command(command: str, workdir: Path, timeout_sec: int) -> dict:
+    # Each model-requested command is executed locally and the combined
+    # stdout/stderr is returned to the next model step for analysis.
     started = time.time()
     proc = subprocess.run(
         command,
@@ -421,6 +440,9 @@ def main() -> int:
     )
 
     for step in range(args.max_steps):
+        # One loop iteration = one model turn. The model may ask for shell
+        # actions, we execute them, then send the results back as the next
+        # user message.
         try:
             response_text = provider.generate(system_prompt, messages)
         except ProviderError as exc:

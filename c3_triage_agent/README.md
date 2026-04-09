@@ -6,6 +6,94 @@
 
 > 输入一段 `fuzzer mismatch`，让 agent 自己搜索历史 issue、运行脚本、判断是否重复根因。
 
+## 三分钟上手
+
+最常用的流程只有 3 步。
+
+### 1. 配 `.env`
+
+如果你当前用的是 iFlow：
+
+```env
+C3_API_KEY=your_iflow_key
+C3_BASE_URL=https://apis.iflow.cn/v1
+C3_WIRE_API=chat_completions
+C3_DISABLE_RESPONSE_STORAGE=true
+C3_REASONING_EFFORT=xhigh
+C3_VERBOSITY=high
+```
+
+### 2. 先测接口
+
+```bash
+python c3_triage_agent/provider_probe.py \
+  --model qwen3-coder-plus \
+  --endpoint chat \
+  --payload-mode both
+```
+
+如果这里不通，就先修 API，不要先改 agent。
+
+### 3. 再跑 agent
+
+```bash
+python c3_triage_agent/autonomous_triage_runner.py \
+  --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
+  --provider openai \
+  --model qwen3-coder-plus \
+  --max-steps 6
+```
+
+## 你平时真正会用到的命令
+
+正常 triage：
+
+```bash
+python c3_triage_agent/autonomous_triage_runner.py \
+  --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
+  --provider openai \
+  --model qwen3-coder-plus \
+  --max-steps 6
+```
+
+盲测“独立发现能力”：
+
+```bash
+python c3_triage_agent/autonomous_triage_runner.py \
+  --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
+  --provider openai \
+  --model qwen3-coder-plus \
+  --history-prompt-mode hidden \
+  --max-steps 6
+```
+
+只看 prompt，不真正调用模型：
+
+```bash
+python c3_triage_agent/autonomous_triage_runner.py \
+  --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
+  --provider openai \
+  --model qwen3-coder-plus \
+  --dry-run
+```
+
+## 我该怎么换自己的 case
+
+最简单的方式就是新建一个文本文件，里面放一段 mismatch，再把 `--report-file` 指过去。
+
+例如：
+
+```bash
+python c3_triage_agent/autonomous_triage_runner.py \
+  --report-file /path/to/your_mismatch.txt \
+  --provider openai \
+  --model qwen3-coder-plus \
+  --history-prompt-mode hidden \
+  --max-steps 6
+```
+
+你不需要先写 JSON manifest。
+
 ## 当前保留的文件
 
 - [autonomous_triage_runner.py](/home/caihao/compare_test/c3_triage_agent/autonomous_triage_runner.py)
@@ -41,58 +129,9 @@
 - [.env](/home/caihao/compare_test/c3_triage_agent/.env)
   你自己的真实配置。
 
-## 推荐的 `.env`
+## 隐藏历史摘要是什么意思
 
-如果你当前用的是 iFlow：
-
-```env
-C3_API_KEY=your_iflow_key
-C3_BASE_URL=https://apis.iflow.cn/v1
-C3_WIRE_API=chat_completions
-C3_DISABLE_RESPONSE_STORAGE=true
-C3_REASONING_EFFORT=xhigh
-C3_VERBOSITY=high
-```
-
-## 先测接口
-
-先不要急着跑 agent，先测 provider：
-
-```bash
-python c3_triage_agent/provider_probe.py \
-  --model qwen3-coder-plus \
-  --endpoint chat \
-  --payload-mode both
-```
-
-如果这一步不通，优先看 API 和模型，不要先怀疑 agent。
-
-## 再测 agent
-
-正常测试：
-
-```bash
-python c3_triage_agent/autonomous_triage_runner.py \
-  --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
-  --provider openai \
-  --model qwen3-coder-plus \
-  --max-steps 6
-```
-
-## 测“独立发现能力”
-
-如果你不想在 prompt 里提前告诉它历史 bug 摘要，而是希望它自己去搜：
-
-```bash
-python c3_triage_agent/autonomous_triage_runner.py \
-  --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
-  --provider openai \
-  --model qwen3-coder-plus \
-  --history-prompt-mode hidden \
-  --max-steps 6
-```
-
-这个模式下：
+`--history-prompt-mode hidden` 的意思是：
 
 - prompt 里不会直接给历史 issue 摘要
 - 只会告诉它 `history_bug_root` 路径
@@ -104,7 +143,42 @@ python c3_triage_agent/autonomous_triage_runner.py \
 --exclude-history 8617
 ```
 
-## 运行后会记录什么
+## agent 现在到底能不能自己执行代码
+
+可以。
+
+当前 agent 的工作方式是：
+
+1. 模型先返回 JSON，里面带 `actions`
+2. runner 执行这些 `actions`
+3. 把脚本输出再喂回模型
+4. 模型继续分析，直到给出最终结论
+
+当前支持的 action 类型只有两种：
+
+- `run`
+- `write_file`
+
+当前允许的命令前缀是：
+
+- `python`
+- `python3`
+- `rg`
+- `sed`
+- `cat`
+- `head`
+- `tail`
+- `ls`
+- `find`
+
+所以它现在已经具备：
+
+- 自己搜索历史 issue
+- 自己运行 POC
+- 自己读取脚本内容
+- 根据输出继续分析
+
+## 运行后看哪里
 
 每轮运行都会在 `runs/<timestamp>/` 下保存：
 
@@ -141,10 +215,17 @@ python c3_triage_agent/autonomous_triage_runner.py \
 - `final_verdict.json`
   最终判断结果
 
+如果你只想快速看“它有没有真的执行脚本并读输出”，优先看：
+
+- `commands/*.json`
+- `analysis_trace.md`
+- `transcript.jsonl`
+
+这三个通常就够了。
+
 ## 当前设计结论
 
 这套目录现在更适合做两件事：
 
 1. 测 provider 是否稳定
 2. 测 agent 是否能独立发现“这是重复问题还是新问题”
-
