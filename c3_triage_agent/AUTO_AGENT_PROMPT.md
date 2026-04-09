@@ -4,6 +4,10 @@ You start from raw failure text only.
 You must infer the engine, search local history, decide whether the issue is
 repeated, and reproduce it if possible.
 
+Always obey the mode rules included in the user prompt.
+If the run says `discovery mode`, do not use `history_find_bug/` or any
+existing POC outside `c3_triage_agent/`.
+
 Priorities:
 
 1. infer the likely engine and failure family from the raw report

@@ -56,6 +56,17 @@ python c3_triage_agent/autonomous_triage_runner.py \
   --max-steps 6
 ```
 
+严格测“自主发现新问题”的能力：
+
+```bash
+python c3_triage_agent/autonomous_triage_runner.py \
+  --report-file c3_triage_agent/incidents/qdrant_test71_mismatch.txt \
+  --provider openai \
+  --model qwen3-coder-plus \
+  --run-mode discovery \
+  --max-steps 6
+```
+
 盲测“独立发现能力”：
 
 ```bash
@@ -65,6 +76,12 @@ python c3_triage_agent/autonomous_triage_runner.py \
   --model qwen3-coder-plus \
   --history-prompt-mode hidden \
   --max-steps 6
+```
+
+如果你既想隐藏摘要，又想彻底禁止它访问历史 issue，优先用：
+
+```bash
+--run-mode discovery
 ```
 
 只看 prompt，不真正调用模型：
@@ -129,13 +146,23 @@ python c3_triage_agent/autonomous_triage_runner.py \
 - [.env](/home/caihao/compare_test/c3_triage_agent/.env)
   你自己的真实配置。
 
-## 隐藏历史摘要是什么意思
+## `hidden` 和 `discovery` 的区别
 
 `--history-prompt-mode hidden` 的意思是：
 
 - prompt 里不会直接给历史 issue 摘要
 - 只会告诉它 `history_bug_root` 路径
 - 它需要自己用 `rg`、`ls`、`python` 去搜索和验证
+
+`--run-mode discovery` 的意思更严格：
+
+- 不给历史摘要
+- 不给 `history_bug_root`
+- 不允许命令访问 `history_find_bug`
+- 工作目录限制在 `c3_triage_agent`
+- 它只能自己写 `repros/` 里的脚本，再自己运行和分析
+
+如果你要评估“它能不能自己从报错出发构造复现并定位问题”，更推荐 `discovery`。
 
 如果你只是想隐藏某个特定历史 issue，也可以继续用：
 
@@ -170,6 +197,13 @@ python c3_triage_agent/autonomous_triage_runner.py \
 - `tail`
 - `ls`
 - `find`
+
+在 `--run-mode discovery` 下会更严格：
+
+- 工作目录变成 `c3_triage_agent`
+- 只能运行 `python repros/...`、`python auto_cases/...`、`python incidents/...`
+- 只能对 `repros/`、`auto_cases/`、`incidents/` 做 `ls/find/cat/head/tail`
+- 禁止访问 `history_find_bug`
 
 所以它现在已经具备：
 

@@ -54,6 +54,20 @@ DEFAULT_ALLOWED_PREFIXES = [
     "find ",
 ]
 
+DISCOVERY_ALLOWED_PREFIXES = [
+    "python repros/",
+    "python auto_cases/",
+    "python incidents/",
+    "python3 repros/",
+    "python3 auto_cases/",
+    "python3 incidents/",
+    "ls ",
+    "find ",
+    "cat ",
+    "head ",
+    "tail ",
+]
+
 BANNED_PATTERNS = [
     r"\brm\b",
     r"\bsudo\b",
@@ -137,6 +151,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="Skip the LLM call and only save the initial prompt context")
     parser.add_argument("--exclude-history", action="append", default=[], help="Exclude matching history issues from the prompt summary (repeatable)")
     parser.add_argument(
+        "--run-mode",
+        default="dedup",
+        choices=["dedup", "discovery"],
+        help="`dedup` can search history_find_bug; `discovery` must stay inside c3_triage_agent and discover a fresh repro",
+    )
+    parser.add_argument(
         "--history-prompt-mode",
         default="summary",
         choices=["summary", "hidden"],
@@ -173,6 +193,26 @@ def is_command_allowed(command: str, allowed_prefixes: list[str]) -> tuple[bool,
     if any(stripped.startswith(prefix) for prefix in allowed_prefixes):
         return True, ""
     return False, "command prefix not allowed"
+
+
+def is_discovery_safe_command(command: str) -> tuple[bool, str]:
+    stripped = command.strip()
+    ok, reason = is_command_allowed(stripped, DISCOVERY_ALLOWED_PREFIXES)
+    if not ok:
+        return False, reason
+    banned_substrings = [
+        "..",
+        "history_find_bug",
+        "/home/caihao/compare_test/history_find_bug",
+        "/home/caihao/compare_test/operator_test",
+        "/home/caihao/compare_test/milvus_fuzz_oracle.py",
+        "/home/caihao/compare_test/qdrant_fuzz_oracle.py",
+        "/home/caihao/compare_test/weaviate_fuzz_oracle.py",
+    ]
+    for item in banned_substrings:
+        if item in stripped:
+            return False, f"discovery mode forbids access to: {item}"
+    return True, ""
 
 
 def truncate_text(text: str, limit: int = 12000) -> str:
@@ -316,30 +356,60 @@ def format_history_catalog(items: list[dict]) -> str:
     return "\n".join(lines)
 
 
-def build_initial_prompt(report_text: str, run_dir: Path, history_items: list[dict], history_prompt_mode: str) -> str:
+def build_initial_prompt(report_text: str, run_dir: Path, history_items: list[dict], history_prompt_mode: str, run_mode: str) -> str:
     report = truncate_text(report_text, 6000)
-    if history_prompt_mode == "hidden":
+    mode_section = (
+        "- discovery mode: stay inside c3_triage_agent, do not use history_find_bug, derive a fresh repro yourself\n\n"
+        if run_mode == "discovery"
+        else "- dedup mode: you may search history_find_bug and compare with existing POCs\n\n"
+    )
+    if run_mode == "discovery":
+        history_section = (
+            "History issue summaries:\n"
+            "- unavailable in discovery mode; do not use history_find_bug or existing POCs\n\n"
+        )
+        workspace_section = (
+            "Workspace:\n"
+            f"- root: {ROOT}\n"
+            f"- repros_root: {REPROS_ROOT}\n"
+            f"- auto_cases_root: {AUTO_CASES_ROOT}\n"
+            f"- run_dir: {run_dir}\n\n"
+        )
+    elif history_prompt_mode == "hidden":
         history_section = (
             "History issue summaries:\n"
             "- hidden for this evaluation run; use history_bug_root to search the workspace yourself\n\n"
         )
+        workspace_section = (
+            "Workspace:\n"
+            f"- root: {DEFAULT_WORKDIR}\n"
+            f"- repros_root: {REPROS_ROOT}\n"
+            f"- auto_cases_root: {AUTO_CASES_ROOT}\n"
+            f"- history_bug_root: {HISTORY_ROOT}\n"
+            f"- run_dir: {run_dir}\n\n"
+        )
     else:
         history_text = format_history_catalog(history_items)
         history_section = "History issue summaries:\n" f"{history_text}\n\n"
+        workspace_section = (
+            "Workspace:\n"
+            f"- root: {DEFAULT_WORKDIR}\n"
+            f"- repros_root: {REPROS_ROOT}\n"
+            f"- auto_cases_root: {AUTO_CASES_ROOT}\n"
+            f"- history_bug_root: {HISTORY_ROOT}\n"
+            f"- run_dir: {run_dir}\n\n"
+        )
     return (
         "Raw report:\n"
         f"{report}\n\n"
-        "Workspace:\n"
-        f"- root: {DEFAULT_WORKDIR}\n"
-        f"- repros_root: {REPROS_ROOT}\n"
-        f"- auto_cases_root: {AUTO_CASES_ROOT}\n"
-        f"- history_bug_root: {HISTORY_ROOT}\n"
-        f"- run_dir: {run_dir}\n\n"
+        f"{workspace_section}"
         "Default targets:\n"
         "- milvus host=127.0.0.1 port=19531\n"
         "- qdrant host=127.0.0.1 rest=6333 grpc=6334\n"
         "- weaviate host=127.0.0.1 rest=8080 grpc=50051\n\n"
         f"{history_section}"
+        "Mode rules:\n"
+        f"{mode_section}"
         "Response rules:\n"
         "- return JSON only\n"
         "- status is need_more_data or final\n"
@@ -362,7 +432,7 @@ def main() -> int:
     report_path = Path(args.report_file).resolve()
     report_text = load_text(report_path)
     history_catalog = load_history_catalog(HISTORY_CATALOG_PATH)
-    prompt_history_items = filter_history_items(history_catalog, args.exclude_history)
+    prompt_history_items = [] if args.run_mode == "discovery" else filter_history_items(history_catalog, args.exclude_history)
     run_dir = ensure_run_dir()
     write_json(
         run_dir / "runner_config.json",
@@ -382,11 +452,12 @@ def main() -> int:
             "exclude_history": args.exclude_history,
             "history_prompt_count": len(prompt_history_items),
             "history_prompt_mode": args.history_prompt_mode,
+            "run_mode": args.run_mode,
         },
     )
     (run_dir / "report_snapshot.txt").write_text(report_text, encoding="utf-8")
     write_json(run_dir / "history_prompt_items.json", {"items": prompt_history_items})
-    initial_prompt = build_initial_prompt(report_text, run_dir, prompt_history_items, args.history_prompt_mode)
+    initial_prompt = build_initial_prompt(report_text, run_dir, prompt_history_items, args.history_prompt_mode, args.run_mode)
     (run_dir / "system_prompt.md").write_text(load_text(PROMPT_PATH), encoding="utf-8")
     (run_dir / "prompt_step_0_user.md").write_text(initial_prompt, encoding="utf-8")
     if args.dry_run:
@@ -492,7 +563,12 @@ def main() -> int:
             label = action.get("label", f"step_{step}_{idx}")
             if action_type == "run":
                 command = action.get("command", "")
-                ok, reason = is_command_allowed(command, DEFAULT_ALLOWED_PREFIXES)
+                if args.run_mode == "discovery":
+                    ok, reason = is_discovery_safe_command(command)
+                    command_workdir = ROOT
+                else:
+                    ok, reason = is_command_allowed(command, DEFAULT_ALLOWED_PREFIXES)
+                    command_workdir = DEFAULT_WORKDIR
                 if not ok:
                     result = {
                         "type": "run",
@@ -503,7 +579,7 @@ def main() -> int:
                         "combined_output": f"rejected by runner: {reason}",
                     }
                 else:
-                    result = run_shell_command(command, workdir=DEFAULT_WORKDIR, timeout_sec=args.timeout_sec)
+                    result = run_shell_command(command, workdir=command_workdir, timeout_sec=args.timeout_sec)
                     result["type"] = "run"
                     result["label"] = label
                     write_json(run_dir / "commands" / f"step_{step}_{idx}_{label}.json", result)
