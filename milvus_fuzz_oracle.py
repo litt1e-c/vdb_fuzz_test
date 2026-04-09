@@ -2180,17 +2180,27 @@ class OracleQueryGenerator:
                     mask = series.apply(check_str_sub).astype("boolean")
                     return (f"({name} is not null and ({expr}))", mask & notnull_mask)
                 else:
-                    prefix = str(target)[:2] if len(str(target)) >= 2 else str(target)[:1]
-                    if any(c in prefix for c in ['%', '_', '"', '\\\\']):
-                        prefix = 'a'
-                    expr = f'{name}[{idx}] like "{prefix}%"'
+                    patterns = self._build_true_like_patterns(target)
+                    if not patterns:
+                        expr = f'{name}[{idx}] == {val_str}'
 
-                    def check_like_sub(x, _idx=idx, _prefix=prefix):
+                        def check_str_sub(x, _idx=idx, _target=str(target)):
+                            if x is None: return None
+                            if not isinstance(x, list) or len(x) <= _idx: return False
+                            return x[_idx] == _target
+
+                        mask = series.apply(check_str_sub).astype("boolean")
+                        return (f"({name} is not null and ({expr}))", mask & notnull_mask)
+
+                    pattern = random.choice(patterns)
+                    expr = f'{name}[{idx}] like "{self._escape_string_literal(pattern)}"'
+
+                    def check_like_sub(x, _idx=idx, _pattern=pattern):
                         if x is None: return None
                         if not isinstance(x, list) or len(x) <= _idx: return False
                         v = x[_idx]
                         if not isinstance(v, str): return False
-                        return v.startswith(_prefix)
+                        return self._like_matches(v, _pattern)
 
                     mask = series.apply(check_like_sub).astype("boolean")
                     return (f"({name} is not null and ({expr}))", mask & notnull_mask)
@@ -4399,43 +4409,39 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return random.choice(strategies)
 
     def _gen_boundary_str(self, fname, val):
-
-        val = str(val)
-        if '"' in val:
-            val = val.replace('"', '\\"')
+        raw_val = str(val)
+        safe_val = self._escape_string_literal(raw_val)
         strategies = []
 
         # 1. 等值
-        strategies.append(f'{fname} == "{val}"')
+        strategies.append(f'{fname} == "{safe_val}"')
 
         # 2. 包含逻辑
-        if len(val) > 0:
-            strategies.append(f'{fname} >= "{val}"')
-            strategies.append(f'{fname} <= "{val}"')
+        if len(raw_val) > 0:
+            strategies.append(f'{fname} >= "{safe_val}"')
+            strategies.append(f'{fname} <= "{safe_val}"')
             # [WORKAROUND: Milvus JSON != Bug]
-            # 原始代码: strategies.append(f'{fname} != "{val}_fake"')
+            # 原始代码: strategies.append(f'{fname} != "{raw_val}_fake"')
             if '"' not in str(fname)[:5]:
-                strategies.append(f'{fname} != "{val}_fake"')
+                fake_safe_val = self._escape_string_literal(f"{raw_val}_fake")
+                strategies.append(f'{fname} != "{fake_safe_val}"')
             else:
-                strategies.append(f'{fname} >= "{val}"')
+                strategies.append(f'{fname} >= "{safe_val}"')
 
-            # Like 前缀
-            prefix = val[:random.randint(1, len(val))]
-            # 只有当前缀不包含特殊字符时才用 like，防止意外匹配错
-            if "%" not in prefix and "_" not in prefix:
-                strategies.append(f'{fname} like "{prefix}%"')
-                # 额外：后缀单字符匹配（始终为真，因为字符串必以其最后一个字符结尾）
-            suffix_char = val[-1]
-            if suffix_char not in ["%", "_"]:
-                strategies.append(f'{fname} like "%{suffix_char}"')
+            for pattern in self._build_true_like_patterns(raw_val):
+                strategies.append(
+                    f'{fname} like "{self._escape_string_literal(pattern)}"'
+                )
 
         # 3. 列表包含
         dummies = [self._random_string(5) for _ in range(3)]
-        candidates = dummies + [val]
+        candidates = dummies + [raw_val]
         random.shuffle(candidates)
-        in_list = ", ".join([f'"{s}"' for s in candidates])
+        in_list = ", ".join(
+            f'"{self._escape_string_literal(s)}"' for s in candidates
+        )
         strategies.append(f'{fname} in [{in_list}]')
-        strategies.extend(self._gen_true_membership_strategies(fname, val))
+        strategies.extend(self._gen_true_membership_strategies(fname, raw_val))
 
         return random.choice(strategies)
 

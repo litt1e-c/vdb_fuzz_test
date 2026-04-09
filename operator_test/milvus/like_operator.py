@@ -15,7 +15,12 @@ COLLECTION_NAME = "like_operator_validation"
 
 
 def query_ids(collection, expr):
-    rows = collection.query(expr, output_fields=["id"], consistency_level="Strong")
+    rows = collection.query(
+        expr,
+        output_fields=["id"],
+        consistency_level="Strong",
+        timeout=10,
+    )
     return sorted(row["id"] for row in rows)
 
 
@@ -34,6 +39,14 @@ def main():
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
             FieldSchema(name="role", dtype=DataType.VARCHAR, max_length=32, nullable=True),
             FieldSchema(name="meta", dtype=DataType.JSON, nullable=True),
+            FieldSchema(
+                name="tags",
+                dtype=DataType.ARRAY,
+                element_type=DataType.VARCHAR,
+                max_capacity=4,
+                max_length=32,
+                nullable=True,
+            ),
             FieldSchema(name="vec", dtype=DataType.FLOAT_VECTOR, dim=2),
         ]
         schema = CollectionSchema(fields)
@@ -45,43 +58,48 @@ def main():
                     "id": 1,
                     "role": "admin",
                     "meta": {"role": "admin"},
+                    "tags": ["admin", "ops"],
                     "vec": [0.0, 0.0],
                 },
                 {
                     "id": 2,
                     "role": "user",
                     "meta": {"role": "user"},
+                    "tags": ["user", "eng"],
                     "vec": [1.0, 1.0],
                 },
                 {
                     "id": 3,
                     "role": "guest",
                     "meta": {"role": "guest"},
+                    "tags": ["guest", "sales"],
                     "vec": [2.0, 2.0],
                 },
                 {
                     "id": 4,
                     "role": None,
                     "meta": {"team": "ops"},
+                    "tags": ["ops"],
                     "vec": [3.0, 3.0],
                 },
                 {
                     "id": 5,
                     "role": None,
                     "meta": None,
+                    "tags": None,
                     "vec": [4.0, 4.0],
                 },
                 {
                     "id": 6,
                     "role": "alpha",
                     "meta": {"role": None},
+                    "tags": ["alpha"],
                     "vec": [5.0, 5.0],
                 },
             ]
         )
-        col.flush()
-        col.create_index("vec", {"metric_type": "L2", "index_type": "FLAT"})
-        col.load()
+        col.create_index("vec", {"metric_type": "L2", "index_type": "FLAT"}, timeout=10)
+        col.load(timeout=10)
         time.sleep(1)
 
         tests = [
@@ -131,9 +149,39 @@ def main():
                 [],
             ),
             (
-                "json_null_key_filtered",
+                "json_null_or_null_field_filtered",
                 'meta["role"] like "alph%"',
                 [],
+            ),
+            (
+                "json_guarded_not_like",
+                'meta is not null and not (meta["role"] like "ad%")',
+                [2, 3, 4, 6],
+            ),
+            (
+                "json_guarded_or_like",
+                '(meta is not null and (meta["role"] like "ad%")) or id == 2',
+                [1, 2],
+            ),
+            (
+                "array_prefix_like",
+                'tags[0] like "ad%"',
+                [1],
+            ),
+            (
+                "array_suffix_like",
+                'tags[0] like "%min"',
+                [1],
+            ),
+            (
+                "array_infix_like",
+                'tags[0] like "%dmi%"',
+                [1],
+            ),
+            (
+                "array_underscore_like",
+                'tags[0] like "ad_in"',
+                [1],
             ),
         ]
 
@@ -148,7 +196,7 @@ def main():
 
     finally:
         if utility.has_collection(COLLECTION_NAME):
-            utility.drop_collection(COLLECTION_NAME)
+            utility.drop_collection(COLLECTION_NAME, timeout=10)
         connections.disconnect("default")
 
 
