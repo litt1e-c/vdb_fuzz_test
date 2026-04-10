@@ -88,6 +88,11 @@ def build_points() -> list[PointStruct]:
             vector=[0.8, 0.2],
             payload={"title": 12345},
         ),
+        PointStruct(
+            id=7,
+            vector=[0.3, 0.7],
+            payload={"title": "good hardware cheap"},
+        ),
     ]
 
 
@@ -120,6 +125,12 @@ def run_transport(prefer_grpc: bool) -> bool:
             Filter(must=[FieldCondition(key="title", match=MatchText(text="quick brown"))]),
             [1],
             "A longer contiguous substring should still match exactly.",
+        ),
+        (
+            "text_multi_term_non_contiguous",
+            Filter(must=[FieldCondition(key="title", match=MatchText(text="good cheap"))]),
+            [],
+            "Without a full-text index, a multi-word query should not match when the whole query is not a contiguous substring.",
         ),
         (
             "text_excludes_missing_null_type_mismatch",
