@@ -2535,6 +2535,7 @@ class OracleQueryGenerator:
         覆盖: field + const, field - const, field * const, field / const, field % const
         当前保守策略下，`+` / `-` / `*` 仅在整列都不会触发 INT64 溢出时生成；
         `/` 仅覆盖本地已验证的子集：非零正整数常量除数，INT 使用截断除法，FLOAT/DOUBLE 使用实数除法。
+        `%` 当前仅对 INT 字段建模；本地 19532 验证下，FLOAT/DOUBLE 上的 `%` 会被解析器拒绝。
         """
         if ftype in ALL_INT_TYPES:
             ops = ["+", "-", "*", "/", "%"]
@@ -4850,6 +4851,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
         针对数值类型生成算术运算查询。
         当前保守策略下，`+` / `-` / `*` 仅在整列都不会触发 INT64 溢出时生成；
         `/` 仅覆盖本地已验证的子集：非零正整数常量除数，INT 使用截断除法，FLOAT/DOUBLE 使用实数除法。
+        `%` 当前仅对 INT 字段建模；本地 19532 验证下，FLOAT/DOUBLE 上的 `%` 会被解析器拒绝。
         """
         if not isinstance(val, (int, float, np.integer, np.floating)): return None
 
