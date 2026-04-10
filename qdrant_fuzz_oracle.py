@@ -15,6 +15,7 @@ import string
 import math
 import copy
 import re
+import uuid
 import numpy as np
 import pandas as pd
 import json
@@ -45,6 +46,10 @@ N = 5000                   # 数据量
 DIM = 128                  # 向量维度
 BATCH_SIZE = 500           # 批次大小
 SLEEP_INTERVAL = 0.01      # 每次插入后暂停
+READ_CONSISTENCY = "all"   # 读一致性默认最高；可通过 CLI 覆盖或设为 random
+WRITE_ORDERING = "strong"  # 写 ordering 默认最高；可通过 CLI 覆盖或设为 random
+ALL_READ_CONSISTENCY_LEVELS = ["all", "majority", "quorum", 1]
+ALL_WRITE_ORDERING_LEVELS = ["weak", "medium", "strong"]
 
 # 全局度量类型列表（延迟初始化，在 run() 内种子设置后随机选取）
 ALL_DISTANCE_TYPES = [Distance.EUCLID, Distance.COSINE, Distance.DOT, Distance.MANHATTAN]
@@ -152,6 +157,7 @@ class FieldType:
     FLOAT = "FLOAT"
     BOOL = "BOOL"
     STRING = "STRING"
+    UUID = "UUID"
     JSON = "JSON"
     ARRAY_INT = "ARRAY_INT"
     ARRAY_STR = "ARRAY_STR"
@@ -217,6 +223,12 @@ class DataManager:
             return [
                 "", " ", "0", "A", "a" * 64,
                 "Z" * 256, "!@#$%^&*()_+-=[]{}|;:,.<>?/"
+            ]
+        if ftype == FieldType.UUID:
+            return [
+                "00000000-0000-0000-0000-000000000000",
+                "00000000-0000-0000-0000-000000000001",
+                "ffffffff-ffff-ffff-ffff-ffffffffffff",
             ]
         if ftype == FieldType.JSON:
             return [
@@ -375,6 +387,11 @@ class DataManager:
                 return bool(v)
             except Exception:
                 return None
+        if ftype == FieldType.UUID:
+            try:
+                return str(uuid.UUID(str(v)))
+            except Exception:
+                return None
         if ftype == FieldType.FLOAT:
             try:
                 fv = float(v)
@@ -486,7 +503,7 @@ class DataManager:
                 out[fname] = pd.Series(pd.array(coerced, dtype="boolean"), index=out.index)
             elif ftype == FieldType.FLOAT:
                 out[fname] = pd.to_numeric(out[fname], errors="coerce")
-            elif ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT, FieldType.GEO, FieldType.JSON, FieldType.ARRAY_OBJECT]:
+            elif ftype in [FieldType.UUID, FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT, FieldType.GEO, FieldType.JSON, FieldType.ARRAY_OBJECT]:
                 out[fname] = out[fname].apply(lambda x, t=ftype: self._normalize_scalar_for_field(x, t))
 
         return out
@@ -525,11 +542,14 @@ class DataManager:
         chars = string.ascii_letters + string.digits
         return ''.join(random.choices(chars, k=random.randint(min_len, max_len)))
 
+    def _random_uuid_string(self):
+        return str(uuid.UUID(int=random.getrandbits(128)))
+
     def generate_schema(self):
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
         num_fields = random.randint(3, 20)
-        types_pool = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.DATETIME]
+        types_pool = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.UUID, FieldType.DATETIME]
 
         for i in range(num_fields):
             ftype = random.choice(types_pool)
@@ -608,6 +628,10 @@ class DataManager:
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.STRING:
                 values = [self._random_string(0, random.randint(5, 50)) for _ in range(N)]
+                values = self._inject_boundary_values(values, ftype, rng)
+                data[fname] = self._apply_nulls(values, rng)
+            elif ftype == FieldType.UUID:
+                values = [self._random_uuid_string() for _ in range(N)]
                 values = self._inject_boundary_values(values, ftype, rng)
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.JSON:
@@ -759,6 +783,9 @@ class DataManager:
             elif ftype == FieldType.STRING:
                 val = self._random_string(0, random.randint(5, 50))
                 row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
+            elif ftype == FieldType.UUID:
+                val = self._random_uuid_string()
+                row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.JSON:
                 if rng.random() < self.null_ratio:
                     row[fname] = None
@@ -841,6 +868,8 @@ class DataManager:
             value = bool(rng.choice([True, False]))
         elif ftype == FieldType.STRING:
             value = self._random_string(0, random.randint(5, 50))
+        elif ftype == FieldType.UUID:
+            value = self._random_uuid_string()
         elif ftype == FieldType.DATETIME:
             epoch_2020 = int(datetime(2020, 1, 1).timestamp())
             epoch_2025 = int(datetime(2025, 1, 1).timestamp())
@@ -901,7 +930,7 @@ class DataManager:
             return None
 
         # 选择随机类型（标量为主，保持简单）
-        type_choices = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.DATETIME]
+        type_choices = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.UUID, FieldType.DATETIME]
         ftype = random.choice(type_choices)
 
         type_name = get_type_name(ftype).lower()
@@ -1013,6 +1042,48 @@ class QdrantManager:
             "backend_prefer_grpc": None,
         }
 
+    def _pick_read_consistency(self):
+        if READ_CONSISTENCY == "random":
+            return random.choice(ALL_READ_CONSISTENCY_LEVELS)
+        return READ_CONSISTENCY
+
+    def _pick_write_ordering(self):
+        if WRITE_ORDERING == "random":
+            return random.choice(ALL_WRITE_ORDERING_LEVELS)
+        return WRITE_ORDERING
+
+    def retrieve(self, **kwargs):
+        kwargs.setdefault("consistency", self._pick_read_consistency())
+        return self.client.retrieve(**kwargs)
+
+    def scroll(self, **kwargs):
+        kwargs.setdefault("consistency", self._pick_read_consistency())
+        return self.client.scroll(**kwargs)
+
+    def query_points(self, **kwargs):
+        kwargs.setdefault("consistency", self._pick_read_consistency())
+        return self.client.query_points(**kwargs)
+
+    def query_points_groups(self, **kwargs):
+        kwargs.setdefault("consistency", self._pick_read_consistency())
+        return self.client.query_points_groups(**kwargs)
+
+    def upsert(self, **kwargs):
+        kwargs.setdefault("ordering", self._pick_write_ordering())
+        return self.client.upsert(**kwargs)
+
+    def set_payload(self, **kwargs):
+        kwargs.setdefault("ordering", self._pick_write_ordering())
+        return self.client.set_payload(**kwargs)
+
+    def create_payload_index(self, **kwargs):
+        kwargs.setdefault("ordering", self._pick_write_ordering())
+        return self.client.create_payload_index(**kwargs)
+
+    def delete_payload_index(self, **kwargs):
+        kwargs.setdefault("ordering", self._pick_write_ordering())
+        return self.client.delete_payload_index(**kwargs)
+
     def reset_collection(self, schema_config):
         global DISTANCE_TYPE
         # 延迟初始化距离度量（在种子设置后随机选取）
@@ -1109,7 +1180,7 @@ class QdrantManager:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    self.client.upsert(
+                    self.upsert(
                         collection_name=COLLECTION_NAME,
                         points=points,
                         wait=True
@@ -1134,37 +1205,43 @@ class QdrantManager:
             ftype = field["type"]
             try:
                 if ftype == FieldType.INT:
-                    self.client.create_payload_index(
+                    self.create_payload_index(
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
                         field_schema=PayloadSchemaType.INTEGER
                     )
                 elif ftype == FieldType.FLOAT:
-                    self.client.create_payload_index(
+                    self.create_payload_index(
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
                         field_schema=PayloadSchemaType.FLOAT
                     )
                 elif ftype == FieldType.STRING:
-                    self.client.create_payload_index(
+                    self.create_payload_index(
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
                         field_schema=PayloadSchemaType.KEYWORD
                     )
+                elif ftype == FieldType.UUID:
+                    self.create_payload_index(
+                        collection_name=COLLECTION_NAME,
+                        field_name=fname,
+                        field_schema=PayloadSchemaType.UUID
+                    )
                 elif ftype == FieldType.BOOL:
-                    self.client.create_payload_index(
+                    self.create_payload_index(
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
                         field_schema=PayloadSchemaType.BOOL
                     )
                 elif ftype == FieldType.DATETIME:
-                    self.client.create_payload_index(
+                    self.create_payload_index(
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
                         field_schema=PayloadSchemaType.INTEGER
                     )
                 elif ftype == FieldType.GEO:
-                    self.client.create_payload_index(
+                    self.create_payload_index(
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
                         field_schema=PayloadSchemaType.GEO
@@ -1195,7 +1272,7 @@ class QdrantManager:
         for start in range(0, len(ids), batch_size):
             batch_ids = ids[start:start + batch_size]
             try:
-                recs = self.client.retrieve(
+                recs = self.retrieve(
                     collection_name=COLLECTION_NAME,
                     ids=batch_ids,
                     with_payload=True,
@@ -1261,7 +1338,7 @@ class QdrantManager:
             batch = backfill_data[start:start + BATCH_SIZE]
             for _, row_id, value in batch:
                 try:
-                    self.client.set_payload(
+                    self.set_payload(
                         collection_name=COLLECTION_NAME,
                         payload={field_name: value},
                         points=[row_id],
@@ -1280,6 +1357,7 @@ class QdrantManager:
             FieldType.INT: PayloadSchemaType.INTEGER,
             FieldType.FLOAT: PayloadSchemaType.FLOAT,
             FieldType.STRING: PayloadSchemaType.KEYWORD,
+            FieldType.UUID: PayloadSchemaType.UUID,
             FieldType.BOOL: PayloadSchemaType.BOOL,
             FieldType.DATETIME: PayloadSchemaType.INTEGER,
             FieldType.GEO: PayloadSchemaType.GEO,
@@ -1287,7 +1365,7 @@ class QdrantManager:
         schema_type = type_to_schema.get(ftype)
         if schema_type:
             try:
-                self.client.create_payload_index(
+                self.create_payload_index(
                     collection_name=COLLECTION_NAME,
                     field_name=fname,
                     field_schema=schema_type,
@@ -1311,7 +1389,7 @@ class QdrantManager:
         for start in range(0, len(ids), BATCH_SIZE):
             batch = ids[start:start + BATCH_SIZE]
             try:
-                points = self.client.retrieve(
+                points = self.retrieve(
                     collection_name=COLLECTION_NAME,
                     ids=batch,
                     with_payload=True,
@@ -1341,7 +1419,7 @@ class QdrantManager:
                             continue
                         vec = next(iter(vec.values()))
 
-                    self.client.upsert(
+                    self.upsert(
                         collection_name=COLLECTION_NAME,
                         points=[PointStruct(id=pid, vector=vec, payload=current_payload)],
                         wait=True,
@@ -1357,7 +1435,7 @@ class QdrantManager:
         每次随机选择 1~3 个字段进行索引重建。
         """
         indexable = [f for f in schema_config if f["type"] in (
-            FieldType.INT, FieldType.FLOAT, FieldType.STRING,
+            FieldType.INT, FieldType.FLOAT, FieldType.STRING, FieldType.UUID,
             FieldType.BOOL, FieldType.DATETIME, FieldType.GEO
         )]
         if not indexable:
@@ -1371,6 +1449,7 @@ class QdrantManager:
             FieldType.INT: PayloadSchemaType.INTEGER,
             FieldType.FLOAT: PayloadSchemaType.FLOAT,
             FieldType.STRING: PayloadSchemaType.KEYWORD,
+            FieldType.UUID: PayloadSchemaType.UUID,
             FieldType.BOOL: PayloadSchemaType.BOOL,
             FieldType.DATETIME: PayloadSchemaType.INTEGER,
             FieldType.GEO: PayloadSchemaType.GEO,
@@ -1381,14 +1460,14 @@ class QdrantManager:
             ftype = field["type"]
             try:
                 # 删除索引
-                self.client.delete_payload_index(
+                self.delete_payload_index(
                     collection_name=COLLECTION_NAME,
                     field_name=fname,
                     wait=True
                 )
                 time.sleep(0.1)
                 # 重建索引
-                self.client.create_payload_index(
+                self.create_payload_index(
                     collection_name=COLLECTION_NAME,
                     field_name=fname,
                     field_schema=type_to_schema.get(ftype, PayloadSchemaType.KEYWORD),
@@ -1639,6 +1718,9 @@ class OracleQueryGenerator:
             length = random.randint(15, 30)
             return ''.join(random.choices(chars, k=length))
 
+        elif ftype == FieldType.UUID:
+            return self._random_uuid_string()
+
         elif ftype == FieldType.JSON:
             new_key = self._random_string(10, 15)
             new_val = self._random_string(10, 15)
@@ -1873,6 +1955,15 @@ class OracleQueryGenerator:
                 mask = self._safe_apply(series, lambda x: x in valid_vals if x is not None else False)
                 expr_str = f'{name} in {valid_vals}'
 
+        elif ftype == FieldType.UUID:
+            val_uuid = str(uuid.UUID(str(val)))
+            filter_cond = FieldCondition(key=name, match=MatchValue(value=val_uuid))
+            mask = self._safe_apply(
+                series,
+                lambda x, t=val_uuid: self._dm._normalize_scalar_for_field(x, FieldType.UUID) == t
+            )
+            expr_str = f'{name} uuid == "{val_uuid}"'
+
         elif ftype == FieldType.JSON:
             # JSON 嵌套查询
             return self.gen_json_expr(name, series, val)
@@ -1990,16 +2081,10 @@ class OracleQueryGenerator:
 
         elif ftype == FieldType.DATETIME:
             val_int = self._clip_int64(int(val))
-            op = random.choice([">", "<", ">=", "<=", "==", "!=", "in", "not_in"])
-            if op == "==":
-                filter_cond = FieldCondition(key=name, match=MatchValue(value=val_int))
-                mask = self._safe_apply(series, lambda x, t=val_int: self._normalize_int_scalar(x) == t)
-                expr_str = f"{name} == {val_int} (timestamp)"
-            elif op == "!=":
-                filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": [val_int]}))
-                mask = self._series_match_except(name, series, {val_int}, self._normalize_int_scalar)
-                expr_str = f"{name} != {val_int} (timestamp)"
-            elif op == ">":
+            # Current DATETIME fields are stored as integer timestamp surrogates, not
+            # official RFC3339 datetime payloads, so keep this branch range-only.
+            op = random.choice([">", "<", ">=", "<="])
+            if op == ">":
                 filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
                 mask = self._safe_apply(series, 
                     lambda x, t=val_int: (
@@ -2031,38 +2116,6 @@ class OracleQueryGenerator:
                     )
                 )
                 expr_str = f"{name} <= {val_int} (timestamp)"
-            elif op == "in":
-                valid_vals = []
-                for x in self.df[name].dropna().unique()[:50]:
-                    nx = self._normalize_int_scalar(self._convert_to_native(x))
-                    if nx is not None:
-                        valid_vals.append(nx)
-                valid_vals = list(dict.fromkeys(valid_vals))
-                sample_size = min(random.randint(2, 6), len(valid_vals))
-                in_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
-                if val_int not in in_vals:
-                    in_vals[0] = val_int
-                filter_cond = FieldCondition(key=name, match=MatchAny(any=in_vals))
-                in_set = set(in_vals)
-                mask = self._safe_apply(series, 
-                    lambda x, s=in_set: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) in s
-                    )
-                )
-                expr_str = f"{name} in {in_vals} (timestamp)"
-            else:  # not_in
-                valid_vals = []
-                for x in self.df[name].dropna().unique()[:50]:
-                    nx = self._normalize_int_scalar(self._convert_to_native(x))
-                    if nx is not None:
-                        valid_vals.append(nx)
-                valid_vals = list(dict.fromkeys(valid_vals))
-                sample_size = min(random.randint(2, 6), len(valid_vals))
-                excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [val_int]
-                filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
-                excl_set = set(excl_vals)
-                mask = self._series_match_except(name, series, excl_set, self._normalize_int_scalar)
-                expr_str = f"{name} not in {excl_vals} (timestamp)"
 
         elif ftype == FieldType.GEO:
             if isinstance(val, dict) and "lat" in val and "lon" in val:
@@ -3328,7 +3381,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             val = pivot_row[fname]
             if val is None: continue
             if isinstance(val, float) and np.isnan(val): continue
-            if ftype in [FieldType.INT, FieldType.FLOAT, FieldType.STRING, FieldType.BOOL, FieldType.DATETIME]:
+            if ftype in [FieldType.INT, FieldType.FLOAT, FieldType.STRING, FieldType.UUID, FieldType.BOOL, FieldType.DATETIME]:
                 valid_fields.append(f)
 
         if not valid_fields:
@@ -3364,6 +3417,10 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     v = str(val)
                     filters.append(FieldCondition(key=fname, match=MatchValue(value=v)))
                     exprs.append(f'{fname}=="{v}"')
+                elif ftype == FieldType.UUID:
+                    v = str(uuid.UUID(str(val)))
+                    filters.append(FieldCondition(key=fname, match=MatchValue(value=v)))
+                    exprs.append(f'{fname} uuid=="{v}"')
             except:
                 pass
 
@@ -3572,6 +3629,13 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 f'{fname} not in {fake_strs}'
             ))
             return random.choice(strategies)
+
+        elif ftype == FieldType.UUID:
+            val_uuid = str(uuid.UUID(str(val)))
+            return (
+                FieldCondition(key=fname, match=MatchValue(value=val_uuid)),
+                f'{fname} uuid == "{val_uuid}"'
+            )
 
         elif ftype == FieldType.JSON:
             return self._gen_pqs_json_filter(fname, val)
@@ -3916,7 +3980,7 @@ def query_qdrant_rows(qm, id_list, limit=5):
     if not ids:
         return {}
     try:
-        result = qm.client.retrieve(
+        result = qm.retrieve(
             collection_name=COLLECTION_NAME,
             ids=ids,
             with_payload=True,
@@ -4117,7 +4181,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
             for row, vec in zip(new_rows, new_vecs):
                 payload = {k: v for k, v in row.items() if k != "id"}
                 points.append(PointStruct(id=row["id"], vector=vec, payload=payload))
-            qm.client.upsert(
+            qm.upsert(
                 collection_name=COLLECTION_NAME,
                 points=points,
                 wait=True
@@ -4154,7 +4218,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 # 删除后验证：确认被删 ID 真的不再存在
                 for did in del_ids:
                     try:
-                        verify_res = qm.client.retrieve(
+                        verify_res = qm.retrieve(
                             collection_name=COLLECTION_NAME,
                             ids=[did],
                             with_payload=False,
@@ -4185,7 +4249,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
             for row, vec in zip(upsert_rows, upsert_vecs):
                 payload = {k: v for k, v in row.items() if k != "id"}
                 points.append(PointStruct(id=row["id"], vector=vec, payload=payload))
-            qm.client.upsert(
+            qm.upsert(
                 collection_name=COLLECTION_NAME,
                 points=points,
                 wait=True
@@ -4219,7 +4283,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
             for row in upsert_rows:
                 rid = _to_native_point_id(row["id"])
                 try:
-                    qdrant_res = qm.client.retrieve(
+                    qdrant_res = qm.retrieve(
                         collection_name=COLLECTION_NAME,
                         ids=[rid],
                         with_payload=True,
@@ -4370,7 +4434,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
 
                 # Qdrant 查询
                 scroll_limit = len(dm.df) + 1000  # 动态数据量自适应
-                scroll_result = qm.client.scroll(
+                scroll_result = qm.scroll(
                     collection_name=COLLECTION_NAME,
                     scroll_filter=filter_obj,
                     limit=scroll_limit,
@@ -4451,7 +4515,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                         hnsw_ef = random.choice([64, 128, 256, 512])
                         sp = SearchParams(hnsw_ef=hnsw_ef, exact=use_exact)
 
-                        search_res = qm.client.query_points(
+                        search_res = qm.query_points(
                             collection_name=COLLECTION_NAME,
                             query=q_vec,
                             query_filter=filter_obj,
@@ -4609,7 +4673,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             # 执行基础查询
             try:
                 scroll_limit = len(dm.df) + 1000
-                base_res = qm.client.scroll(
+                base_res = qm.scroll(
                     collection_name=COLLECTION_NAME,
                     scroll_filter=base_filter,
                     limit=scroll_limit,
@@ -4633,7 +4697,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                 m_expr = m["expr"]
 
                 try:
-                    mut_res = qm.client.scroll(
+                    mut_res = qm.scroll(
                         collection_name=COLLECTION_NAME,
                         scroll_filter=m_filter,
                         limit=scroll_limit,
@@ -4828,7 +4892,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             try:
                 start_t = time.time()
                 scroll_limit = len(dm.df) + 1000
-                res = qm.client.scroll(
+                res = qm.scroll(
                     collection_name=COLLECTION_NAME,
                     scroll_filter=filter_obj,
                     limit=scroll_limit,
@@ -4985,7 +5049,7 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
 
             try:
                 # Qdrant 的 group_by 搜索 - 使用 search_groups
-                search_res = qm.client.query_points_groups(
+                search_res = qm.query_points_groups(
                     collection_name=COLLECTION_NAME,
                     query=q_vec,
                     group_by=group_field,
@@ -5057,6 +5121,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   python qdrant_fuzz_oracle.py --dynamic --rounds 300  # 动态操作模式
   python qdrant_fuzz_oracle.py --dynamic --evo-null-sync # 演进字段严格 IsNull 语义
   python qdrant_fuzz_oracle.py --prefer-grpc            # 使用 gRPC 查询路径
+  python qdrant_fuzz_oracle.py --read-consistency all --write-ordering strong
         """,
     )
 
@@ -5089,6 +5154,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help=f"Qdrant gRPC 端口 (默认: {GRPC_PORT})")
     p.add_argument("--prefer-grpc", action="store_true",
                    help="优先使用 gRPC 传输（仍保留 REST 端口以兼容部分 API）")
+    p.add_argument(
+        "--read-consistency",
+        type=str,
+        choices=["all", "majority", "quorum", "1", "random"],
+        default="all",
+        help="Qdrant 读一致性策略 (默认: all；可选 random)",
+    )
+    p.add_argument(
+        "--write-ordering",
+        type=str,
+        choices=["weak", "medium", "strong", "random"],
+        default="strong",
+        help="Qdrant 写 ordering 策略 (默认: strong；可选 random)",
+    )
 
     # ---- 功能开关 ----
     p.add_argument("--dynamic", action="store_true",
@@ -5116,6 +5195,7 @@ def main(argv: list[str] | None = None) -> None:
     global CHAOS_RATE
     global SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC
     global HOST, PORT, GRPC_PORT, PREFER_GRPC
+    global READ_CONSISTENCY, WRITE_ORDERING
     global INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES
 
     args = parse_args(argv)
@@ -5132,6 +5212,8 @@ def main(argv: list[str] | None = None) -> None:
     PORT = int(args.port)
     GRPC_PORT = int(args.grpc_port)
     PREFER_GRPC = bool(args.prefer_grpc)
+    READ_CONSISTENCY = 1 if args.read_consistency == "1" else args.read_consistency
+    WRITE_ORDERING = args.write_ordering
 
     # Banner
     print("=" * 80)
@@ -5143,6 +5225,8 @@ def main(argv: list[str] | None = None) -> None:
     print(f"   动态操作:   {'开启' if args.dynamic else '关闭'}")
     print(f"   混淆概率:   {CHAOS_RATE}")
     print(f"   连接:       {HOST}:{PORT} (grpc:{GRPC_PORT}, prefer_grpc={PREFER_GRPC})")
+    print(f"   读一致性:   {READ_CONSISTENCY}")
+    print(f"   写排序:     {WRITE_ORDERING}")
     if not PREFER_GRPC:
         print("   ⚠️  说明: REST 路径对 ±float32_max 的范围比较存在已知不一致（建议使用 --prefer-grpc）")
     print(
