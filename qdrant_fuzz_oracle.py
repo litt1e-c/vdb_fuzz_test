@@ -1641,6 +1641,27 @@ class OracleQueryGenerator:
 
         return self._safe_apply(series, _match)
 
+    def _series_match_except_array(self, series, excluded_set, normalizer):
+        """
+        对齐 Qdrant MatchExcept 的数组语义：
+        - null / missing 不命中；
+        - 数组中只要存在一个元素不在 except 列表中，即整体命中；
+        - 空数组不命中。
+        """
+        def _match(x, _excluded=excluded_set):
+            if self._is_na_like(x) or not isinstance(x, list):
+                return False
+            for item in x:
+                try:
+                    normalized = normalizer(item)
+                except Exception:
+                    continue
+                if normalized is not None and normalized not in _excluded:
+                    return True
+            return False
+
+        return self._safe_apply(series, _match)
+
     def _condition_filter(self, condition):
         return Filter(must=[condition])
 
@@ -1930,7 +1951,7 @@ class OracleQueryGenerator:
             expr_str = f"{name} {op} {val_float}"
 
         elif ftype == FieldType.STRING:
-            str_ops = ["==", "!=", "in"]
+            str_ops = ["==", "!=", "in", "not_in"]
             if hasattr(models, "MatchPhrase"):
                 str_ops.append("phrase")
             op = random.choice(str_ops)
@@ -1959,7 +1980,7 @@ class OracleQueryGenerator:
                 # 无全文索引时，Qdrant 退化为 substring 匹配
                 mask = self._safe_apply(series, lambda x, p=phrase: isinstance(x, str) and p in x)
                 expr_str = f'{name} phrase "{phrase}"'
-            else:  # in
+            elif op == "in":
                 # 生成多个值的列表
                 valid_vals = [str(x) for x in self.df[name].dropna().unique()[:5].tolist()]
                 if val not in valid_vals:
@@ -1967,6 +1988,20 @@ class OracleQueryGenerator:
                 filter_cond = FieldCondition(key=name, match=MatchAny(any=valid_vals))
                 mask = self._safe_apply(series, lambda x: x in valid_vals if x is not None else False)
                 expr_str = f'{name} in {valid_vals}'
+            else:  # not_in
+                valid_vals = [str(x) for x in self.df[name].dropna().unique()[:20].tolist()]
+                valid_vals = list(dict.fromkeys(valid_vals))
+                sample_size = min(random.randint(2, 6), len(valid_vals))
+                excl_vals = random.sample(valid_vals, sample_size) if valid_vals else [str(val)]
+                filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
+                excl_set = set(excl_vals)
+                mask = self._series_match_except(
+                    name,
+                    series,
+                    excl_set,
+                    lambda x: x if isinstance(x, str) else None,
+                )
+                expr_str = f'{name} not in {excl_vals}'
 
         elif ftype == FieldType.UUID:
             val_uuid = str(uuid.UUID(str(val)))
@@ -1992,7 +2027,7 @@ class OracleQueryGenerator:
                 self._convert_to_native(item) for item in all_items if item is not None
             ))
 
-            array_ops = ["contains", "not_empty"]
+            array_ops = ["contains", "not_contains", "not_empty"]
             # Qdrant 对缺失字段不参与 values_count，而 pandas 中演化字段的 missing/null 不易严格区分，
             # 为避免 oracle 误报，演化字段不生成 values_count 谓词。
             if not self._is_evolved_field(name):
@@ -2046,6 +2081,18 @@ class OracleQueryGenerator:
                     lambda x, s=candidate_set: any(v in s for v in x) if isinstance(x, list) else False
                 )
                 expr_str = f'{name} contains any of {candidates}'
+            elif array_op == "not_contains" and unique_items:
+                if len(unique_items) >= 2:
+                    sample_size = min(random.randint(2, 4), len(unique_items))
+                else:
+                    sample_size = 1
+                excl_vals = random.sample(unique_items, sample_size) if sample_size < len(unique_items) else list(unique_items)
+                excl_vals = list(dict.fromkeys(excl_vals))
+                excl_set = set(excl_vals)
+                normalizer = self._normalize_int_scalar if ftype == FieldType.ARRAY_INT else (lambda x: x if isinstance(x, str) else None)
+                filter_cond = FieldCondition(key=name, match=MatchExcept(**{"except": excl_vals}))
+                mask = self._series_match_except_array(series, excl_set, normalizer)
+                expr_str = f'{name} has element not in {excl_vals}'
             else:
                 filter_cond = self._qdrant_not_empty_filter(name)
                 mask = self._series_not_empty(series)
@@ -3675,6 +3722,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 target = random.choice(valid_items)
                 # 确保 target 是原生 Python 类型
                 target = self._convert_to_native(target)
+                strategies = []
                 if ftype == FieldType.ARRAY_INT:
                     noise = [
                         self._offset_int64(int(target), random.randint(100000, 200000))
@@ -3685,7 +3733,23 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 candidates = noise + [target]
                 random.shuffle(candidates)
                 candidates = list(dict.fromkeys(candidates))
-                return FieldCondition(key=fname, match=MatchAny(any=candidates)), f"{fname} contains any of {candidates}"
+                strategies.append((
+                    FieldCondition(key=fname, match=MatchAny(any=candidates)),
+                    f"{fname} contains any of {candidates}"
+                ))
+                if ftype == FieldType.ARRAY_INT:
+                    fake = [
+                        self._offset_int64(int(target), random.randint(200001, 400000))
+                        for _ in range(3)
+                    ]
+                else:
+                    fake = [self._random_string(12, 16) for _ in range(3)]
+                fake = list(dict.fromkeys(fake))
+                strategies.append((
+                    FieldCondition(key=fname, match=MatchExcept(**{"except": fake})),
+                    f"{fname} has element not in {fake}"
+                ))
+                return random.choice(strategies)
             return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
         elif ftype == FieldType.ARRAY_FLOAT:
