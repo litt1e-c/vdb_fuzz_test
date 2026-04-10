@@ -2007,6 +2007,9 @@ class OracleQueryGenerator:
 
         elif ftype == FieldType.STRING:
             str_ops = ["==", "!=", "in", "not_in"]
+            non_empty_strings = [str(x) for x in self.df[name].dropna().tolist() if isinstance(x, str) and x]
+            if hasattr(models, "MatchText") and non_empty_strings:
+                str_ops.append("text")
             if hasattr(models, "MatchPhrase"):
                 str_ops.append("phrase")
             op = random.choice(str_ops)
@@ -2035,6 +2038,18 @@ class OracleQueryGenerator:
                 # 无全文索引时，Qdrant 退化为 substring 匹配
                 mask = self._safe_apply(series, lambda x, p=phrase: isinstance(x, str) and p in x)
                 expr_str = f'{name} phrase "{phrase}"'
+            elif op == "text":
+                text_source = random.choice(non_empty_strings)
+                if len(text_source) >= 4:
+                    start = random.randint(0, max(0, len(text_source) - 3))
+                    query_text = text_source[start:start + random.randint(2, min(8, len(text_source) - start))]
+                else:
+                    query_text = text_source
+                filter_cond = FieldCondition(key=name, match=models.MatchText(text=query_text))
+                # 当前 fuzzer 对 STRING 只创建 KEYWORD 索引，不创建 full-text index，
+                # 因而 text 条件按官方文档的“无 full-text index -> exact substring match”子集建模。
+                mask = self._safe_apply(series, lambda x, q=query_text: isinstance(x, str) and q in x)
+                expr_str = f'{name} text "{query_text}"'
             elif op == "in":
                 # 生成多个值的列表
                 valid_vals = [str(x) for x in self.df[name].dropna().unique()[:5].tolist()]
@@ -3855,6 +3870,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 FieldCondition(key=fname, match=MatchExcept(**{"except": fake_strs})),
                 f'{fname} not in {fake_strs}'
             ))
+            # 策略4: MatchText（当前实现仅声明无 full-text index 的 substring 子集）
+            if hasattr(models, "MatchText") and val_str:
+                if len(val_str) >= 4:
+                    start = random.randint(0, max(0, len(val_str) - 3))
+                    query_text = val_str[start:start + random.randint(2, min(8, len(val_str) - start))]
+                else:
+                    query_text = val_str
+                strategies.append((
+                    FieldCondition(key=fname, match=models.MatchText(text=query_text)),
+                    f'{fname} text "{query_text}"'
+                ))
             return random.choice(strategies)
 
         elif ftype == FieldType.UUID:
