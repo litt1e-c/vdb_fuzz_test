@@ -325,6 +325,61 @@ def milvus_int_mul_series_safe(series, operand):
     return bool(series.apply(lambda x: milvus_int_mul_is_safe_value(x, operand)).all())
 
 
+def milvus_int_trunc_div_value(val, operand):
+    """Apply the locally observed INT division semantics: truncation toward zero."""
+    if hasattr(val, "item"):
+        try:
+            val = val.item()
+        except Exception:
+            raise ValueError("failed to normalize INT dividend")
+
+    divisor = int(operand)
+    if divisor == 0:
+        raise ZeroDivisionError("INT division by zero is unsupported")
+
+    if milvus_is_empty(val):
+        return None
+
+    dividend = int(val)
+    quotient = abs(dividend) // abs(divisor)
+    if (dividend < 0) ^ (divisor < 0):
+        quotient = -quotient
+    return quotient
+
+
+def milvus_int_div_series_safe(series, operand):
+    """Conservatively reject INT division when the divisor is unsafe for the observed subset."""
+    try:
+        divisor = int(operand)
+    except Exception:
+        return False
+
+    if divisor == 0:
+        return False
+
+    # Avoid the INT64_MIN / -1 overflow corner even though the current generator
+    # only emits positive divisors for division.
+    if divisor == -1:
+        int64_min = -(2**63)
+
+        def hits_overflow(x):
+            if milvus_is_empty(x):
+                return False
+            if hasattr(x, "item"):
+                try:
+                    x = x.item()
+                except Exception:
+                    return True
+            try:
+                return int(x) == int64_min
+            except Exception:
+                return True
+
+        return not bool(series.apply(hits_overflow).any())
+
+    return True
+
+
 def is_json_contains_candidate(val):
     """Return True when the value is safe to use in json_contains* expressions."""
     if hasattr(val, "item"):
@@ -2477,13 +2532,14 @@ class OracleQueryGenerator:
     def _gen_arithmetic_oracle_expr(self, name, ftype, series):
         """
         【新增】为数值类型生成算术表达式（Oracle 模式）。
-        覆盖: field + const, field - const, field * const, field % const
-        当前保守策略下，`+` / `-` / `*` 仅在整列都不会触发 INT64 溢出时生成。
+        覆盖: field + const, field - const, field * const, field / const, field % const
+        当前保守策略下，`+` / `-` / `*` 仅在整列都不会触发 INT64 溢出时生成；
+        `/` 仅覆盖本地已验证的子集：非零正整数常量除数，INT 使用截断除法，FLOAT/DOUBLE 使用实数除法。
         """
         if ftype in ALL_INT_TYPES:
-            ops = ["+", "-", "*", "%"]
+            ops = ["+", "-", "*", "/", "%"]
         elif ftype in ALL_FLOAT_TYPES:
-            ops = ["+", "-", "*"]
+            ops = ["+", "-", "*", "/"]
         else:
             return None
 
@@ -2491,6 +2547,8 @@ class OracleQueryGenerator:
         # 使用小操作数避免溢出
         if op == "%":
             operand = random.randint(2, 20)
+        elif op == "/":
+            operand = random.randint(1, 20)
         elif op == "*":
             operand = random.randint(1, 5)
         else:
@@ -2504,6 +2562,9 @@ class OracleQueryGenerator:
                 return None
         if ftype in ALL_INT_TYPES and op == "*":
             if not milvus_int_mul_series_safe(series, operand):
+                return None
+        if ftype in ALL_INT_TYPES and op == "/":
+            if not milvus_int_div_series_safe(series, operand):
                 return None
 
         # 从实际数据采样一个值来计算阈值
@@ -2520,6 +2581,11 @@ class OracleQueryGenerator:
             if op == "+": expected = sample_val + operand
             elif op == "-": expected = sample_val - operand
             elif op == "*": expected = sample_val * operand
+            elif op == "/":
+                if ftype in ALL_INT_TYPES:
+                    expected = milvus_int_trunc_div_value(sample_val, operand)
+                else:
+                    expected = sample_val / operand
             elif op == "%":
                 if operand == 0: return None
                 # 【关键】使用 C/Go 风格的截断除法取模（而非 Python 的欧几里得取模）
@@ -2581,6 +2647,11 @@ class OracleQueryGenerator:
                 if _op == "+": result = x + _operand
                 elif _op == "-": result = x - _operand
                 elif _op == "*": result = x * _operand
+                elif _op == "/":
+                    if ftype in ALL_INT_TYPES:
+                        result = milvus_int_trunc_div_value(x, _operand)
+                    else:
+                        result = x / _operand
                 elif _op == "%":
                     if _operand == 0: return False
                     # C/Go 风格取模（截断除法）
@@ -4777,7 +4848,8 @@ class PQSQueryGenerator(OracleQueryGenerator):
     def gen_arithmetic_expr(self, fname, val, ftype=None):
         """
         针对数值类型生成算术运算查询。
-        当前保守策略下，`+` / `-` / `*` 仅在整列都不会触发 INT64 溢出时生成。
+        当前保守策略下，`+` / `-` / `*` 仅在整列都不会触发 INT64 溢出时生成；
+        `/` 仅覆盖本地已验证的子集：非零正整数常量除数，INT 使用截断除法，FLOAT/DOUBLE 使用实数除法。
         """
         if not isinstance(val, (int, float, np.integer, np.floating)): return None
 
@@ -4787,9 +4859,9 @@ class PQSQueryGenerator(OracleQueryGenerator):
             val = int(val)  # 确保 INT 类型的 val 是整数
 
         if is_float:
-            ops = ["+", "-", "*"] # 浮点数不测取模
+            ops = ["+", "-", "*", "/"] # 浮点数不测取模
         else:
-            ops = ["+", "-", "*", "%"]
+            ops = ["+", "-", "*", "/", "%"]
         op = random.choice(ops)
 
         # 策略 A: 字段 op 常量
@@ -4797,6 +4869,8 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if op == "%":
             if val == 0: return None
             operand = random.randint(1, max(2, abs(int(val))))
+        elif op == "/":
+            operand = random.randint(1, 20)
         else:
             operand = random.randint(1, 100)
 
@@ -4809,6 +4883,9 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if not is_float and op == "*":
             if fname not in self.df.columns or not milvus_int_mul_series_safe(self.df[fname], operand):
                 return None
+        if not is_float and op == "/":
+            if fname not in self.df.columns or not milvus_int_div_series_safe(self.df[fname], operand):
+                return None
 
         # 计算预期结果 (使用 C/Go 风格取模，与 Milvus 一致)
         INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
@@ -4816,6 +4893,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
             if op == "+": res = val + operand
             elif op == "-": res = val - operand
             elif op == "*": res = val * operand
+            elif op == "/":
+                if is_float:
+                    res = val / operand
+                else:
+                    res = milvus_int_trunc_div_value(val, operand)
             elif op == "%": res = int(np.fmod(val, operand))
         except:
             return None
