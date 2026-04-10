@@ -2322,6 +2322,7 @@ class OracleQueryGenerator:
         """
         【新增】为 ARRAY 字段生成带 Oracle mask 的表达式。
         覆盖: array_contains, array_length, 数组下标访问, array_contains_all/any
+        本地 19532 验证下，数组下标比较子集可用，但 `arr[idx] is null` / `is not null` 会报错，当前不建模。
         灵感来源: 官方测试脚本中的数组操作覆盖模式。
         """
         strategy = random.choice([
