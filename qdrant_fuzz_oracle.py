@@ -1044,13 +1044,23 @@ class QdrantManager:
 
     def _pick_read_consistency(self):
         if READ_CONSISTENCY == "random":
-            return random.choice(ALL_READ_CONSISTENCY_LEVELS)
-        return READ_CONSISTENCY
+            raw = random.choice(ALL_READ_CONSISTENCY_LEVELS)
+        else:
+            raw = READ_CONSISTENCY
+        if isinstance(raw, int):
+            return raw
+        if isinstance(raw, models.ReadConsistencyType):
+            return raw
+        return models.ReadConsistencyType(raw)
 
     def _pick_write_ordering(self):
         if WRITE_ORDERING == "random":
-            return random.choice(ALL_WRITE_ORDERING_LEVELS)
-        return WRITE_ORDERING
+            raw = random.choice(ALL_WRITE_ORDERING_LEVELS)
+        else:
+            raw = WRITE_ORDERING
+        if isinstance(raw, models.WriteOrdering):
+            return raw
+        return models.WriteOrdering(raw)
 
     def retrieve(self, **kwargs):
         kwargs.setdefault("consistency", self._pick_read_consistency())
@@ -1503,6 +1513,9 @@ class OracleQueryGenerator:
             max_len = min_len
         chars = string.ascii_letters + string.digits
         return ''.join(random.choices(chars, k=random.randint(min_len, max_len)))
+
+    def _random_uuid_string(self):
+        return self._dm._random_uuid_string()
 
     @staticmethod
     def _convert_to_native(val):
@@ -1975,6 +1988,9 @@ class OracleQueryGenerator:
             for arr in valid_series:
                 if isinstance(arr, list):
                     all_items.extend(arr)
+            unique_items = list(dict.fromkeys(
+                self._convert_to_native(item) for item in all_items if item is not None
+            ))
 
             array_ops = ["contains", "not_empty"]
             # Qdrant 对缺失字段不参与 values_count，而 pandas 中演化字段的 missing/null 不易严格区分，
@@ -2013,13 +2029,23 @@ class OracleQueryGenerator:
                 op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
                 mask = self._safe_apply(series, _count_match)
                 expr_str = f"{name} values_count {op_map[cmp_op]} {threshold}"
-            elif array_op == "contains" and all_items:
-                target = random.choice(all_items)
-                # 转换 numpy 类型
-                target = self._convert_to_native(target)
-                filter_cond = FieldCondition(key=name, match=MatchAny(any=[target]))
-                mask = self._safe_apply(series, lambda x, t=target: t in x if isinstance(x, list) else False)
-                expr_str = f'{name} contains {target}'
+            elif array_op == "contains" and unique_items:
+                target = random.choice(unique_items)
+                if len(unique_items) >= 2:
+                    sample_size = min(random.randint(2, 4), len(unique_items))
+                else:
+                    sample_size = 1
+                candidates = random.sample(unique_items, sample_size) if sample_size < len(unique_items) else list(unique_items)
+                if target not in candidates:
+                    candidates[0] = target
+                candidates = list(dict.fromkeys(candidates))
+                candidate_set = set(candidates)
+                filter_cond = FieldCondition(key=name, match=MatchAny(any=candidates))
+                mask = self._safe_apply(
+                    series,
+                    lambda x, s=candidate_set: any(v in s for v in x) if isinstance(x, list) else False
+                )
+                expr_str = f'{name} contains any of {candidates}'
             else:
                 filter_cond = self._qdrant_not_empty_filter(name)
                 mask = self._series_not_empty(series)
@@ -3649,7 +3675,17 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 target = random.choice(valid_items)
                 # 确保 target 是原生 Python 类型
                 target = self._convert_to_native(target)
-                return FieldCondition(key=fname, match=MatchAny(any=[target])), f"{fname} contains {target}"
+                if ftype == FieldType.ARRAY_INT:
+                    noise = [
+                        self._offset_int64(int(target), random.randint(100000, 200000))
+                        for _ in range(2)
+                    ]
+                else:
+                    noise = [self._random_string(8, 12) for _ in range(2)]
+                candidates = noise + [target]
+                random.shuffle(candidates)
+                candidates = list(dict.fromkeys(candidates))
+                return FieldCondition(key=fname, match=MatchAny(any=candidates)), f"{fname} contains any of {candidates}"
             return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
         elif ftype == FieldType.ARRAY_FLOAT:
