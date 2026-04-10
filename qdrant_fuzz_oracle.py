@@ -4022,6 +4022,33 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     )]),
                     f"{fname} nested(score >= {sv} AND score <= {sv})"
                 ))
+            # 策略5: should 内嵌
+            if "score" in chosen and chosen["score"] is not None:
+                sv = int(chosen["score"])
+                alt = self._offset_int64(sv, random.choice([101, 203, 509]))
+                if alt == sv:
+                    alt = self._offset_int64(sv, 997)
+                strategies.append((
+                    Filter(must=[NestedCondition(
+                        nested=Nested(key=fname, filter=Filter(should=[
+                            Filter(must=[FieldCondition(key="score", match=MatchValue(value=sv))]),
+                            Filter(must=[FieldCondition(key="score", match=MatchValue(value=alt))]),
+                        ]))
+                    )]),
+                    f"{fname} nested(score == {sv} OR score == {alt})"
+                ))
+            # 策略6: inner must_not
+            if "active" in chosen and chosen["active"] is not None:
+                av = bool(chosen["active"])
+                forbidden = not av
+                strategies.append((
+                    Filter(must=[NestedCondition(
+                        nested=Nested(key=fname, filter=Filter(must_not=[
+                            FieldCondition(key="active", match=MatchValue(value=forbidden))
+                        ]))
+                    )]),
+                    f"{fname} nested(NOT active == {forbidden})"
+                ))
             if strategies:
                 return random.choice(strategies)
             return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
