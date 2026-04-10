@@ -191,6 +191,24 @@ class DataManager:
         self.double_scale = random.uniform(100, 10000)
 
     KEY_POOL = [f"k_{i}" for i in range(20)] + ["user", "log", "data", "a_b", "test_key"]
+    COUNTRY_CITY_POOL = {
+        "Germany": [
+            {"name": "Berlin", "population": 3.7, "sightseeing": ["Brandenburg Gate", "Reichstag"]},
+            {"name": "Munich", "population": 1.5, "sightseeing": ["Marienplatz", "Olympiapark"]},
+        ],
+        "Japan": [
+            {"name": "Tokyo", "population": 9.3, "sightseeing": ["Tokyo Tower", "Tokyo Skytree"]},
+            {"name": "Osaka", "population": 2.7, "sightseeing": ["Osaka Castle", "Universal Studios Japan"]},
+        ],
+        "France": [
+            {"name": "Paris", "population": 2.1, "sightseeing": ["Eiffel Tower", "Louvre Museum"]},
+            {"name": "Lyon", "population": 0.5, "sightseeing": ["Basilica of Notre-Dame", "Parc de la Tete d'Or"]},
+        ],
+        "Brazil": [
+            {"name": "Sao Paulo", "population": 12.3, "sightseeing": ["Ibirapuera Park", "Paulista Avenue"]},
+            {"name": "Rio de Janeiro", "population": 6.7, "sightseeing": ["Christ the Redeemer", "Copacabana Beach"]},
+        ],
+    }
     FLOAT32_MAX = float(np.finfo(np.float32).max)
     FLOAT32_MIN_NORMAL = float(np.finfo(np.float32).tiny)
     FLOAT32_MIN_SUBNORMAL = float(np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32))
@@ -237,14 +255,28 @@ class DataManager:
                     "color": "Red",
                     "active": True,
                     "config": {"version": 1},
-                    "history": [0, 0, 0]
+                    "history": [0, 0, 0],
+                    "country": copy.deepcopy({
+                        "name": "Germany",
+                        "cities": [
+                            {"name": "Berlin", "population": 3.7, "sightseeing": ["Brandenburg Gate", "Reichstag"]},
+                            {"name": "Munich", "population": 1.5, "sightseeing": ["Marienplatz", "Olympiapark"]},
+                        ],
+                    }),
                 },
                 {
                     "price": 999,
                     "color": "Blue",
                     "active": False,
                     "config": {"version": 9},
-                    "history": [99, 50, 1]
+                    "history": [99, 50, 1],
+                    "country": copy.deepcopy({
+                        "name": "Japan",
+                        "cities": [
+                            {"name": "Tokyo", "population": 9.3, "sightseeing": ["Tokyo Tower", "Tokyo Skytree"]},
+                            {"name": "Osaka", "population": 2.7, "sightseeing": ["Osaka Castle", "Universal Studios Japan"]},
+                        ],
+                    }),
                 },
                 {
                     "price": None,
@@ -252,6 +284,12 @@ class DataManager:
                     "active": False,
                     "config": {"version": 0},
                     "history": [-1, 100, 2147483647],
+                    "country": copy.deepcopy({
+                        "name": "France",
+                        "cities": [
+                            {"name": "Paris", "population": 2.1, "sightseeing": ["Eiffel Tower", "Louvre Museum"]},
+                        ],
+                    }),
                     "random_payload": ""
                 },
                 {
@@ -259,6 +297,12 @@ class DataManager:
                     "color": "",
                     "active": True,
                     "test_key": "edge",
+                    "country": copy.deepcopy({
+                        "name": "Brazil",
+                        "cities": [
+                            {"name": "Sao Paulo", "population": 12.3, "sightseeing": ["Ibirapuera Park"]},
+                        ],
+                    }),
                     "random_payload": {"k": "v"}
                 },
             ]
@@ -545,6 +589,42 @@ class DataManager:
     def _random_uuid_string(self):
         return str(uuid.UUID(int=random.getrandbits(128)))
 
+    def _build_country_payload(self, rng):
+        country_name = str(rng.choice(list(self.COUNTRY_CITY_POOL.keys())))
+        templates = self.COUNTRY_CITY_POOL[country_name]
+        city_count = int(rng.integers(1, len(templates) + 1))
+        selected_indices = rng.choice(len(templates), size=city_count, replace=False)
+        if np.isscalar(selected_indices):
+            selected_indices = [int(selected_indices)]
+        cities = []
+        for idx in list(selected_indices):
+            city = copy.deepcopy(templates[int(idx)])
+            if rng.random() < 0.2 and isinstance(city.get("sightseeing"), list) and len(city["sightseeing"]) > 1:
+                city["sightseeing"] = city["sightseeing"][:1]
+            cities.append(city)
+        return {"name": country_name, "cities": cities}
+
+    def _build_json_payload(self, rng):
+        base_obj = {
+            "price": int(rng.integers(0, 1000)),
+            "color": rng.choice(["Red", "Blue", "Green"]),
+            "active": bool(rng.choice([True, False])),
+        }
+        if rng.random() < 0.8:
+            base_obj["config"] = {"version": int(rng.integers(1, 10))}
+        if rng.random() < 0.8:
+            base_obj["history"] = [int(x) for x in rng.integers(0, 100, size=3)]
+
+        random_part = self._gen_random_json_structure(rng, depth=self.json_max_depth)
+        if isinstance(random_part, dict):
+            base_obj.update(random_part)
+        else:
+            base_obj["random_payload"] = random_part
+
+        # Keep one stable documented nested-key shape in every non-null JSON object.
+        base_obj["country"] = self._build_country_payload(rng)
+        return base_obj
+
     def generate_schema(self):
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
@@ -640,22 +720,7 @@ class DataManager:
                     if rng.random() < self.null_ratio:
                         json_list.append(None)
                         continue
-                    base_obj = {
-                        "price": int(rng.integers(0, 1000)),
-                        "color": rng.choice(["Red", "Blue", "Green"]),
-                        "active": bool(rng.choice([True, False])),
-                    }
-                    if rng.random() < 0.8:
-                        base_obj["config"] = {"version": int(rng.integers(1, 10))}
-                    if rng.random() < 0.8:
-                        base_obj["history"] = [int(x) for x in rng.integers(0, 100, size=3)]
-
-                    random_part = self._gen_random_json_structure(rng, depth=self.json_max_depth)
-                    if isinstance(random_part, dict):
-                        base_obj.update(random_part)
-                    else:
-                        base_obj["random_payload"] = random_part
-                    json_list.append(base_obj)
+                    json_list.append(self._build_json_payload(rng))
                 json_list = self._inject_boundary_values(json_list, ftype, rng)
                 data[fname] = json_list
             elif ftype == FieldType.ARRAY_INT:
@@ -790,21 +855,7 @@ class DataManager:
                 if rng.random() < self.null_ratio:
                     row[fname] = None
                     continue
-                base_obj = {
-                    "price": int(rng.integers(0, 1000)),
-                    "color": rng.choice(["Red", "Blue", "Green"]),
-                    "active": bool(rng.choice([True, False])),
-                }
-                if rng.random() < 0.8:
-                    base_obj["config"] = {"version": int(rng.integers(1, 10))}
-                if rng.random() < 0.8:
-                    base_obj["history"] = [int(x) for x in rng.integers(0, 100, size=3)]
-                random_part = self._gen_random_json_structure(rng, depth=self.json_max_depth)
-                if isinstance(random_part, dict):
-                    base_obj.update(random_part)
-                else:
-                    base_obj["random_payload"] = random_part
-                row[fname] = self._maybe_use_boundary_value(base_obj, ftype, rng)
+                row[fname] = self._maybe_use_boundary_value(self._build_json_payload(rng), ftype, rng)
             elif ftype == FieldType.ARRAY_INT:
                 arr_len = rng.integers(0, 6)
                 val = [int(x) for x in rng.integers(0, 100, size=arr_len)]
@@ -875,21 +926,7 @@ class DataManager:
             epoch_2025 = int(datetime(2025, 1, 1).timestamp())
             value = int(rng.integers(epoch_2020, epoch_2025))
         elif ftype == FieldType.JSON:
-            base_obj = {
-                "price": int(rng.integers(0, 1000)),
-                "color": rng.choice(["Red", "Blue", "Green"]),
-                "active": bool(rng.choice([True, False])),
-            }
-            if rng.random() < 0.8:
-                base_obj["config"] = {"version": int(rng.integers(1, 10))}
-            if rng.random() < 0.8:
-                base_obj["history"] = [int(x) for x in rng.integers(0, 100, size=3)]
-            random_part = self._gen_random_json_structure(rng, depth=self.json_max_depth)
-            if isinstance(random_part, dict):
-                base_obj.update(random_part)
-            else:
-                base_obj["random_payload"] = random_part
-            value = base_obj
+            value = self._build_json_payload(rng)
         elif ftype == FieldType.ARRAY_INT:
             arr_len = rng.integers(0, 6)
             value = [int(x) for x in rng.integers(0, 100, size=arr_len)]
@@ -1699,6 +1736,24 @@ class OracleQueryGenerator:
             return val
         except: return None
 
+    def _get_json_projected_values(self, obj, prefix_keys, array_key, leaf_key, flatten_lists=False):
+        """获取类似 country.cities[].population / country.cities[].sightseeing 的投影值。"""
+        arr = self._get_json_val(obj, list(prefix_keys) + [array_key])
+        if not isinstance(arr, list):
+            return []
+        out = []
+        for item in arr:
+            if not isinstance(item, dict):
+                continue
+            val = item.get(leaf_key)
+            if val is None:
+                continue
+            if flatten_lists and isinstance(val, list):
+                out.extend(v for v in val if v is not None)
+            else:
+                out.append(val)
+        return out
+
     def get_value_for_query(self, fname, ftype):
         """获取用于查询的值"""
         # 在查询参数层注入边界值，提升各模式边界覆盖率
@@ -2283,7 +2338,15 @@ class OracleQueryGenerator:
                 mask = pd.Series(False, index=self.df.index)
                 return (filter_cond, mask, f'CHAOS: {name}.active == {fake_int} (type mismatch)')
 
-        strategy = random.choice(["range", "nested", "index", "multi_key"])
+        strategy = random.choice([
+            "range",
+            "config_version",
+            "multi_key",
+            "country_name",
+            "city_name",
+            "city_population",
+            "city_sightseeing",
+        ])
 
         if strategy == "range":
             low = random.randint(100, 500)
@@ -2304,7 +2367,7 @@ class OracleQueryGenerator:
 
             return (filter_cond, self._safe_apply(series, check_range), f'{name}.price > {low} and < {high}')
 
-        elif strategy == "nested":
+        elif strategy == "config_version":
             val = random.randint(1, 9)
             filter_cond = FieldCondition(
                 key=f"{name}.config.version",
@@ -2321,23 +2384,114 @@ class OracleQueryGenerator:
 
             return (filter_cond, self._safe_apply(series, check_nested), f'{name}.config.version == {val}')
 
-        elif strategy == "index":
-            idx = 0
-            val = random.randint(20, 80)
+        elif strategy == "country_name":
+            valid_vals = []
+            for x in series.dropna():
+                v = self._get_json_val(x, ["country", "name"])
+                if isinstance(v, str):
+                    valid_vals.append(v)
+            country_val = random.choice(valid_vals) if valid_vals else "Germany"
             filter_cond = FieldCondition(
-                key=f"{name}.history[{idx}]",
-                range=Range(gt=val)
+                key=f"{name}.country.name",
+                match=MatchValue(value=country_val)
             )
 
-            def check_index(x):
+            def check_country_name(x, _v=country_val):
                 try:
-                    v = self._get_json_val(x, ["history", idx])
-                    if v is None: return False
-                    if isinstance(v, bool): return False
-                    return (isinstance(v, (int, float)) and v > val)
-                except: return False
+                    return self._get_json_val(x, ["country", "name"]) == _v
+                except:
+                    return False
 
-            return (filter_cond, self._safe_apply(series, check_index), f'{name}.history[{idx}] > {val}')
+            return (
+                filter_cond,
+                self._safe_apply(series, check_country_name),
+                f'{name}.country.name == "{country_val}"'
+            )
+
+        elif strategy == "city_name":
+            valid_vals = []
+            for x in series.dropna():
+                valid_vals.extend(
+                    str(v) for v in self._get_json_projected_values(
+                        x, ["country"], "cities", "name"
+                    ) if isinstance(v, str)
+                )
+            city_val = random.choice(valid_vals) if valid_vals else "Tokyo"
+            filter_cond = FieldCondition(
+                key=f"{name}.country.cities[].name",
+                match=MatchValue(value=city_val)
+            )
+
+            def check_city_name(x, _v=city_val):
+                try:
+                    vals = self._get_json_projected_values(x, ["country"], "cities", "name")
+                    return any(v == _v for v in vals)
+                except:
+                    return False
+
+            return (
+                filter_cond,
+                self._safe_apply(series, check_city_name),
+                f'{name}.country.cities[].name == "{city_val}"'
+            )
+
+        elif strategy == "city_population":
+            valid_vals = []
+            for x in series.dropna():
+                vals = self._get_json_projected_values(x, ["country"], "cities", "population")
+                for v in vals:
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        valid_vals.append(float(v))
+            threshold = random.choice(valid_vals) if valid_vals else 9.0
+            filter_cond = FieldCondition(
+                key=f"{name}.country.cities[].population",
+                range=Range(gte=threshold)
+            )
+
+            def check_city_population(x, _threshold=threshold):
+                try:
+                    vals = self._get_json_projected_values(x, ["country"], "cities", "population")
+                    return any(
+                        isinstance(v, (int, float)) and not isinstance(v, bool) and float(v) >= _threshold
+                        for v in vals
+                    )
+                except:
+                    return False
+
+            return (
+                filter_cond,
+                self._safe_apply(series, check_city_population),
+                f"{name}.country.cities[].population >= {threshold}"
+            )
+
+        elif strategy == "city_sightseeing":
+            valid_vals = []
+            for x in series.dropna():
+                valid_vals.extend(
+                    str(v) for v in self._get_json_projected_values(
+                        x, ["country"], "cities", "sightseeing", flatten_lists=True
+                    ) if isinstance(v, str)
+                )
+            sight_val = random.choice(valid_vals) if valid_vals else "Osaka Castle"
+            filter_cond = FieldCondition(
+                key=f"{name}.country.cities[].sightseeing",
+                match=MatchValue(value=sight_val)
+            )
+
+            def check_city_sightseeing(x, _v=sight_val):
+                try:
+                    vals = self._get_json_projected_values(
+                        x, ["country"], "cities", "sightseeing", flatten_lists=True
+                    )
+                    return any(v == _v for v in vals)
+                except:
+                    return False
+
+            return (
+                filter_cond,
+                self._safe_apply(series, check_city_sightseeing),
+                f'{name}.country.cities[].sightseeing == "{sight_val}"'
+            )
 
         else:  # multi_key
             color = random.choice(["Red", "Blue"])
@@ -3887,6 +4041,46 @@ class PQSQueryGenerator(OracleQueryGenerator):
         # 将 numpy 类型转换
         if hasattr(json_obj, "tolist"): json_obj = json_obj.tolist()
         if hasattr(json_obj, "item"): json_obj = json_obj.item()
+
+        if isinstance(json_obj, dict):
+            strategies = []
+            country = json_obj.get("country")
+            if isinstance(country, dict):
+                country_name = country.get("name")
+                if isinstance(country_name, str):
+                    strategies.append((
+                        FieldCondition(key=f"{fname}.country.name", match=MatchValue(value=country_name)),
+                        f'{fname}.country.name == "{country_name}"'
+                    ))
+                cities = country.get("cities")
+                if isinstance(cities, list):
+                    valid_cities = [item for item in cities if isinstance(item, dict)]
+                    if valid_cities:
+                        chosen = random.choice(valid_cities)
+                        city_name = chosen.get("name")
+                        if isinstance(city_name, str):
+                            strategies.append((
+                                FieldCondition(key=f"{fname}.country.cities[].name", match=MatchValue(value=city_name)),
+                                f'{fname}.country.cities[].name == "{city_name}"'
+                            ))
+                        population = chosen.get("population")
+                        if isinstance(population, (int, float)) and not isinstance(population, bool):
+                            population = float(population)
+                            strategies.append((
+                                FieldCondition(key=f"{fname}.country.cities[].population", range=Range(gte=population)),
+                                f"{fname}.country.cities[].population >= {population}"
+                            ))
+                        sightseeing = chosen.get("sightseeing")
+                        if isinstance(sightseeing, list):
+                            valid_sights = [str(v) for v in sightseeing if v is not None]
+                            if valid_sights:
+                                sight = random.choice(valid_sights)
+                                strategies.append((
+                                    FieldCondition(key=f"{fname}.country.cities[].sightseeing", match=MatchValue(value=sight)),
+                                    f'{fname}.country.cities[].sightseeing == "{sight}"'
+                                ))
+            if strategies and random.random() < 0.65:
+                return random.choice(strategies)
 
         current = json_obj
         path_str = fname  # Qdrant 使用点号路径: fname.key1.key2
