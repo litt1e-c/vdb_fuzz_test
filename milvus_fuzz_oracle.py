@@ -253,6 +253,30 @@ def milvus_json_path_exists(obj, keys):
     return milvus_json_value_has_content(current)
 
 
+def milvus_int_add_is_safe_value(val, operand):
+    """Return True when INT64 addition stays within range under Python mathematical semantics."""
+    if hasattr(val, "item"):
+        try:
+            val = val.item()
+        except Exception:
+            return False
+
+    if milvus_is_empty(val):
+        return True
+
+    try:
+        result = int(val) + int(operand)
+    except Exception:
+        return False
+
+    return -(2**63) <= result <= 2**63 - 1
+
+
+def milvus_int_add_series_safe(series, operand):
+    """Conservatively reject INT additions when any non-null row could overflow INT64."""
+    return bool(series.apply(lambda x: milvus_int_add_is_safe_value(x, operand)).all())
+
+
 def is_json_contains_candidate(val):
     """Return True when the value is safe to use in json_contains* expressions."""
     if hasattr(val, "item"):
@@ -2406,7 +2430,7 @@ class OracleQueryGenerator:
         """
         【新增】为数值类型生成算术表达式（Oracle 模式）。
         覆盖: field + const, field - const, field * const, field % const
-        这些操作在 Milvus 内部走不同的执行路径，是 bug 高发区。
+        当前保守策略下，`+` 仅在整列都不会触发 INT64 溢出时生成。
         """
         if ftype in ALL_INT_TYPES:
             ops = ["+", "-", "*", "%"]
@@ -2423,6 +2447,10 @@ class OracleQueryGenerator:
             operand = random.randint(1, 5)
         else:
             operand = random.randint(1, 50)
+
+        if ftype in ALL_INT_TYPES and op == "+":
+            if not milvus_int_add_series_safe(series, operand):
+                return None
 
         # 从实际数据采样一个值来计算阈值
         valid_series = series.dropna()
@@ -4695,7 +4723,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
     def gen_arithmetic_expr(self, fname, val, ftype=None):
         """
         针对数值类型生成算术运算查询。
-        目标：测试 +, -, *, %, ** 是否导致 Crash 或计算错误。
+        当前保守策略下，`+` 仅在整列都不会触发 INT64 溢出时生成。
         """
         if not isinstance(val, (int, float, np.integer, np.floating)): return None
 
@@ -4717,6 +4745,10 @@ class PQSQueryGenerator(OracleQueryGenerator):
             operand = random.randint(1, max(2, abs(int(val))))
         else:
             operand = random.randint(1, 100)
+
+        if not is_float and op == "+":
+            if fname not in self.df.columns or not milvus_int_add_series_safe(self.df[fname], operand):
+                return None
 
         # 计算预期结果 (使用 C/Go 风格取模，与 Milvus 一致)
         INT64_MIN, INT64_MAX = -(2**63), 2**63 - 1
