@@ -18,7 +18,7 @@ doc_notes:
   - "A local historical case exists for geo bounding-box boundary behavior, but it is secondary evidence for the geo family and not official `geo_radius` semantics."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST and gRPC matched the tested geo-radius subset: an inside point matched, a point constructed exactly at the 1000m haversine boundary and a zero-radius exact-center query did not match, a 1000.5m point did not match, geo arrays matched when one element was inside, and missing/null plus the tested non-geo string row were excluded."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST and gRPC matched the tested geo-radius subset: an inside point matched, a point constructed exactly at the 1000m haversine boundary and a zero-radius exact-center query did not match, a 1000.5m point did not match, geo arrays matched when one element was inside, and missing/null plus the tested non-geo string row were excluded."
 oracle_support:
   - scalar geo radius predicates with haversine strict-inside comparison
   - PQS scalar geo radius predicates centered on the pivot geo point with positive radius

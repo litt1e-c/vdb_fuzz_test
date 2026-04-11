@@ -18,7 +18,7 @@ doc_notes:
   - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary summation worked, negative terms could produce zero or negative totals, defaults could supply a missing term, missing terms without defaults were rejected, a query containing one overflowing sum was rejected as a whole, and floating-point accumulation order mattered in the tested constant examples because `[1e20, 1.0, -1e20]` evaluated to 0 while `[1e20, -1e20, 1.0]` evaluated to 1."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary summation worked, negative terms could produce zero or negative totals, defaults could supply a missing term, missing terms without defaults were rejected, a query containing one overflowing sum was rejected as a whole, and floating-point accumulation order mattered in the tested constant examples because `[1e20, 1.0, -1e20]` evaluated to 0 while `[1e20, -1e20, 1.0]` evaluated to 1."
 oracle_support: []
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/sum_operator.py

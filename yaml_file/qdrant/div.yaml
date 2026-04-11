@@ -18,7 +18,7 @@ doc_notes:
   - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary numeric division rescored as expected, a constant-zero left operand short-circuited and did not evaluate a missing right operand, `right=0.0` without a default was rejected as non-finite, `by_zero_default=7.0` returned the default for non-zero numerators while a zero numerator still yielded 0, and a huge quotient that overflowed the tested finite score range was rejected."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary numeric division rescored as expected, a constant-zero left operand short-circuited and did not evaluate a missing right operand, `right=0.0` without a default was rejected as non-finite, `by_zero_default=7.0` returned the default for non-zero numerators while a zero numerator still yielded 0, and a huge quotient that overflowed the tested finite score range was rejected."
 oracle_support: []
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/div_operator.py

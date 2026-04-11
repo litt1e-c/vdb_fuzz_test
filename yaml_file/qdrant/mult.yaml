@@ -18,7 +18,7 @@ doc_notes:
   - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary multiplication worked, negative factors propagated sign, a zero factor short-circuited evaluation when encountered before a later missing factor, a missing factor before a later zero still raised an error, defaults could supply a missing factor, very small products underflowed to 0 without an error, and a query containing one overflowing product was rejected as a whole rather than returning only the finite rows."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary multiplication worked, negative factors propagated sign, a zero factor short-circuited evaluation when encountered before a later missing factor, a missing factor before a later zero still raised an error, defaults could supply a missing factor, very small products underflowed to 0 without an error, and a query containing one overflowing product was rejected as a whole rather than returning only the finite rows."
 oracle_support: []
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/mult_operator.py

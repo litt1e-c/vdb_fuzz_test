@@ -17,7 +17,7 @@ doc_notes:
   - "The checked payload docs say a filter is not satisfied when the stored value type does not fit the filtering condition, but `is_null` is documented by value state rather than by a narrow payload type family."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST, gRPC, and Python `:memory:` agreed on the tested subset: only explicit null values matched `is_null`; missing keys, [], [None], empty strings, and empty objects did not; top-level array-of-object null matched while [] and a non-empty object array did not; nested-path `meta.reports` followed the same explicit-null-only semantics; and `must_not is_null` returned the tested complement set."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: only explicit null values matched `is_null`; missing keys, [], [None], empty strings, and empty objects did not; top-level array-of-object null matched while [] and a non-empty object array did not; nested-path `meta.reports` followed the same explicit-null-only semantics; and `must_not is_null` returned the tested complement set."
 oracle_support:
   - top-level is_null and must_not-is_null over generated scalar, array, and ARRAY_OBJECT fields when explicit null values are present
   - evolved-field strict is_null semantics only when explicit null backfill is enabled

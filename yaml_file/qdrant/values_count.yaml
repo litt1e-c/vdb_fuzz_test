@@ -18,7 +18,7 @@ doc_notes:
   - "The checked docs do not separately document object payloads for `values_count`, even though they fall under the documented non-array rule."
 
 verify_status: mismatch_observed
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST and gRPC matched each other on the tested subset: missing keys did not satisfy the tested predicates, explicit null and [] behaved like count 0, present non-array string and dict values behaved like count 1, [None] behaved like count 1, and a two-element array of objects behaved like count 2. Python `:memory:` matched most tested cases but counted the tested scalar dict as 2 instead of 1, so `gt=1`/`gte=2` differed from the server in that backend-sensitive case."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST and gRPC matched each other on the tested subset: missing keys did not satisfy the tested predicates, explicit null and [] behaved like count 0, present non-array string and dict values behaved like count 1, [None] behaved like count 1, and a two-element array of objects behaved like count 2. Python `:memory:` matched most tested cases but counted the tested scalar dict as 2 instead of 1, so `gt=1`/`gte=2` differed from the server in that backend-sensitive case."
 oracle_support:
   - server-facing values_count predicates over generated ARRAY_INT, ARRAY_STR, and ARRAY_FLOAT fields
   - explicit null on generated array fields treated as count 0 in the validated subset
