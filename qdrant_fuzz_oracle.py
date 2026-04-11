@@ -2395,21 +2395,30 @@ class OracleQueryGenerator:
                 bottom_lat = max(center_lat - delta_lat, -90)
                 left_lon = max(center_lon - delta_lon, -180)
                 right_lon = min(center_lon + delta_lon, 180)
-                filter_cond = FieldCondition(
-                    key=name,
-                    geo_bounding_box=GeoBoundingBox(
-                        top_left=GeoPoint(lat=top_lat, lon=left_lon),
-                        bottom_right=GeoPoint(lat=bottom_lat, lon=right_lon)
-                    )
+                pivot_on_bbox_edge = (
+                    math.isclose(center_lat, top_lat)
+                    or math.isclose(center_lat, bottom_lat)
+                    or math.isclose(center_lon, left_lon)
+                    or math.isclose(center_lon, right_lon)
                 )
-                mask = self._safe_apply(series, lambda x: (
-                    x is not None and isinstance(x, dict)
-                    and "lat" in x and "lon" in x
-                    and bottom_lat <= x["lat"] <= top_lat
-                    and left_lon <= x["lon"] <= right_lon
-                ))
-                expr_str = f"{name} in bbox({bottom_lat:.2f},{left_lon:.2f} -> {top_lat:.2f},{right_lon:.2f})"
-            else:
+                if pivot_on_bbox_edge:
+                    geo_strategy = "radius"
+                else:
+                    filter_cond = FieldCondition(
+                        key=name,
+                        geo_bounding_box=GeoBoundingBox(
+                            top_left=GeoPoint(lat=top_lat, lon=left_lon),
+                            bottom_right=GeoPoint(lat=bottom_lat, lon=right_lon)
+                        )
+                    )
+                    mask = self._safe_apply(series, lambda x: (
+                        x is not None and isinstance(x, dict)
+                        and "lat" in x and "lon" in x
+                        and bottom_lat <= x["lat"] <= top_lat
+                        and left_lon <= x["lon"] <= right_lon
+                    ))
+                    expr_str = f"{name} in bbox({bottom_lat:.2f},{left_lon:.2f} -> {top_lat:.2f},{right_lon:.2f})"
+            if geo_strategy == "radius":
                 # GeoRadius 查询 - Qdrant 独有的圆形地理范围查询
                 radius_m = random.uniform(100_000, 5_000_000)  # 100km ~ 5000km
                 filter_cond = FieldCondition(
@@ -4181,15 +4190,26 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 strategies = []
                 # 策略1: 极小bbox
                 delta = 0.001
-                strategies.append((
-                    FieldCondition(
-                        key=fname,
-                        geo_bounding_box=GeoBoundingBox(
-                            top_left=GeoPoint(lat=min(lat + delta, 90), lon=max(lon - delta, -180)),
-                            bottom_right=GeoPoint(lat=max(lat - delta, -90), lon=min(lon + delta, 180))
-                        )
-                    ), f"{fname} in tiny bbox around ({lat},{lon})"
-                ))
+                top_lat = min(lat + delta, 90)
+                bottom_lat = max(lat - delta, -90)
+                left_lon = max(lon - delta, -180)
+                right_lon = min(lon + delta, 180)
+                pivot_on_bbox_edge = (
+                    math.isclose(lat, top_lat)
+                    or math.isclose(lat, bottom_lat)
+                    or math.isclose(lon, left_lon)
+                    or math.isclose(lon, right_lon)
+                )
+                if not pivot_on_bbox_edge:
+                    strategies.append((
+                        FieldCondition(
+                            key=fname,
+                            geo_bounding_box=GeoBoundingBox(
+                                top_left=GeoPoint(lat=top_lat, lon=left_lon),
+                                bottom_right=GeoPoint(lat=bottom_lat, lon=right_lon)
+                            )
+                        ), f"{fname} in tiny bbox around ({lat},{lon})"
+                    ))
                 # 策略2: GeoRadius 极小半径确保命中
                 strategies.append((
                     FieldCondition(

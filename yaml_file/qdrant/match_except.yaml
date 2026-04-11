@@ -27,4 +27,4 @@ oracle_support:
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/match_except_operator.py
 
-oracle_mapping: "`match_except` is mapped to pandas/PQS as complement-style membership over a non-empty excluded set: scalar rows match when the normalized present value is not excluded, and array rows match when at least one normalized element is not excluded; missing/null rows are treated as non-matches. The locally observed type-mismatch and empty-list behaviors are modeled as keeping present rows, but this is our oracle assumption, not an official claim."
+oracle_mapping: "`match_except` is mapped to pandas/PQS as complement-style membership over a non-empty excluded set: scalar rows match when the normalized present value is not excluded, array rows match when at least one normalized element is not excluded, missing/null rows are treated as non-matches, and locally observed type-mismatch plus empty-list behaviors are modeled as keeping present rows. This is our oracle assumption, not an official claim."

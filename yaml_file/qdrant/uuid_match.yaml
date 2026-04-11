@@ -26,4 +26,4 @@ oracle_support:
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/uuid_match_operator.py
 
-oracle_mapping: "`uuid_match` is mapped to pandas/PQS as exact equality on canonical UUID strings using `str(uuid.UUID(...))`, with missing/null treated as non-matches. Current fuzzer coverage is limited to scalar UUID payload fields and does not yet generate UUID arrays, so array any-element behavior is locally validated but outside current implementation scope; this is our oracle assumption, not an official claim."
+oracle_mapping: "`uuid_match` is mapped to pandas/PQS as exact equality on canonical UUID strings using `str(uuid.UUID(...))`, with missing/null treated as non-matches; current fuzzer coverage is limited to scalar UUID payload fields and does not yet generate UUID arrays, so array any-element behavior is locally validated but outside current implementation scope. This is our oracle assumption, not an official claim."
