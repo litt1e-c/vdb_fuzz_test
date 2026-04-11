@@ -19,7 +19,7 @@ doc_notes:
   - "The checked docs do not clearly specify how invalid UUID literals in the query are handled."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched scalar UUID equality, UUID-array any-element matching, excluded missing/null rows from ordinary UUID match predicates, returned no rows for the tested integer type-mismatch query, and accepted `PayloadSchemaType.UUID` index creation."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched scalar UUID equality, UUID-array any-element matching, excluded missing/null rows from ordinary UUID match predicates, returned no rows for the tested integer type-mismatch query, and accepted `PayloadSchemaType.UUID` index creation."
 oracle_support:
   - scalar UUID exact equality on generated UUID fields
   - UUID match support in the main oracle and PQS workflows

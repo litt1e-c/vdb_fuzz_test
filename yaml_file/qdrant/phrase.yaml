@@ -18,7 +18,7 @@ doc_notes:
   - "The current fuzzer does not create full-text indexes for STRING fields, so indexed phrase-token semantics are outside current implementation scope."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched `MatchPhrase` on present scalar string values as exact contiguous substring matching without a full-text index; reversed or non-contiguous phrases did not match, and missing/null plus the tested non-string row did not satisfy ordinary `phrase` predicates."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched `MatchPhrase` on present scalar string values as exact contiguous substring matching without a full-text index; reversed or non-contiguous phrases did not match, and missing/null plus the tested non-string row did not satisfy ordinary `phrase` predicates."
 oracle_support:
   - scalar STRING MatchPhrase without full-text index
   - MatchPhrase generation in the main oracle workflow

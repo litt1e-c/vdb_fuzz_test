@@ -20,7 +20,7 @@ doc_notes:
   - "The checked `match.value` docs do not document float or datetime support."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched documented exact-equality semantics for keyword/integer/bool scalars and arrays, excluded missing/null and type-mismatched rows, and the tested client model rejected float `MatchValue(value=1.5)` construction."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched documented exact-equality semantics for keyword/integer/bool scalars and arrays, excluded missing/null and type-mismatched rows, and the tested client model rejected float `MatchValue(value=1.5)` construction."
 oracle_support:
   - keyword/integer/bool exact equality
   - any-element matching for arrays of those supported scalar types

@@ -16,7 +16,7 @@ doc_notes:
   - "The checked docs say `has_id` is not supported inside nested."
 
 verify_status: mismatch_observed
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST and gRPC matched same-element semantics for nested with inner must/should/must_not and excluded missing/null/[] parent fields from ordinary nested predicates; however, inner `has_id` was accepted and returned an empty result on both transports instead of being rejected as the checked docs state."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST and gRPC matched same-element semantics for nested with inner must/should/must_not and excluded missing/null/[] parent fields from ordinary nested predicates; however, inner `has_id` was accepted and returned an empty result on both transports instead of being rejected as the checked docs state."
 oracle_support:
   - same-element nested matching over generated ARRAY_OBJECT fields
   - inner must/should/must_not subset over score/label/active child fields

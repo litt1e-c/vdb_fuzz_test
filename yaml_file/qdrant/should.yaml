@@ -16,7 +16,7 @@ doc_notes:
   - "The checked docs do not clearly specify the behavior of an empty `should` list."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched disjunction semantics for ordinary and recursively nested `should`, excluded missing/null rows when all disjuncts were ordinary predicates, returned all rows for `A OR NOT A`, and on the tested scroll path treated `should=[]` as matching all rows."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched disjunction semantics for ordinary and recursively nested `should`, excluded missing/null rows when all disjuncts were ordinary predicates, returned all rows for `A OR NOT A`, and on the tested scroll path treated `should=[]` as matching all rows."
 oracle_support:
   - non-empty disjunction of generated child conditions
   - recursive disjunction over nested Filter children

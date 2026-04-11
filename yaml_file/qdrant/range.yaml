@@ -19,7 +19,7 @@ doc_notes:
   - "The checked docs do not specify precision or transport behavior at extreme numeric boundaries."
 
 verify_status: mismatch_observed
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, the safe non-extreme subset passed on REST and gRPC for integer/float scalar ranges, conjunctive bounds, array any-element matching, missing/null exclusion, and tested string type mismatch; local historical range repros document mismatches near int64 extreme values and ±float32 maximum finite values."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, the safe non-extreme subset passed on REST and gRPC for integer/float scalar ranges, conjunctive bounds, array any-element matching, missing/null exclusion, and tested string type mismatch; local historical range repros document mismatches near int64 extreme values and ±float32 maximum finite values."
 oracle_support:
   - integer Range predicates outside default-excluded int64 extremes
   - float scalar and array Range predicates with ±float32 maximum finite literals retained and tagged as known-boundary candidates

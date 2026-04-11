@@ -19,7 +19,7 @@ doc_notes:
   - "The checked docs do not clearly specify the behavior of an empty `except` list."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched scalar and array `match.except` semantics for keyword/integer values, excluded missing/null rows from ordinary `match.except`, and on the tested paths treated type-mismatched excluded values and `except=[]` as keeping all present rows."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched scalar and array `match.except` semantics for keyword/integer values, excluded missing/null rows from ordinary `match.except`, and on the tested paths treated type-mismatched excluded values and `except=[]` as keeping all present rows."
 oracle_support:
   - non-empty MatchExcept over scalar keyword and integer fields
   - non-empty MatchExcept over array-of-keyword and array-of-integer fields

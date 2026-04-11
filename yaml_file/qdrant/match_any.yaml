@@ -18,7 +18,7 @@ doc_notes:
   - "The checked docs do not clearly specify the behavior of an empty `any` list."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched documented disjunction semantics for scalar keyword/integer fields and for arrays of those types, excluded missing/null and tested type-mismatched rows from ordinary `match.any`, and on the tested scroll path returned an empty result for `MatchAny(any=[])`."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched documented disjunction semantics for scalar keyword/integer fields and for arrays of those types, excluded missing/null and tested type-mismatched rows from ordinary `match.any`, and on the tested scroll path returned an empty result for `MatchAny(any=[])`."
 oracle_support:
   - non-empty MatchAny over scalar keyword and integer fields
   - non-empty MatchAny over array-of-keyword and array-of-integer fields

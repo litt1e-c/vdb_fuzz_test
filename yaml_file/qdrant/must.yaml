@@ -16,7 +16,7 @@ doc_notes:
   - "The checked docs do not clearly specify the behavior of an empty `must` list."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched conjunction semantics for ordinary and recursively nested `must`, excluded missing/null rows for ordinary predicates inside `must`, and preserved the documented distinction between plain array-path conjunction and `nested` same-element matching."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched conjunction semantics for ordinary and recursively nested `must`, excluded missing/null rows for ordinary predicates inside `must`, and preserved the documented distinction between plain array-path conjunction and `nested` same-element matching."
 oracle_support:
   - non-empty conjunction of generated child conditions
   - recursive conjunction over nested Filter children

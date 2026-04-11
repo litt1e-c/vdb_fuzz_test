@@ -17,7 +17,7 @@ doc_notes:
   - "The current fuzzer does not create full-text indexes for STRING fields, so indexed token-level semantics are outside current implementation scope."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched exact substring behavior for `MatchText` on present scalar string values without a full-text index, including a non-contiguous multi-word negative case; missing/null and the tested non-string row did not satisfy ordinary `text` predicates."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched exact substring behavior for `MatchText` on present scalar string values without a full-text index, including a non-contiguous multi-word negative case; missing/null and the tested non-string row did not satisfy ordinary `text` predicates."
 oracle_support:
   - scalar STRING MatchText without full-text index
   - MatchText generation in the main oracle workflow

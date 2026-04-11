@@ -18,7 +18,7 @@ doc_notes:
   - "The checked docs do not clearly specify the behavior of an empty `must_not` list."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched complement semantics for ordinary and recursively nested `must_not`, kept missing/null rows when ordinary inner predicates did not match, preserved double negation, and for nested data both outer `must_not` and inner nested `must_not` behaved consistently with complement-style semantics."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched complement semantics for ordinary and recursively nested `must_not`, kept missing/null rows when ordinary inner predicates did not match, preserved double negation, and for nested data both outer `must_not` and inner nested `must_not` behaved consistently with complement-style semantics."
 oracle_support:
   - non-empty negation of generated child conditions
   - recursive negation over nested Filter children
