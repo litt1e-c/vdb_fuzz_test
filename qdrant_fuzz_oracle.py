@@ -115,8 +115,7 @@ KNOWN_UNSTABLE_INT64_VALUES = {
 }
 
 # 已知 Qdrant v1.17.0 在 ±float32 最大有限值附近的 range 比较存在异常。
-# 通用 fuzz 默认不注入这些值；历史 bug 脚本保留专门复现能力。
-INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES = False
+# 通用 fuzz 保留这些值以维持边界覆盖；mismatch 日志会标记为已知边界候选，便于归因。
 KNOWN_UNSTABLE_FLOAT32_ABS = float(np.finfo(np.float32).max)
 
 
@@ -260,16 +259,13 @@ class DataManager:
                 pool = [v for v in pool if not is_known_unstable_int64_value(v)]
             return pool
         if ftype == FieldType.FLOAT:
-            pool = [
+            return [
                 -0.0, 0.0, -1.0, 1.0,
                 -self.double_scale, self.double_scale,
                 -self.FLOAT32_MIN_SUBNORMAL, self.FLOAT32_MIN_SUBNORMAL,
                 -self.FLOAT32_MIN_NORMAL, self.FLOAT32_MIN_NORMAL,
                 -self.FLOAT32_MAX, self.FLOAT32_MAX
             ]
-            if not INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES:
-                pool = [v for v in pool if not is_known_unstable_float32_value(v)]
-            return pool
         if ftype == FieldType.BOOL:
             return [False, True]
         if ftype == FieldType.STRING:
@@ -362,20 +358,11 @@ class DataManager:
                 ["!@#", "[]{}"]
             ]
         if ftype == FieldType.ARRAY_FLOAT:
-            pool = [
+            return [
                 [], [0.0], [-0.0],
                 [-self.FLOAT32_MIN_SUBNORMAL, self.FLOAT32_MIN_SUBNORMAL],
                 [-self.FLOAT32_MAX, self.FLOAT32_MAX]
             ]
-            if not INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES:
-                pool = [
-                    arr for arr in pool
-                    if not (
-                        isinstance(arr, list)
-                        and any(is_known_unstable_float32_value(v) for v in arr)
-                    )
-                ]
-            return pool
         if ftype == FieldType.DATETIME:
             return [0, epoch_2020, epoch_2025 - 1, 2147483647, 4102444800]
         if ftype == FieldType.GEO:
@@ -1818,10 +1805,6 @@ class OracleQueryGenerator:
         if ftype == FieldType.INT and not valid_series.empty and not INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES:
             valid_series = valid_series[
                 valid_series.apply(lambda x: not is_known_unstable_int64_value(self._convert_to_native(x)))
-            ]
-        if ftype == FieldType.FLOAT and not valid_series.empty and not INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES:
-            valid_series = valid_series[
-                valid_series.apply(lambda x: not is_known_unstable_float32_value(self._convert_to_native(x)))
             ]
         if not valid_series.empty and random.random() < 0.8:
             val = random.choice(valid_series.values)
@@ -5628,11 +5611,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="允许通用 fuzz 注入已知不稳定的 int64 极值边界（默认关闭，以减少误报）",
     )
-    p.add_argument(
-        "--include-known-float32-boundaries",
-        action="store_true",
-        help="允许通用 fuzz 注入已知不稳定的 ±float32 最大有限值边界（默认关闭，以减少误报）",
-    )
 
     return p.parse_args(argv)
 
@@ -5643,7 +5621,6 @@ def main(argv: list[str] | None = None) -> None:
     global HOST, PORT, GRPC_PORT, PREFER_GRPC
     global READ_CONSISTENCY, WRITE_ORDERING
     global INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES
-    global INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES
 
     args = parse_args(argv)
 
@@ -5655,7 +5632,6 @@ def main(argv: list[str] | None = None) -> None:
 
     SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = bool(args.evo_null_sync)
     INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES = bool(args.include_known_int64_boundaries)
-    INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES = bool(args.include_known_float32_boundaries)
     HOST = args.host
     PORT = int(args.port)
     GRPC_PORT = int(args.grpc_port)
@@ -5675,16 +5651,15 @@ def main(argv: list[str] | None = None) -> None:
     print(f"   连接:       {HOST}:{PORT} (grpc:{GRPC_PORT}, prefer_grpc={PREFER_GRPC})")
     print(f"   读一致性:   {READ_CONSISTENCY}")
     print(f"   写排序:     {WRITE_ORDERING}")
-    if not PREFER_GRPC and INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES:
-        print("   ⚠️  说明: REST 路径对 ±float32_max 的范围比较存在已知不一致（建议使用 --prefer-grpc）")
+    if not PREFER_GRPC:
+        print("   ⚠️  说明: REST 路径对 ±float32_max 的范围比较存在已知不一致；mismatch 日志会标记边界候选")
     print(
         "   演进空值语义: "
         + ("严格 IsNull（显式NULL回填）" if SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC else "IsEmpty（缺失/null/[]统一）")
     )
     if not INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES:
         print("   已知边界保护: 通用 fuzz 默认跳过已知不稳定的 int64 极值附近字面量")
-    if not INCLUDE_KNOWN_UNSTABLE_FLOAT32_BOUNDARIES:
-        print("   已知边界保护: 通用 fuzz 默认跳过已知不稳定的 ±float32 最大有限值边界")
+    print("   已知边界标记: ±float32 最大有限值保留参与 fuzz，相关 mismatch 会标记为边界候选")
     if args.dynamic:
         effective_rounds = args.pqs_rounds if args.mode == "pqs" else args.rounds
         if effective_rounds < 30:
