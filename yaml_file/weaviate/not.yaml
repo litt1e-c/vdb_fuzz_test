@@ -1,0 +1,27 @@
+operator_id: not
+family: logical
+syntax_examples:
+  - 'Filter.not_(Filter.by_property("round").equal("Double"))'
+  - 'Filter.not_(Filter.by_property("nullableScore").is_none(True))'
+  - 'where: { operator: Not, operands: [...] }'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - filter_operand
+  - property_filter_predicates
+doc_semantics: "NOT negates a filter condition; the checked Python v4 examples use `Filter.not_(...)`, and the GraphQL where structure lists `Not` as a filter operator that wraps operands."
+doc_notes:
+  - "The checked Filters guide states that multiple conditions use `And`, `Or`, and `Not`, and shows a Python example where `Filter.not_(Filter.by_property(\"answer\").equal(\"Yucatan\"))` is composed with other filters."
+  - "The checked API reference lists `Not` as a where-filter operator, but it does not specify a complete null/missing truth table for negated property predicates."
+  - "The checked docs do not define empty operand lists, short-circuit behavior, double-NOT normalization, or OBJECT-specific non-null filtering semantics."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.18.1, `not_operator.py` passed the tested subset: NOT over scalar text equality, numeric comparison, text equality with explicit-null/omitted values, a numeric range conjunction, array `contains_any`, scalar `is_none(True)`, OBJECT `is_none(True)`, double NOT over scalar `is_none(True)`, and NOT over an OR compound all returned the expected tag sets. In the tested ordinary positive-predicate cases, explicit-null or omitted values were included by NOT; in the tested `NOT(is_none(True))` cases, only non-null/non-missing rows were returned. These null/missing and OBJECT observations are local oracle evidence, not official NOT-specific semantics; GitHub issue10642 is currently labeled as discussion/feature request/reproducible rather than a confirmed bug, so direct OBJECT `is_none(False)` is treated here as an unimplemented or unsupported feature boundary while `NOT(OBJECT is_none(True))` is a locally validated workaround subset."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - issue10642
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/not_operator.py"
+oracle_mapping: "Current fuzzer maps NOT to pandas by complementing generated subfilter masks and treating null/unknown mask values as included for ordinary negated predicates; dedicated NOT strategies model numeric/text comparisons, ranges, array contains, and `is_none(True)`, while PQS uses double-NOT and selected pivot-true NOT patterns. Support is partial but sound for the generated subset validated here, including `NOT(OBJECT is_none(True))`; metadata filters, reference filters, property length, arbitrary object paths, direct OBJECT `is_none(False)`, and undocumented empty-operand behavior are not covered. This is our oracle assumption, not an official claim."
