@@ -21,8 +21,8 @@ doc_notes:
 verify_status: mismatch_observed
 observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, the safe non-extreme subset passed on REST and gRPC for integer/float scalar ranges, conjunctive bounds, array any-element matching, missing/null exclusion, and tested string type mismatch; local historical range repros document mismatches near int64 extreme values and ±float32 maximum finite values."
 oracle_support:
-  - non-extreme integer and float scalar Range predicates
-  - non-extreme array-of-integer and array-of-float any-element Range predicates
+  - integer Range predicates outside default-excluded int64 extremes
+  - float scalar and array Range predicates with ±float32 maximum finite literals retained and tagged as known-boundary candidates
   - default exclusion of known unstable int64 extremes
   - known-boundary tagging for ±float32 maximum finite literals
 case_refs:
@@ -30,4 +30,4 @@ case_refs:
   - poc_qdrant_issue8617_float32_min_boundary_filtering
 repro_path: /home/caihao/compare_test/operator_test/qdrant/range_operator.py
 
-oracle_mapping: "`range` is mapped to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds, scalar rows matching direct comparison and array rows matching when any numeric element satisfies the range; missing/null and tested type-mismatched rows are treated as non-matches. Current fuzzer coverage excludes known unstable int64 extreme values by default, keeps ±float32 maximum finite values available for boundary coverage with known-boundary mismatch tagging, and excludes official datetime ranges, which are modeled separately by `datetime_range`. This is our oracle assumption, not an official claim."
+oracle_mapping: "`range` is mapped to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds, scalar rows matching direct comparison and array rows matching when any numeric element satisfies the range; missing/null and tested type-mismatched rows are treated as non-matches, current fuzzer coverage excludes known unstable int64 extreme values by default, keeps ±float32 maximum finite values available with known-boundary mismatch tagging, and excludes official datetime ranges modeled separately by `datetime_range`. This is our oracle assumption, not an official claim."

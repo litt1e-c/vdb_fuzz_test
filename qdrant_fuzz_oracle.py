@@ -2401,7 +2401,13 @@ class OracleQueryGenerator:
                     or math.isclose(center_lon, left_lon)
                     or math.isclose(center_lon, right_lon)
                 )
-                if pivot_on_bbox_edge:
+                bbox_clamped_to_global_edge = (
+                    math.isclose(top_lat, 90.0)
+                    or math.isclose(bottom_lat, -90.0)
+                    or math.isclose(left_lon, -180.0)
+                    or math.isclose(right_lon, 180.0)
+                )
+                if pivot_on_bbox_edge or bbox_clamped_to_global_edge:
                     geo_strategy = "radius"
                 else:
                     filter_cond = FieldCondition(
@@ -4200,7 +4206,13 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     or math.isclose(lon, left_lon)
                     or math.isclose(lon, right_lon)
                 )
-                if not pivot_on_bbox_edge:
+                bbox_clamped_to_global_edge = (
+                    math.isclose(top_lat, 90.0)
+                    or math.isclose(bottom_lat, -90.0)
+                    or math.isclose(left_lon, -180.0)
+                    or math.isclose(right_lon, 180.0)
+                )
+                if not pivot_on_bbox_edge and not bbox_clamped_to_global_edge:
                     strategies.append((
                         FieldCondition(
                             key=fname,
