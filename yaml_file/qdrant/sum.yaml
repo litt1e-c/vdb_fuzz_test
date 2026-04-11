@@ -1,0 +1,26 @@
+operator_id: sum
+family: formula_expression
+syntax_examples:
+  - '{"formula":{"sum":["price","bonus"]}}'
+  - '{"formula":{"sum":["missing_term",2.0]},"defaults":{"missing_term":3.0}}'
+  - '{"formula":{"sum":[1e20,1.0,-1e20]}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/search-relevance/
+  - https://api.qdrant.tech/api-reference/search/query-points
+doc_supported_types:
+  - numeric_expression
+doc_semantics: "The checked official search-relevance page lists `sum` as an arithmetic expression that sums an array of expressions within FormulaQuery-based rescoring."
+doc_notes:
+  - "The checked concept page does not clearly specify floating-point accumulation order, cancellation behavior, or overflow/non-finite score handling."
+  - "The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error."
+  - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary summation worked, negative terms could produce zero or negative totals, defaults could supply a missing term, missing terms without defaults were rejected, a query containing one overflowing sum was rejected as a whole, and floating-point accumulation order mattered in the tested constant examples because `[1e20, 1.0, -1e20]` evaluated to 0 while `[1e20, -1e20, 1.0]` evaluated to 1."
+oracle_support: []
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/sum_operator.py
+
+oracle_mapping: "`sum` would be mapped to a numeric oracle by evaluating terms left-to-right over the prefetched candidate set, comparing finite scores with float tolerance, rejecting missing terms without defaults and overflowing/non-finite totals, and preserving the currently validated order-sensitive floating-point accumulation behavior. Current main fuzzer coverage does not implement FormulaQuery or `sum`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim."

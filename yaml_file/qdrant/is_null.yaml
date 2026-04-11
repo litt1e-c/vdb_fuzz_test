@@ -1,0 +1,28 @@
+operator_id: is_null
+family: null_empty_condition
+syntax_examples:
+  - '{"is_null":{"key":"reports"}}'
+  - '{"must_not":[{"is_null":{"key":"reports"}}]}'
+  - '{"is_null":{"key":"meta.reports"}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/filtering/
+  - https://qdrant.tech/documentation/concepts/payload/
+doc_supported_types:
+  - unknown
+doc_semantics: "`is_null` matches records where the target field exists and has `null` value; the checked docs present it as the way to test for NULL values, and `must_not` with `is_null` selects non-null values."
+doc_notes:
+  - "The checked docs do not explicitly state how `is_null` treats missing keys, empty arrays, arrays containing nulls, empty strings, empty objects, or nested-path examples."
+  - "The checked payload docs say a filter is not satisfied when the stored value type does not fit the filtering condition, but `is_null` is documented by value state rather than by a narrow payload type family."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: only explicit null values matched `is_null`; missing keys, [], [None], empty strings, and empty objects did not; top-level array-of-object null matched while [] and a non-empty object array did not; nested-path `meta.reports` followed the same explicit-null-only semantics; and `must_not is_null` returned the tested complement set."
+oracle_support:
+  - top-level is_null and must_not-is_null over generated scalar, array, and ARRAY_OBJECT fields when explicit null values are present
+  - evolved-field strict is_null semantics only when explicit null backfill is enabled
+  - locally validated nested-path is_null subset, but no generic nested-path generation in the main fuzzer outside PQS JSON path selection
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/is_null_operator.py
+
+oracle_mapping: "`is_null` is mapped to pandas by treating a row as null only when the target value itself is explicit null, and as non-null otherwise; `must_not is_null` uses the complement of that mask, which preserves missing rows for ordinary fields. Current main fuzzer coverage includes top-level scalar and array fields, plus ARRAY_OBJECT after the shared null/empty branch refinement; evolved fields default to `is_empty` semantics unless explicit null backfill is enabled, and broader generic nested-path `is_null` behavior is locally validated but not generally generated. This is our oracle assumption, not an official claim."

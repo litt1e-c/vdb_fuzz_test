@@ -41,7 +41,7 @@ services:
   # --- Milvus Standalone (使用修复后的 Master 镜像) ---
   milvus:
     # 修改此处以匹配官方验证通过的版本
-    image: milvusdb/milvus:master-20260330-31a01c81-amd64
+    image: milvusdb/milvus:master-20260204-e12a5b0b-amd64
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined

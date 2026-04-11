@@ -1,0 +1,26 @@
+operator_id: div
+family: formula_expression
+syntax_examples:
+  - '{"formula":{"div":{"left":"price","right":2.0}}}'
+  - '{"formula":{"div":{"left":0.0,"right":"missing_metric"}}}'
+  - '{"formula":{"div":{"left":"price","right":0.0,"by_zero_default":7.0}}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/search-relevance/
+  - https://api.qdrant.tech/api-reference/search/query-points
+doc_supported_types:
+  - numeric_expression
+doc_semantics: "The checked official search-relevance page lists `div` as an arithmetic expression that divides one expression by another and states that multiplication and division are lazily evaluated, so if a `0` is encountered the rest of the operations do not execute."
+doc_notes:
+  - "The checked concept page does not clearly specify divide-by-zero handling, missing-variable behavior, overflow/non-finite score handling, or output precision."
+  - "The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error."
+  - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary numeric division rescored as expected, a constant-zero left operand short-circuited and did not evaluate a missing right operand, `right=0.0` without a default was rejected as non-finite, `by_zero_default=7.0` returned the default for non-zero numerators while a zero numerator still yielded 0, and a huge quotient that overflowed the tested finite score range was rejected."
+oracle_support: []
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/div_operator.py
+
+oracle_mapping: "`div` would be mapped to a numeric oracle by evaluating left and right expressions over the prefetched candidate set, short-circuiting when the left side is exactly 0, rejecting non-finite results unless an explicit zero-divisor fallback is configured, and comparing scores with float tolerance rather than exact equality. Current main fuzzer coverage does not implement FormulaQuery or `div`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim."

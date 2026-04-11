@@ -21,7 +21,7 @@ import pandas as pd
 import json
 import sys
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
 from qdrant_client.http.models import (
@@ -244,11 +244,40 @@ class DataManager:
     FLOAT32_MIN_NORMAL = float(np.finfo(np.float32).tiny)
     FLOAT32_MIN_SUBNORMAL = float(np.nextafter(np.float32(0.0), np.float32(1.0), dtype=np.float32))
 
+    @staticmethod
+    def _format_datetime_utc(ts):
+        if ts is None or pd.isna(ts):
+            return None
+        if not isinstance(ts, pd.Timestamp):
+            ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        ts = ts.floor("s")
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _normalize_datetime_value(self, value):
+        if self._is_missing_scalar(value):
+            return None
+        if isinstance(value, (int, np.integer, float, np.floating)):
+            return None
+        try:
+            ts = pd.to_datetime(value, utc=True, errors="coerce")
+        except Exception:
+            return None
+        if ts is None or pd.isna(ts):
+            return None
+        return self._format_datetime_utc(ts)
+
+    def _random_datetime_value(self, rng):
+        epoch_2020 = int(datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp())
+        epoch_2025 = int(datetime(2025, 1, 1, tzinfo=timezone.utc).timestamp())
+        raw = int(rng.integers(epoch_2020, epoch_2025))
+        return self._format_datetime_utc(pd.Timestamp(raw, unit="s", tz="UTC"))
+
     def _boundary_pool(self, ftype):
         """按字段类型返回边界值候选池。"""
-        epoch_2020 = int(datetime(2020, 1, 1).timestamp())
-        epoch_2025 = int(datetime(2025, 1, 1).timestamp())
-
         if ftype == FieldType.INT:
             pool = [
                 -self.int_range, -1, 0, 1, self.int_range,
@@ -364,7 +393,13 @@ class DataManager:
                 [-self.FLOAT32_MAX, self.FLOAT32_MAX]
             ]
         if ftype == FieldType.DATETIME:
-            return [0, epoch_2020, epoch_2025 - 1, 2147483647, 4102444800]
+            return [
+                "1970-01-01T00:00:00Z",
+                "2020-01-01T00:00:00Z",
+                "2024-02-29T12:34:56Z",
+                "2024-12-31T23:59:59Z",
+                "2099-12-31T23:59:59Z",
+            ]
         if ftype == FieldType.GEO:
             return [
                 {"lat": 0.0, "lon": 0.0},
@@ -452,11 +487,13 @@ class DataManager:
     def _normalize_scalar_for_field(self, v, ftype):
         if self._is_missing_scalar(v):
             return None
-        if ftype in [FieldType.INT, FieldType.DATETIME]:
+        if ftype == FieldType.INT:
             try:
                 return self._clip_int64(v)
             except Exception:
                 return None
+        if ftype == FieldType.DATETIME:
+            return self._normalize_datetime_value(v)
         if ftype == FieldType.BOOL:
             try:
                 return bool(v)
@@ -568,10 +605,12 @@ class DataManager:
             if fname not in out.columns:
                 continue
 
-            if ftype in [FieldType.INT, FieldType.DATETIME]:
+            if ftype == FieldType.INT:
                 raw_vals = out[fname].tolist()
                 coerced = [pd.NA if self._is_missing_scalar(x) else self._clip_int64(x) for x in raw_vals]
                 out[fname] = pd.Series(pd.array(coerced, dtype="Int64"), index=out.index)
+            elif ftype == FieldType.DATETIME:
+                out[fname] = out[fname].apply(lambda x: self._normalize_datetime_value(x))
             elif ftype == FieldType.BOOL:
                 raw_vals = out[fname].tolist()
                 coerced = [pd.NA if self._is_missing_scalar(x) else bool(x) for x in raw_vals]
@@ -585,8 +624,8 @@ class DataManager:
 
     def normalize_dataframe_types(self):
         """
-        统一主 DataFrame 中标量字段类型，避免 INT/DATETIME 在带 NULL 场景下漂移成 float，
-        从而导致 Oracle 比较语义失真（特别是 int64 边界值）。
+        统一主 DataFrame 中标量字段类型，避免 INT 在带 NULL 场景下漂移成 float，
+        并将 DATETIME 规范化为 UTC 字符串，降低 Oracle 比较语义失真。
         """
         if self.df is None:
             return
@@ -776,11 +815,7 @@ class DataManager:
                 arr_list = self._inject_boundary_values(arr_list, ftype, rng)
                 data[fname] = self._apply_nulls(arr_list, rng)
             elif ftype == FieldType.DATETIME:
-                # 生成时间戳（epoch 秒数，整型）
-                # 范围：2020-01-01 到 2025-01-01
-                epoch_2020 = int(datetime(2020, 1, 1).timestamp())
-                epoch_2025 = int(datetime(2025, 1, 1).timestamp())
-                values = [int(rng.integers(epoch_2020, epoch_2025)) for _ in range(N)]
+                values = [self._random_datetime_value(rng) for _ in range(N)]
                 values = self._inject_boundary_values(values, ftype, rng)
                 data[fname] = self._apply_nulls(values, rng)
             elif ftype == FieldType.GEO:
@@ -822,7 +857,7 @@ class DataManager:
             ftype = field["type"]
             if fname not in data:
                 continue
-            if ftype in [FieldType.INT, FieldType.DATETIME]:
+            if ftype == FieldType.INT:
                 data[fname] = pd.array(
                     [pd.NA if self._is_missing_scalar(x) else self._clip_int64(x) for x in data[fname]],
                     dtype="Int64"
@@ -900,10 +935,7 @@ class DataManager:
                 val = [round(float(rng.random() * 1000), 2) for _ in range(arr_len)]
                 row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.DATETIME:
-                from datetime import datetime as dt_cls
-                epoch_2020 = int(dt_cls(2020, 1, 1).timestamp())
-                epoch_2025 = int(dt_cls(2025, 1, 1).timestamp())
-                val = int(rng.integers(epoch_2020, epoch_2025))
+                val = self._random_datetime_value(rng)
                 row[fname] = self._maybe_use_boundary_value(val, ftype, rng)
             elif ftype == FieldType.GEO:
                 if rng.random() < self.null_ratio:
@@ -953,9 +985,7 @@ class DataManager:
         elif ftype == FieldType.UUID:
             value = self._random_uuid_string()
         elif ftype == FieldType.DATETIME:
-            epoch_2020 = int(datetime(2020, 1, 1).timestamp())
-            epoch_2025 = int(datetime(2025, 1, 1).timestamp())
-            value = int(rng.integers(epoch_2020, epoch_2025))
+            value = self._random_datetime_value(rng)
         elif ftype == FieldType.JSON:
             value = self._build_json_payload(rng)
         elif ftype == FieldType.ARRAY_INT:
@@ -1010,7 +1040,7 @@ class DataManager:
         self.schema_config.append(field_config)
 
         # 更新 pandas DataFrame: 所有现有行设为缺失值，并尽量保持类型稳定
-        if ftype in [FieldType.INT, FieldType.DATETIME]:
+        if ftype == FieldType.INT:
             self.df[field_name] = pd.Series([pd.NA] * len(self.df), dtype="Int64")
         elif ftype == FieldType.BOOL:
             self.df[field_name] = pd.Series([pd.NA] * len(self.df), dtype="boolean")
@@ -1316,7 +1346,7 @@ class QdrantManager:
                     self.create_payload_index(
                         collection_name=COLLECTION_NAME,
                         field_name=fname,
-                        field_schema=PayloadSchemaType.INTEGER
+                        field_schema=PayloadSchemaType.DATETIME
                     )
                 elif ftype == FieldType.GEO:
                     self.create_payload_index(
@@ -1437,7 +1467,7 @@ class QdrantManager:
             FieldType.STRING: PayloadSchemaType.KEYWORD,
             FieldType.UUID: PayloadSchemaType.UUID,
             FieldType.BOOL: PayloadSchemaType.BOOL,
-            FieldType.DATETIME: PayloadSchemaType.INTEGER,
+            FieldType.DATETIME: PayloadSchemaType.DATETIME,
             FieldType.GEO: PayloadSchemaType.GEO,
         }
         schema_type = type_to_schema.get(ftype)
@@ -1529,7 +1559,7 @@ class QdrantManager:
             FieldType.STRING: PayloadSchemaType.KEYWORD,
             FieldType.UUID: PayloadSchemaType.UUID,
             FieldType.BOOL: PayloadSchemaType.BOOL,
-            FieldType.DATETIME: PayloadSchemaType.INTEGER,
+            FieldType.DATETIME: PayloadSchemaType.DATETIME,
             FieldType.GEO: PayloadSchemaType.GEO,
         }
 
@@ -1641,6 +1671,39 @@ class OracleQueryGenerator:
             return self._clip_int64(x)
         except Exception:
             return None
+
+    @staticmethod
+    def _format_datetime_utc(ts):
+        if ts is None or pd.isna(ts):
+            return None
+        if not isinstance(ts, pd.Timestamp):
+            ts = pd.Timestamp(ts)
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        else:
+            ts = ts.tz_convert("UTC")
+        ts = ts.floor("s")
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def _normalize_datetime_scalar(self, x):
+        if self._is_na_like(x):
+            return None
+        if isinstance(x, (int, np.integer, float, np.floating)):
+            return None
+        try:
+            ts = pd.to_datetime(x, utc=True, errors="coerce")
+        except Exception:
+            return None
+        if ts is None or pd.isna(ts):
+            return None
+        return ts.floor("s")
+
+    def _offset_datetime_str(self, value, *, seconds=0, days=0):
+        ts = self._normalize_datetime_scalar(value)
+        if ts is None:
+            return None
+        shifted = ts + pd.Timedelta(days=days, seconds=seconds)
+        return self._format_datetime_utc(shifted)
 
     def _as_bool_mask(self, mask):
         """统一 mask 为 pandas nullable boolean Series，避免 object/float 掩码的隐式行为。"""
@@ -1853,10 +1916,14 @@ class OracleQueryGenerator:
             return round(random.random() * 2000, 2)
 
         elif ftype == FieldType.DATETIME:
-            # 生成一个随机时间戳（epoch 秒数）
-            epoch_2020 = int(datetime(2020, 1, 1).timestamp())
-            epoch_2025 = int(datetime(2025, 1, 1).timestamp())
-            return random.randint(epoch_2020, epoch_2025)
+            if not valid_series.empty:
+                valid_strings = [self._convert_to_native(x) for x in valid_series.values if self._normalize_datetime_scalar(self._convert_to_native(x)) is not None]
+                if valid_strings:
+                    return random.choice(valid_strings)
+            return random.choice([
+                "2019-01-01T00:00:00Z",
+                "2030-01-01T00:00:00Z",
+            ])
 
         elif ftype == FieldType.GEO:
             return {"lat": round(random.uniform(-90, 90), 6), "lon": round(random.uniform(-180, 180), 6)}
@@ -1888,7 +1955,7 @@ class OracleQueryGenerator:
                     return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
                 return (self._qdrant_not_null_filter(name), self._series_not_null(series), f"{name} is not null")
 
-            if ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT]:
+            if ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT, FieldType.ARRAY_OBJECT]:
                 op = random.choice(["is_null", "is_not_null", "is_empty", "is_not_empty"])
                 if op == "is_null":
                     return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
@@ -2272,42 +2339,43 @@ class OracleQueryGenerator:
                 expr_str = f'{name} is not empty'
 
         elif ftype == FieldType.DATETIME:
-            val_int = self._clip_int64(int(val))
-            # Current DATETIME fields are stored as integer timestamp surrogates, not
-            # official RFC3339 datetime payloads, so keep this branch range-only.
+            target_ts = self._normalize_datetime_scalar(val)
+            if target_ts is None:
+                return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
+            val_dt = self._format_datetime_utc(target_ts)
             op = random.choice([">", "<", ">=", "<="])
             if op == ">":
-                filter_cond = FieldCondition(key=name, range=Range(gt=val_int))
+                filter_cond = FieldCondition(key=name, range=DatetimeRange(gt=val_dt))
                 mask = self._safe_apply(series, 
-                    lambda x, t=val_int: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) > t
+                    lambda x, t=target_ts: (
+                        self._normalize_datetime_scalar(x) is not None and self._normalize_datetime_scalar(x) > t
                     )
                 )
-                expr_str = f"{name} > {val_int} (timestamp)"
+                expr_str = f'{name} > "{val_dt}"'
             elif op == "<":
-                filter_cond = FieldCondition(key=name, range=Range(lt=val_int))
+                filter_cond = FieldCondition(key=name, range=DatetimeRange(lt=val_dt))
                 mask = self._safe_apply(series, 
-                    lambda x, t=val_int: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) < t
+                    lambda x, t=target_ts: (
+                        self._normalize_datetime_scalar(x) is not None and self._normalize_datetime_scalar(x) < t
                     )
                 )
-                expr_str = f"{name} < {val_int} (timestamp)"
+                expr_str = f'{name} < "{val_dt}"'
             elif op == ">=":
-                filter_cond = FieldCondition(key=name, range=Range(gte=val_int))
+                filter_cond = FieldCondition(key=name, range=DatetimeRange(gte=val_dt))
                 mask = self._safe_apply(series, 
-                    lambda x, t=val_int: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) >= t
+                    lambda x, t=target_ts: (
+                        self._normalize_datetime_scalar(x) is not None and self._normalize_datetime_scalar(x) >= t
                     )
                 )
-                expr_str = f"{name} >= {val_int} (timestamp)"
+                expr_str = f'{name} >= "{val_dt}"'
             elif op == "<=":
-                filter_cond = FieldCondition(key=name, range=Range(lte=val_int))
+                filter_cond = FieldCondition(key=name, range=DatetimeRange(lte=val_dt))
                 mask = self._safe_apply(series, 
-                    lambda x, t=val_int: (
-                        self._normalize_int_scalar(x) is not None and self._normalize_int_scalar(x) <= t
+                    lambda x, t=target_ts: (
+                        self._normalize_datetime_scalar(x) is not None and self._normalize_datetime_scalar(x) <= t
                     )
                 )
-                expr_str = f"{name} <= {val_int} (timestamp)"
+                expr_str = f'{name} <= "{val_dt}"'
 
         elif ftype == FieldType.GEO:
             if isinstance(val, dict) and "lat" in val and "lon" in val:
@@ -2362,7 +2430,7 @@ class OracleQueryGenerator:
                     a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
                     c = 2 * math.asin(min(1.0, math.sqrt(a)))
                     dist = 6_371_000 * c  # 地球平均半径(m)
-                    return dist <= r
+                    return dist < r
                 mask = self._safe_apply(series, _haversine_check)
                 expr_str = f"{name} in radius({center_lat:.2f},{center_lon:.2f}, r={radius_m:.0f}m)"
 
@@ -2864,7 +2932,7 @@ class OracleQueryGenerator:
 
         # --- 策略 1: NOT + 比较 ---
         if strategy == "not_compare":
-            if ftype in [FieldType.INT, FieldType.DATETIME]:
+            if ftype == FieldType.INT:
                 valid = series.dropna()
                 if valid.empty:
                     return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
@@ -2892,6 +2960,37 @@ class OracleQueryGenerator:
                 mask = self._safe_apply(series, _mask_fn_int)
                 op_sym = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[op]
                 return f_obj, mask, f"NOT ({name} {op_sym} {val})"
+
+            if ftype == FieldType.DATETIME:
+                valid = series.dropna()
+                if valid.empty:
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
+                raw_val = self._convert_to_native(random.choice(valid.values))
+                val_ts = self._normalize_datetime_scalar(raw_val)
+                if val_ts is None:
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
+                val_dt = self._format_datetime_utc(val_ts)
+                op = random.choice(["gt", "lt", "gte", "lte"])
+                inner_cond = FieldCondition(key=name, range=DatetimeRange(**{op: val_dt}))
+                f_obj = Filter(must_not=[inner_cond])
+
+                def _mask_fn_dt(x, _op=op, _val=val_ts):
+                    nx = self._normalize_datetime_scalar(x)
+                    if nx is None:
+                        return True
+                    if _op == "gt":
+                        return not (nx > _val)
+                    if _op == "lt":
+                        return not (nx < _val)
+                    if _op == "gte":
+                        return not (nx >= _val)
+                    if _op == "lte":
+                        return not (nx <= _val)
+                    return True
+
+                mask = self._safe_apply(series, _mask_fn_dt)
+                op_sym = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[op]
+                return f_obj, mask, f'NOT ({name} {op_sym} "{val_dt}")'
 
             if ftype == FieldType.FLOAT:
                 valid = series.dropna()
@@ -2970,7 +3069,7 @@ class OracleQueryGenerator:
 
         # --- 策略 5: NOT + AND (德摩根定律) ---
         elif strategy == "not_and":
-            if ftype in [FieldType.INT, FieldType.DATETIME]:
+            if ftype == FieldType.INT:
                 valid = series.dropna()
                 if valid.empty:
                     return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
@@ -2992,6 +3091,32 @@ class OracleQueryGenerator:
                     return not (nx > _low and nx < _high)
                 mask = self._safe_apply(series, _and_mask)
                 return f_obj, mask, f"NOT ({name} > {low} AND {name} < {high})"
+            if ftype == FieldType.DATETIME:
+                valid = series.dropna()
+                if valid.empty:
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
+                raw_val = self._convert_to_native(random.choice(valid.values))
+                val_ts = self._normalize_datetime_scalar(raw_val)
+                if val_ts is None:
+                    return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
+                low_dt = self._format_datetime_utc(val_ts - pd.Timedelta(days=random.randint(1, 7)))
+                high_dt = self._format_datetime_utc(val_ts + pd.Timedelta(days=random.randint(1, 7)))
+                inner = Filter(must=[
+                    FieldCondition(key=name, range=DatetimeRange(gt=low_dt)),
+                    FieldCondition(key=name, range=DatetimeRange(lt=high_dt))
+                ])
+                f_obj = Filter(must_not=[inner])
+
+                def _and_mask_dt(x, _low=low_dt, _high=high_dt):
+                    nx = self._normalize_datetime_scalar(x)
+                    low_ts = self._normalize_datetime_scalar(_low)
+                    high_ts = self._normalize_datetime_scalar(_high)
+                    if nx is None or low_ts is None or high_ts is None:
+                        return True
+                    return not (nx > low_ts and nx < high_ts)
+
+                mask = self._safe_apply(series, _and_mask_dt)
+                return f_obj, mask, f'NOT ({name} > "{low_dt}" AND {name} < "{high_dt}")'
             return self._qdrant_not_null_filter(name), not_nullish_mask, f"NOT ({nullish_expr})"
 
         # --- 策略 6: NOT + OR (德摩根延伸) ---
@@ -3283,8 +3408,8 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
 
         elif dtype == FieldType.DATETIME:
             return (
-                FieldCondition(key=name, range=Range(gt=9999999999)),
-                f'{name} > 9999999999 (impossible timestamp)'
+                FieldCondition(key=name, range=DatetimeRange(gt="2100-01-01T00:00:00Z")),
+                f'{name} > "2100-01-01T00:00:00Z"'
             )
 
         elif dtype == FieldType.GEO:
@@ -3449,7 +3574,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
             # 检查是否为 INT 类型字段
             fname = cond.key
             ftype = self.field_types.get(fname)
-            if ftype not in [FieldType.INT, FieldType.DATETIME]:
+            if ftype != FieldType.INT:
                 continue
 
             rng = cond.range
@@ -3695,10 +3820,16 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 if ftype == FieldType.BOOL:
                     filters.append(FieldCondition(key=fname, match=MatchValue(value=bool(val))))
                     exprs.append(f"{fname}=={bool(val)}")
-                elif ftype == FieldType.INT or ftype == FieldType.DATETIME:
+                elif ftype == FieldType.INT:
                     v = int(val)
                     filters.append(FieldCondition(key=fname, range=Range(gte=v, lte=v)))
                     exprs.append(f"{fname}=={v}")
+                elif ftype == FieldType.DATETIME:
+                    v = self._format_datetime_utc(self._normalize_datetime_scalar(val))
+                    if v is None:
+                        continue
+                    filters.append(FieldCondition(key=fname, range=DatetimeRange(gte=v, lte=v)))
+                    exprs.append(f'{fname}=="{v}"')
                 elif ftype == FieldType.FLOAT:
                     v = float(val)
                     eps = 1e-5
@@ -4020,24 +4151,28 @@ class PQSQueryGenerator(OracleQueryGenerator):
             return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
 
         elif ftype == FieldType.DATETIME:
-            val_int = int(val) if hasattr(val, "item") else int(val)
+            val_dt = self._format_datetime_utc(self._normalize_datetime_scalar(val))
+            if val_dt is None:
+                return self._qdrant_nullish_filter(fname), self._nullish_expr(fname)
             strategies = []
+            prev_dt = self._offset_datetime_str(val_dt, seconds=-1)
+            next_dt = self._offset_datetime_str(val_dt, seconds=1)
+            future_dt = self._offset_datetime_str(val_dt, days=1)
             # 策略1: 精确闭区间
             strategies.append((
-                FieldCondition(key=fname, range=Range(gte=val_int, lte=val_int)),
-                f'{fname} timestamp == {val_int}'
+                FieldCondition(key=fname, range=DatetimeRange(gte=val_dt, lte=val_dt)),
+                f'{fname} datetime == "{val_dt}"'
             ))
-            # 策略2: 开区间包裹
-            strategies.append((
-                FieldCondition(key=fname, range=Range(gt=val_int - 1, lt=val_int + 1)),
-                f'{fname} timestamp in ({val_int-1}, {val_int+1})'
-            ))
-            # 策略3: must_not 反面（排除未来）
-            future = val_int + random.randint(1, 86400)
-            strategies.append((
-                Filter(must_not=[FieldCondition(key=fname, range=Range(gte=future))]),
-                f'NOT ({fname} >= {future})'
-            ))
+            if prev_dt is not None and next_dt is not None:
+                strategies.append((
+                    FieldCondition(key=fname, range=DatetimeRange(gt=prev_dt, lt=next_dt)),
+                    f'{fname} datetime in ("{prev_dt}", "{next_dt}")'
+                ))
+            if future_dt is not None:
+                strategies.append((
+                    Filter(must_not=[FieldCondition(key=fname, range=DatetimeRange(gte=future_dt))]),
+                    f'NOT ({fname} >= "{future_dt}")'
+                ))
             return random.choice(strategies)
 
         elif ftype == FieldType.GEO:

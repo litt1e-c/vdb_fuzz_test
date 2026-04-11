@@ -23,7 +23,6 @@ observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, the safe 
 oracle_support:
   - non-extreme integer and float scalar Range predicates
   - non-extreme array-of-integer and array-of-float any-element Range predicates
-  - integer timestamp surrogate ranges for current DATETIME fields
   - default exclusion of known unstable int64 extremes
   - known-boundary tagging for ±float32 maximum finite literals
 case_refs:
@@ -31,4 +30,4 @@ case_refs:
   - poc_qdrant_issue8617_float32_min_boundary_filtering
 repro_path: /home/caihao/compare_test/operator_test/qdrant/range_operator.py
 
-oracle_mapping: "`range` is mapped to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds, scalar rows matching direct comparison and array rows matching when any numeric element satisfies the range; missing/null and tested type-mismatched rows are treated as non-matches. Current fuzzer coverage excludes known unstable int64 extreme values by default, keeps ±float32 maximum finite values available for boundary coverage with known-boundary mismatch tagging, and treats current DATETIME support as an integer timestamp surrogate rather than official datetime range. This is our oracle assumption, not an official claim."
+oracle_mapping: "`range` is mapped to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds, scalar rows matching direct comparison and array rows matching when any numeric element satisfies the range; missing/null and tested type-mismatched rows are treated as non-matches. Current fuzzer coverage excludes known unstable int64 extreme values by default, keeps ±float32 maximum finite values available for boundary coverage with known-boundary mismatch tagging, and excludes official datetime ranges, which are modeled separately by `datetime_range`. This is our oracle assumption, not an official claim."

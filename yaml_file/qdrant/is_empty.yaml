@@ -1,0 +1,28 @@
+operator_id: is_empty
+family: null_empty_condition
+syntax_examples:
+  - '{"is_empty":{"key":"reports"}}'
+  - '{"must_not":[{"is_empty":{"key":"reports"}}]}'
+  - '{"is_empty":{"key":"meta.reports"}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/filtering/
+  - https://qdrant.tech/documentation/concepts/payload/
+doc_supported_types:
+  - unknown
+doc_semantics: "`is_empty` matches records where the target field does not exist or has `null` or `[]` value; the checked docs also note that `must_not` with `is_empty` selects non-empty values."
+doc_notes:
+  - "The checked docs do not explicitly state how `is_empty` treats empty strings, empty objects, arrays containing nulls, or nested-path examples."
+  - "The checked payload docs say a filter is not satisfied when the stored value type does not fit the filtering condition, but `is_empty` is documented by value state rather than by a narrow payload type family."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: missing keys, explicit null, and [] matched `is_empty`; empty strings, empty objects, and [None] did not; array-of-object [] matched while a non-empty object array did not; nested-path `meta.reports` followed the same tested subset semantics; and `must_not is_empty` returned the tested complement set."
+oracle_support:
+  - top-level is_empty and must_not-is_empty over generated ARRAY_INT, ARRAY_STR, ARRAY_FLOAT, and ARRAY_OBJECT fields
+  - evolved-field empty semantics for missing/null/[] when explicit null backfill is disabled
+  - locally validated nested-path is_empty subset, but no generic nested-path generation in the main fuzzer
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/is_empty_operator.py
+
+oracle_mapping: "`is_empty` is mapped to pandas by treating a row as empty when the target value is missing, explicit null, or an empty list, and as non-empty otherwise; `must_not is_empty` uses the complement of that mask. Current main fuzzer coverage is the generated top-level array fields plus evolved-field empty semantics, and after refinement it also generates direct `ARRAY_OBJECT` `is_empty` predicates; broader generic nested-path `is_empty` behavior is locally validated but not yet generated. This is our oracle assumption, not an official claim."

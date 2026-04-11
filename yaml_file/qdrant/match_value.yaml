@@ -28,4 +28,4 @@ oracle_support:
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/match_value_operator.py
 
-oracle_mapping: "`match_value` is mapped to pandas/PQS exact equality on keyword, integer, and bool payloads, with array fields matching if any element equals the target and with missing/null rows treated as non-matches. Current fuzzer coverage is limited to that supported scalar subset and explicitly excludes official float/datetime `match.value` claims, because this fuzzer stores DATETIME as integer timestamp surrogates; this is our oracle assumption, not an official claim."
+oracle_mapping: "`match_value` is mapped to pandas/PQS exact equality on keyword, integer, and bool payloads, with array fields matching if any element equals the target and with missing/null rows treated as non-matches. Current fuzzer coverage is limited to that supported scalar subset and explicitly excludes float/datetime `match.value`; datetime scalar comparison is modeled separately through `datetime_range` closed bounds. This is our oracle assumption, not an official claim."
