@@ -85,6 +85,20 @@ ROWS = [
         },
         vector=[0.5, 0.0, 0.5],
     ),
+    DataObject(
+        uuid=deterministic_uuid("f"),
+        properties={
+            "tag": "f",
+            "round": "Double",
+            "answer": "EmptyText",
+            "points": 600,
+            "nullableScore": 0,
+            "optionalText": "",
+            "tagsArray": [4],
+            "metaObj": {},
+        },
+        vector=[0.2, 0.2, 0.2],
+    ),
 ]
 
 
@@ -164,6 +178,13 @@ def print_check(name, doc_expectation, oracle_expectation, expected, actual):
     return ok
 
 
+def print_observation(name, why_observed, actual):
+    print(name)
+    print(f"  note:    {why_observed}")
+    print(f"  observed:{actual}")
+    print("  result:  OBSERVED")
+
+
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:8]}"
     collection_name = f"{COLLECTION_PREFIX}{suffix}"
@@ -198,7 +219,7 @@ def main():
             "not_numeric_comparison_with_null_or_missing",
             "Docs document NOT composition but do not fully specify scalar null/missing truth tables.",
             "Current fuzzer oracle treats null or omitted scalar values as included by NOT over an ordinary positive comparison.",
-            ["a", "b", "d", "e"],
+            ["a", "b", "d", "e", "f"],
             fetch_tags(collection, numeric_not_cmp),
         ))
 
@@ -207,7 +228,7 @@ def main():
             "not_text_equal_with_null_or_missing",
             "Docs document NOT composition but do not fully specify text null/missing truth tables.",
             "Current fuzzer oracle treats null or omitted text values as included by NOT over equality.",
-            ["b", "c", "d", "e"],
+            ["b", "c", "d", "e", "f"],
             fetch_tags(collection, text_not_equal),
         ))
 
@@ -219,7 +240,7 @@ def main():
             "not_range_compound",
             "NOT may wrap a nested filter expression.",
             "Oracle negates the range conjunction over present numeric values.",
-            ["a", "c"],
+            ["a", "c", "f"],
             fetch_tags(collection, range_not),
         ))
 
@@ -228,8 +249,80 @@ def main():
             "not_array_contains_any_with_null_or_missing",
             "Docs document NOT composition; array null/missing behavior is operand-level behavior.",
             "Current fuzzer oracle treats null, omitted, and empty arrays as included by NOT over contains_any.",
-            ["b", "c", "d", "e"],
+            ["b", "c", "d", "e", "f"],
             fetch_tags(collection, contains_not),
+        ))
+
+        text_is_null = Filter.by_property("optionalText").is_none(True)
+        checks.append(print_check(
+            "text_is_none_true_null_missing_empty_string",
+            "Official null-state docs say empty strings are equivalent to null values.",
+            "Fuzzer null masks treat None, omitted text, and empty string as effective null.",
+            ["b", "d", "f"],
+            fetch_tags(collection, text_is_null),
+        ))
+
+        text_is_not_null = Filter.by_property("optionalText").is_none(False)
+        checks.append(print_check(
+            "text_is_none_false_excludes_empty_string",
+            "Official null-state docs say empty strings are equivalent to null values.",
+            "Fuzzer null masks therefore exclude empty strings from is_none(False).",
+            ["a", "c", "e"],
+            fetch_tags(collection, text_is_not_null),
+        ))
+
+        text_not_is_null = Filter.not_(Filter.by_property("optionalText").is_none(True))
+        checks.append(print_check(
+            "not_text_is_none_true_excludes_empty_string",
+            "NOT over text null-state should preserve the documented empty-string-as-null boundary in the tested subset.",
+            "Oracle maps NOT(is_none(True)) to the non-null/non-empty text rows.",
+            ["a", "c", "e"],
+            fetch_tags(collection, text_not_is_null),
+        ))
+
+        text_not_is_not_null = Filter.not_(Filter.by_property("optionalText").is_none(False))
+        checks.append(print_check(
+            "not_text_is_none_false_includes_empty_string",
+            "NOT over text non-null state should return the documented null-equivalent rows in the tested subset.",
+            "Oracle maps NOT(is_none(False)) to null, omitted, and empty-string text rows.",
+            ["b", "d", "f"],
+            fetch_tags(collection, text_not_is_not_null),
+        ))
+
+        array_is_null = Filter.by_property("tagsArray").is_none(True)
+        checks.append(print_check(
+            "array_is_none_true_null_missing_empty_array",
+            "Official null-state docs say zero-length arrays are equivalent to null values.",
+            "Fuzzer data generation normalizes empty arrays to None, so the oracle treats null, omitted, and empty arrays as effective null.",
+            ["b", "d", "e"],
+            fetch_tags(collection, array_is_null),
+        ))
+
+        array_is_not_null = Filter.by_property("tagsArray").is_none(False)
+        checks.append(print_check(
+            "array_is_none_false_excludes_empty_array",
+            "Official null-state docs say zero-length arrays are equivalent to null values.",
+            "Oracle maps is_none(False) to arrays with at least one element.",
+            ["a", "c", "f"],
+            fetch_tags(collection, array_is_not_null),
+        ))
+
+        array_not_is_null = Filter.not_(Filter.by_property("tagsArray").is_none(True))
+        checks.append(print_check(
+            "not_array_is_none_true_excludes_empty_array",
+            "NOT over array null-state should preserve the documented empty-array-as-null boundary in the tested subset.",
+            "Oracle maps NOT(is_none(True)) to arrays with at least one element.",
+            ["a", "c", "f"],
+            fetch_tags(collection, array_not_is_null),
+        ))
+
+        array_not_is_not_null = Filter.not_(Filter.by_property("tagsArray").is_none(False))
+        checks.append(print_check(
+            "not_array_is_none_false_includes_empty_array",
+            "NOT over array non-null state should return the documented null-equivalent rows in the tested subset.",
+            "Oracle maps NOT(is_none(False)) to null, omitted, and empty-array rows.",
+            ["b", "d", "e"],
+            fetch_tags(collection, array_not_is_not_null),
         ))
 
         not_is_null = Filter.not_(Filter.by_property("nullableScore").is_none(True))
@@ -237,7 +330,7 @@ def main():
             "not_is_none_true_scalar",
             "NOT negates the scalar null-state filter.",
             "Oracle maps NOT(is_none(True)) to the non-null/non-missing scalar rows.",
-            ["a", "c", "e"],
+            ["a", "c", "e", "f"],
             fetch_tags(collection, not_is_null),
         ))
 
@@ -246,7 +339,7 @@ def main():
             "not_is_none_true_object",
             "OBJECT null filtering is a separate operand-level behavior; issue10642 treats direct OBJECT is_none(False) as an unimplemented or unsupported boundary.",
             "Current oracle treats NOT(OBJECT is_none(True)) as non-null/non-missing OBJECT rows for the validated subset.",
-            ["a", "c", "e"],
+            ["a", "c", "e", "f"],
             fetch_tags(collection, object_not_is_null),
         ))
 
@@ -267,9 +360,24 @@ def main():
             "not_over_or_compound",
             "NOT may wrap a nested OR expression.",
             "Oracle applies complement after the OR mask is computed.",
-            ["b", "e"],
+            ["b", "e", "f"],
             fetch_tags(collection, not_or_filter),
         ))
+
+        object_is_null = Filter.by_property("metaObj").is_none(True)
+        checks.append(print_check(
+            "object_is_none_true_null_missing_not_empty_object",
+            "Docs cover null-state generally; OBJECT empty-object behavior is not specified by the checked pages.",
+            "The fuzzer currently treats None or omitted OBJECT as null and a Python dict, including an empty dict, as non-null.",
+            ["b", "d"],
+            fetch_tags(collection, object_is_null),
+        ))
+
+        print_observation(
+            "direct_object_is_none_false_observation",
+            "Direct OBJECT is_none(False) is tracked as an unimplemented or unsupported feature boundary by issue10642, so this observation is not used as a passing oracle assertion.",
+            fetch_tags(collection, Filter.by_property("metaObj").is_none(False)),
+        )
 
         if all(checks):
             print("Summary: all NOT operator checks passed on the local Weaviate service.")

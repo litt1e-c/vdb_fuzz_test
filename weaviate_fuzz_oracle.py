@@ -1119,7 +1119,8 @@ class OracleQueryGenerator:
 
     def gen_nested_object_expr(self):
         """Nested Object 查询 (对标 Milvus gen_json_advanced_expr)
-        NOTE: Weaviate 当前版本对 OBJECT 类型仅支持 is_none(True) 过滤,
+        NOTE: Weaviate 当前版本对 OBJECT 类型仅可靠使用 is_none(True)
+        以及 NOT(is_none(True)) 过滤；direct is_none(False) 属于未实现/不支持边界。
         不支持嵌套属性路径过滤 (metaObj.price > X)。
         主要价值: 数据完整性验证 + null 测试。
         """
@@ -1140,8 +1141,16 @@ class OracleQueryGenerator:
         """NOT 表达式 — 使用 Filter.not_() 包装
         WORKAROUND: Weaviate NOT 包含 null 行 (与 SQL 三值逻辑不同)
         """
-        # Exclude OBJECT fields (only is_none(True) works, NOT(is_none(True)) = is_none(False) is broken)
         non_obj = [f for f in self.schema if f["type"] != FieldType.OBJECT]
+        obj_fields = [f for f in self.schema if f["type"] == FieldType.OBJECT]
+        if ENABLE_NULL_FILTER and obj_fields and (not non_obj or random.random() < 0.12):
+            f = random.choice(obj_fields)
+            name = f["name"]
+            series = self.df[name]
+            fc = Filter.not_(Filter.by_property(name).is_none(True))
+            mask = series.apply(lambda x: isinstance(x, dict))
+            return fc, mask, f"NOT({name} is null)"
+
         if not non_obj:
             return None, None, None
         f = random.choice(non_obj)
