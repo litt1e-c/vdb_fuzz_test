@@ -2013,7 +2013,7 @@ class OracleQueryGenerator:
                 str_ops.append("text")
             if hasattr(models, "MatchTextAny") and text_any_sources:
                 str_ops.append("text_any")
-            if hasattr(models, "MatchPhrase"):
+            if hasattr(models, "MatchPhrase") and non_empty_strings:
                 str_ops.append("phrase")
             op = random.choice(str_ops)
             
@@ -2031,12 +2031,12 @@ class OracleQueryGenerator:
                 )
                 expr_str = f'{name} != "{val}"'
             elif op == "phrase":
-                val_str = str(val)
-                if len(val_str) >= 4:
-                    start = random.randint(0, max(0, len(val_str) - 3))
-                    phrase = val_str[start:start + random.randint(2, min(6, len(val_str) - start))]
+                phrase_source = random.choice(non_empty_strings)
+                if len(phrase_source) >= 4:
+                    start = random.randint(0, max(0, len(phrase_source) - 3))
+                    phrase = phrase_source[start:start + random.randint(2, min(6, len(phrase_source) - start))]
                 else:
-                    phrase = val_str
+                    phrase = phrase_source
                 filter_cond = FieldCondition(key=name, match=models.MatchPhrase(phrase=phrase))
                 # 无全文索引时，Qdrant 退化为 substring 匹配
                 mask = self._safe_apply(series, lambda x, p=phrase: isinstance(x, str) and p in x)
@@ -3888,7 +3888,18 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 FieldCondition(key=fname, match=MatchExcept(**{"except": fake_strs})),
                 f'{fname} not in {fake_strs}'
             ))
-            # 策略4: MatchText（当前实现仅声明无 full-text index 的 substring 子集）
+            # 策略4: MatchPhrase（当前实现仅声明无 full-text index 的 substring 子集）
+            if hasattr(models, "MatchPhrase") and val_str:
+                if len(val_str) >= 4:
+                    start = random.randint(0, max(0, len(val_str) - 3))
+                    phrase = val_str[start:start + random.randint(2, min(6, len(val_str) - start))]
+                else:
+                    phrase = val_str
+                strategies.append((
+                    FieldCondition(key=fname, match=models.MatchPhrase(phrase=phrase)),
+                    f'{fname} phrase "{phrase}"'
+                ))
+            # 策略5: MatchText（当前实现仅声明无 full-text index 的 substring 子集）
             if hasattr(models, "MatchText") and val_str:
                 if len(val_str) >= 4:
                     start = random.randint(0, max(0, len(val_str) - 3))
@@ -3899,7 +3910,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     FieldCondition(key=fname, match=models.MatchText(text=query_text)),
                     f'{fname} text "{query_text}"'
                 ))
-            # 策略5: MatchTextAny（当前实现仅声明无 full-text index 的任一 query term 子串命中子集）
+            # 策略6: MatchTextAny（当前实现仅声明无 full-text index 的任一 query term 子串命中子集）
             val_stripped = val_str.strip()
             if hasattr(models, "MatchTextAny") and val_stripped:
                 source_terms = [part for part in val_stripped.split() if part]
