@@ -934,6 +934,7 @@ class OracleQueryGenerator:
             if ts is None:
                 return False
             if op == "==": return ts == target_ts
+            if op == "!=": return ts != target_ts
             if op == ">": return ts > target_ts
             if op == "<": return ts < target_ts
             if op == ">=": return ts >= target_ts
@@ -1348,10 +1349,12 @@ class OracleQueryGenerator:
                 es = f'{name} like "{prefix}*"'
 
         elif ftype == FieldType.DATE:
-            op = random.choice([">", "<", ">=", "<=", "=="])
-            op_map = {"==": "equal", ">": "greater_than", "<": "less_than", ">=": "greater_or_equal", "<=": "less_or_equal"}
+            op = random.choice([">", "<", ">=", "<=", "==", "!="])
+            op_map = {"==": "equal", "!=": "not_equal", ">": "greater_than", "<": "less_than", ">=": "greater_or_equal", "<=": "less_or_equal"}
             fc = getattr(Filter.by_property(name), op_map[op])(val)
             mask = self._date_cmp_mask(series, op, val)
+            if op == "!=":
+                mask = mask | null_mask
             es = f"{name} {op} {val}"
 
         elif ftype in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]:
