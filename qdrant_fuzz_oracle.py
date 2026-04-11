@@ -4985,12 +4985,12 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
     if not failed_cases:
         print(f"✅ 所有 {total_test} 轮测试全部通过！")
         if known_bug_cases:
-            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，未计入新的逻辑失败。")
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知数值极值边界候选案例，未计入新的逻辑失败。")
         print(f"📄 详细记录请查看: {display_path(log_filename)}")
     else:
         print(f"🚫 发现 {len(failed_cases)} 个失败案例！(已保存至日志)")
         if known_bug_cases:
-            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，单独记录，不计入上述失败数。")
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知数值极值边界候选案例，单独记录，不计入上述失败数。")
         print("-" * 60)
         for case in failed_cases:
             print(f"🔴 Case {case['id']}:")
@@ -5190,11 +5190,11 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
     if failed_cases:
         print(f"🚫 发现 {len(failed_cases)} 个等价性错误！请检查日志。")
         if known_bug_cases:
-            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，未计入新的等价性错误。")
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知数值极值边界候选案例，未计入新的等价性错误。")
     else:
         print(f"✅ 所有等价性测试通过。")
         if known_bug_cases:
-            print(f"⚠️  另有 {len(known_bug_cases)} 个已知 int64 边界候选案例，未计入新的等价性错误。")
+            print(f"⚠️  另有 {len(known_bug_cases)} 个已知数值极值边界候选案例，未计入新的等价性错误。")
     print(f"📄 详细日志请查看: {display_path(log_filename)}")
 
 
