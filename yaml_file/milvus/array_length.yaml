@@ -1,0 +1,30 @@
+operator_id: array_length
+family: array
+syntax_examples:
+  - 'array_length(history_temperatures) == 0'
+  - 'array_length(history_temperatures) <= 2'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://milvus.io/docs/array-operators.md"
+  - "https://milvus.io/docs/array_data_type.md"
+  - "https://milvus.io/docs/nullable-and-default.md"
+doc_supported_types:
+  - array_field
+doc_semantics: "ARRAY_LENGTH returns the number of elements in an array field and can be combined with comparison operators."
+doc_notes:
+  - "The checked Array Operators page explicitly documents ARRAY_LENGTH."
+  - "The checked Array Field page says array elements share one scalar element type and ARRAY does not support JSON as an element type."
+  - "The checked Nullable & Default page says ARRAY fields are null only when the whole field is None or omitted."
+  - "The checked official pages do not clearly specify raw null/UNKNOWN behavior for ARRAY_LENGTH under boolean composition or state-changing operations such as delete plus compaction."
+
+verify_status: mismatch_observed
+observed_summary: "Basic local validation matched ARRAY_LENGTH comparisons on sampled non-null arrays, including empty arrays with length 0, and raw `not (array_length(...))` excluded null or omitted arrays in the sampled environment. A separate local compaction probe reproduced a mismatch after delete plus compact: empty arrays later satisfied `is null`, failed `is not null`, and still satisfied `array_length(...) == 0`, causing a guarded ARRAY_LENGTH conjunct to stop matching previously matching rows."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - issue48901
+repro_path: "/home/caihao/compare_test/operator_test/milvus/array_length_operator.py"
+
+oracle_mapping: "Current main pandas oracle maps ARRAY_LENGTH to `len(arr)` on Python lists and emits the guarded subset `(arr is not null and array_length(arr) op k)`, while PQS emits raw positive witness forms for non-null arrays. Empty arrays are modeled as non-null arrays of length 0 and the oracle intentionally does not mimic the compaction-induced `IS NULL` reclassification observed locally; this is our oracle assumption, not an official claim."

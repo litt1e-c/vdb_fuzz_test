@@ -1,0 +1,32 @@
+operator_id: not_in
+family: range
+syntax_examples:
+  - 'not (role in ["admin"])'
+  - 'not (meta["role"] in ["admin"])'
+  - 'meta["role"] not in ["admin"]'
+
+doc_status: unspecified
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+
+doc_supported_types:
+  - unknown
+
+doc_semantics: "Not clearly specified in the checked official pages."
+
+doc_notes:
+  - "The checked official Basic Operators page documents `IN` under range operators but does not list `NOT IN` as a supported operator."
+  - "No dedicated `NOT IN` example or official missing-key/null semantics were found in the checked page."
+
+verify_status: edge_validated
+observed_summary: "Local validation showed that scalar workaround form `(role is not null and (not (role in [\"admin\"])))` returned `[2]`, while both JSON-path workaround form `(meta is not null and (not (meta[\"role\"] in [\"admin\"])))` and direct syntax `meta[\"role\"] not in [\"admin\"]` returned `[2, 3]`, so a missing JSON key inside a non-null JSON object is currently treated as matching the negated membership form."
+
+oracle_support:
+  - pandas
+  - pqs
+
+case_refs: []
+
+repro_path: "/home/caihao/compare_test/operator_test/milvus/not_in_operator.py"
+
+oracle_mapping: "Current fuzzer models `not_in` as `not (x in [...])`: scalar BOOL/INT/VARCHAR paths negate the pandas membership mask and add an explicit `is not null` guard, JSON-path drill-down now uses the same workaround with whole-field null kept as UNKNOWN and missing keys inside a non-null JSON object treated as inner `in == False`, and PQS generates true `not_in` predicates by choosing exclusion lists that do not contain the pivot value. This is our oracle assumption, not an official claim."

@@ -1,0 +1,26 @@
+operator_id: json_contains_all
+family: json
+syntax_examples:
+  - 'json_contains_all(meta["tags"], ["sale", "new"])'
+  - 'json_contains_all(meta["nums"], [1, 2])'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://milvus.io/docs/json-field-overview.md"
+  - "https://milvus.io/docs/v2.4.x/use-json-fields.md"
+doc_supported_types:
+  - json_path_array
+doc_semantics: "json_contains_all checks whether all specified items are present in the JSON array at the target path."
+doc_notes:
+  - "The checked official JSON pages explicitly document json_contains_all for JSON fields."
+  - "The checked official pages do not clearly specify missing-key behavior, NULL behavior, non-array-path behavior, duplicate-item behavior, or truth-table behavior under boolean composition."
+
+verify_status: edge_validated
+observed_summary: "Local validation matched all-members containment on JSON-array paths in the sampled cases. Missing key, explicit null at the target path inside a non-null JSON object, and non-array target paths were filtered out in direct queries; under raw NOT, rows whose whole JSON field was null or omitted stayed excluded, while missing-key, explicit-null-path, and non-array-path rows were included."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/json_contains_all_operator.py"
+
+oracle_mapping: "Current main pandas oracle maps json_contains_all over JSON-array paths to `all(item in path_val for item in target_items)` on normalized JSON list values, returning UNKNOWN for a null or omitted JSON field and FALSE for a missing path, an explicit null at the target path inside a non-null JSON object, or a non-array path; PQS uses the same normalized candidate builder. The current sound subset covers target item lists made of JSON-serializable scalars or list members built from such scalars, while dict-valued array members remain outside the modeled subset; this is our oracle assumption, not an official claim."

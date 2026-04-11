@@ -1,0 +1,32 @@
+operator_id: like
+family: range
+syntax_examples:
+  - 'name LIKE "Prod%"'
+  - 'meta["role"] LIKE "%adm%"'
+  - 'tags[0] LIKE "ad_in"'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/ngram.md"
+  - "https://milvus.io/docs/array_data_type.md"
+doc_supported_types:
+  - scalar_text
+  - json_path_scalar
+doc_semantics: "LIKE performs pattern matching on string values; the checked official pages document prefix, suffix, infix, and wildcard usage with `%` and `_`, and show JSON-path examples."
+doc_notes:
+  - "The checked Basic Operators page documents LIKE on string fields with prefix, suffix, and infix examples."
+  - "The checked NGRAM page states that `%` matches zero or more characters, `_` matches exactly one character, and matching is case-sensitive."
+  - "The checked NGRAM page also shows a JSON-path LIKE example."
+  - "The checked current Array Field page documents array subscript filtering generally, but does not explicitly document LIKE on array string elements in the checked page set."
+  - "The checked pages do not explicitly specify NULL behavior, missing-key behavior, or escape semantics for LIKE."
+
+verify_status: edge_validated
+observed_summary: "In local no-flush validation, scalar VARCHAR, JSON-path string, and ARRAY<VARCHAR> subscript LIKE matched expected prefix, suffix, infix, and underscore behavior in the sampled cases. Missing JSON key, null JSON field, and explicit null JSON value at the target path were filtered out, and guarded JSON NOT/OR compositions matched the sampled oracle expectations."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/like_operator.py"
+
+oracle_mapping: "Current fuzzer models scalar VARCHAR and JSON-path string values with a shared `%` / `_` matcher in both the main pandas oracle and PQS string-pattern generation, and it uses the same matcher for `ARRAY<VARCHAR>` subscript LIKE in the main pandas oracle. Scalar and array-subscript LIKE are guarded by `is not null`, and JSON LIKE treats a null JSON field as UNKNOWN while a missing path or explicit null at the target path inside a non-null JSON object is treated as FALSE; this is our oracle assumption, not an official claim."

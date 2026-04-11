@@ -1,0 +1,28 @@
+operator_id: and
+family: logical
+syntax_examples:
+  - 'id > 0 AND color == "red"'
+  - 'product["model"] == "JSN-087" AND product["price"] < 1850'
+  - 'nullable_score is not null AND nullable_score > 8'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://milvus.io/docs/boolean.md"
+  - "https://milvus.io/docs/basic-operators.md"
+doc_supported_types:
+  - boolean_predicates
+doc_semantics: "AND combines multiple conditions into a single filter and matches rows only when both subconditions are satisfied; the checked official pages include scalar and JSON-path examples using AND."
+doc_notes:
+  - "The checked Filtering Explained page lists AND as a logical operator for combining multiple conditions."
+  - "The checked Filtering Explained page shows a JSON-field example: `product[\"model\"] == \"JSN-087\" AND product[\"price\"] < 1850`."
+  - "The checked pages do not explicitly specify NULL/UNKNOWN truth tables, short-circuit behavior, or whether constant-expression operands such as `null is null` may be combined with other predicates."
+
+verify_status: edge_validated
+observed_summary: "Local validation matched expected results for ordinary scalar AND, guarded null-check AND, guarded JSON-path AND, and a historical 3VL probe `not ((c_null == true) and (c_false == true))` in the sampled current environment. However, `(null is null) and (meta[\"value\"] > 50)` was rejected by the parser, so constant-expression operands are outside the current sound AND subset."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/and_operator.py"
+
+oracle_mapping: "Current fuzzer models AND with pandas nullable-boolean conjunction (`mask_l & mask_r`), which preserves SQL-style UNKNOWN propagation for the generated subexpressions, and PQS conjunction by composing two pivot-true subexpressions. The current sound subset is AND over generated atomic predicates and guarded JSON predicates; constant-expression leaves such as `null is null` are intentionally excluded from composed AND expressions because local validation showed `(null is null) and json_pred` is parser-rejected in Milvus, and this is our oracle assumption, not an official claim."

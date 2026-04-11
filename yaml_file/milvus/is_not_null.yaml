@@ -1,0 +1,32 @@
+operator_id: is_not_null
+family: null_check
+syntax_examples:
+  - 'description IS NOT NULL'
+  - 'metadata IS NOT NULL'
+  - 'tags IS NOT NULL'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/nullable-and-default.md"
+doc_supported_types:
+  - scalar_field
+  - json_field
+  - array_field
+doc_semantics: "IS NOT NULL filters rows whose field value is not NULL. The checked official pages state that empty strings are not NULL, and that for JSON and ARRAY fields the operator works at the column level: only a present, non-null whole field matches."
+doc_notes:
+  - "The checked Basic Operators page explicitly documents IS NOT NULL."
+  - "The checked Nullable & Default page states that an empty string is not NULL."
+  - "The checked official pages state that JSON and ARRAY field null checks are column-level, so individual null JSON keys do not make the field null."
+  - "The checked official pages do not clearly specify JSON-path or ARRAY-subscript IS NOT NULL semantics."
+
+verify_status: mismatch_observed
+observed_summary: "On the local master-20260330-31a01c81-amd64 instance at 127.0.0.1:19532, the dedicated validation script matched field-level scalar, JSON, and ARRAY IS NOT NULL behavior on sampled cases: empty string, empty JSON object `{}`, JSON object with a null key, non-empty array, and empty array `[]` matched, while explicit null and omitted nullable fields did not. However, the historical issue48901 repro also matched on the same instance: after delete+compact, rows with empty arrays `[]` no longer matched `arr_int32_0 is not null` and instead matched `arr_int32_0 is null`, while `array_length(arr_int32_0) == 0` remained true."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - issue48901
+repro_path: "/home/caihao/compare_test/history_find_bug/milvus/poc_milvus_issue48901_empty_array_is_null_after_compaction.py"
+
+oracle_mapping: "Current main pandas oracle models field-level IS NOT NULL with `milvus_notnull_mask`, treating only `None` and `NaN` as null and therefore treating empty JSON objects `{}` and empty arrays `[]` as non-null. General JSON-path semantics are not claimed as fully modeled, ARRAY-subscript `is not null` is treated as unsupported, and PQS mainly emits field-level `is not null` plus guarded JSON comparisons rather than a complete path-level IS NOT NULL model; this is our oracle assumption, not an official claim."

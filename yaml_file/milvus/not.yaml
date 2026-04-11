@@ -1,0 +1,28 @@
+operator_id: not
+family: logical
+syntax_examples:
+  - 'NOT color == "green"'
+  - 'not (id == 1)'
+  - 'not ((meta is not null and (meta["value"] > 50)))'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://blog.milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/boolean.md"
+doc_supported_types:
+  - boolean_predicates
+doc_semantics: "NOT negates a condition in a filter expression; the checked official pages document it as a logical operator for excluding a condition."
+doc_notes:
+  - "The checked Basic Operators page lists NOT as a supported logical operator and gives `NOT color == \"green\"` as an example."
+  - "The checked current Filtering Explained page describes logical operators generally, but does not explicitly specify NULL/UNKNOWN truth tables or JSON-specific NOT behavior."
+  - "The checked official pages do not clearly specify whether `not (json_path_predicate)` and `not (json_field is not null and json_path_predicate)` should behave identically on null JSON fields."
+
+verify_status: edge_validated
+observed_summary: "Local validation matched expected results for scalar negation, NOT over range/or compositions, NOT is null, NOT is not null, double NOT on `is null`, and a historical `not (NULL and FALSE)` 3VL probe in the sampled current environment. Local testing also showed that raw JSON NOT differs from the guarded JSON-NOT subset on null JSON fields: `not (meta[\"value\"] > 50)` excluded the null-JSON row, while `not ((meta is not null and (meta[\"value\"] > 50)))` returned it."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/not_operator.py"
+
+oracle_mapping: "Current fuzzer models NOT with pandas nullable-boolean negation for generated scalar predicates and with double-NOT composition in PQS, and its current JSON support is the guarded subset `not (json_field is not null and json_pred)` rather than full raw `not (json_pred)` semantics. Raw JSON NOT on null or missing-path cases is therefore not claimed as fully modeled by the current fuzzer, and this is our oracle assumption, not an official claim."

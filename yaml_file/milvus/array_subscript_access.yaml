@@ -1,0 +1,27 @@
+operator_id: array_subscript_access
+family: array_filtering
+syntax_examples:
+  - 'arr_int[0] > 3'
+  - 'arr_str[1] == "ops"'
+  - 'arr_bool[0] == true'
+
+doc_status: family_documented
+doc_source_urls:
+  - https://milvus.io/docs/id/basic-operators.md
+  - https://milvus.io/docs/v2.5.x/nullable-and-default.md
+doc_supported_types:
+  - ARRAY
+doc_semantics: "The checked official Basic Operators page shows bracket-based access on array fields in filter expressions, for example `history_temperatures[0] > 30`, indicating that basic comparison operators can be applied to indexed array elements."
+doc_notes:
+  - "The checked official pages document bracket access only at the family/example level, not as a standalone operator specification."
+  - "The checked official nullable documentation states that `IS NULL` and `IS NOT NULL` on ARRAY fields work at the column level, not on individual indexed elements."
+
+verify_status: edge_validated
+observed_summary: "On the local 19532 deployment, `arr[idx]` comparisons on INT, VARCHAR, and BOOL array elements worked as expected, and out-of-range indexed comparisons returned no matches rather than raising an error. In contrast, `arr[idx] is null` and `arr[idx] is not null` were unsupported at execution time and failed with `unsupported data type: ARRAY` from QueryNode."
+oracle_support:
+  - pandas
+  - PQS
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/milvus/array_subscript_access_operator.py
+
+oracle_mapping: "pandas-mode and PQS model `arr[idx]` only for comparison-style access on numeric, string, and bool elements, treating null arrays, empty arrays, out-of-range indexes, and missing element values as non-matches under the guarded comparison subset. Subscript-level `is null` and `is not null` are intentionally not modeled because they are locally unsupported. This is our oracle assumption, not an official claim."

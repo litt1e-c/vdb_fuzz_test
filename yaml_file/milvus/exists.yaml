@@ -1,0 +1,30 @@
+operator_id: exists
+family: json_filtering
+syntax_examples:
+  - 'exists json_field["A"]'
+  - 'exists(meta["nested"]["x"])'
+  - 'not (exists(meta["price"]))'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://milvus.io/docs/v2.4.x/use-json-fields.md
+  - https://milvus.io/docs/json-field-overview.md
+  - https://milvus.io/docs/json-operators.md
+  - https://blog.milvus.io/docs/basic-operators.md
+doc_supported_types:
+  - JSON
+doc_semantics: 'The checked official v2.4.x JSON filter reference states that `exists json_field["A"]` evaluates to true if the JSON field has a key named `A`.'
+doc_notes:
+  - The checked current v2.6.x `json-field-overview` page documents bracket-path access, including nested keys, but does not restate `exists`.
+  - The checked current v2.6.x `json-operators` page omits `exists`, so the checked current official pages do not clearly specify `exists` behavior for explicit null values, empty containers, or all-null containers.
+
+verify_status: edge_validated
+observed_summary: 'On the local 19532 deployment, both `exists(meta["k"])` and `exists meta["k"]` executed. `exists` returned true for non-null scalars and for containers with at least one non-null scalar descendant, but false for missing keys, explicit null values, empty dict/list, and containers whose descendants were all null; falsey scalars such as `0`, `false`, and `""` still counted as existing.'
+oracle_support:
+  - pandas
+  - PQS
+case_refs:
+  - issue46972
+repro_path: /home/caihao/compare_test/operator_test/milvus/exists_operator.py
+
+oracle_mapping: 'pandas-mode and PQS map `exists(json_path)` on explicit JSON-field paths to recursive path resolution plus a local content predicate: missing keys, explicit null, empty containers, and containers whose descendants are all null map to `False`, while falsey scalars such as `0`, `false`, and `""` map to `True`; dynamic-field-specific forms and broader non-JSON uses are not modeled by the current fuzzer. This is our oracle assumption, not an official claim.'

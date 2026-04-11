@@ -1,0 +1,29 @@
+operator_id: array_contains
+family: array
+syntax_examples:
+  - 'array_contains(history_temperatures, 23)'
+  - 'array_contains(tags, "pop")'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://milvus.io/docs/array-operators.md"
+  - "https://milvus.io/docs/array_data_type.md"
+  - "https://milvus.io/docs/nullable-and-default.md"
+doc_supported_types:
+  - array_field
+doc_semantics: "ARRAY_CONTAINS checks whether an array field contains a specified element."
+doc_notes:
+  - "The checked Array Operators page explicitly documents ARRAY_CONTAINS."
+  - "The checked Array Field page says array elements share one scalar element type and ARRAY does not support JSON as an element type."
+  - "The checked Nullable & Default page says ARRAY fields are null only when the whole field is None or omitted."
+  - "The checked official pages do not clearly specify raw null/UNKNOWN behavior for ARRAY_CONTAINS under boolean composition."
+
+verify_status: edge_validated
+observed_summary: "Local validation matched integer, boolean, and string ARRAY_CONTAINS cases in the sampled direct queries. Empty arrays behaved as non-null arrays with a false containment result, while null or omitted arrays were excluded in direct queries and also stayed excluded under raw `not (array_contains(...))`, which matches UNKNOWN rather than FALSE for null arrays in the sampled environment."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/array_contains_operator.py"
+
+oracle_mapping: "Current main pandas oracle models ARRAY_CONTAINS over Python lists and emits the guarded subset `(arr is not null and array_contains(arr, value))`, while PQS emits raw positive witness forms for non-null arrays. Empty arrays are treated as non-null arrays with a false containment result; raw null-array behavior under arbitrary boolean composition is not fully modeled in the main oracle, and this is our oracle assumption, not an official claim."
