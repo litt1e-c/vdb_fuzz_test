@@ -26,4 +26,4 @@ oracle_support:
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/text_any_operator.py
 
-oracle_mapping: "`text_any` is mapped to pandas/PQS by splitting the query on whitespace and matching present scalar string values when any query term occurs as a substring, with missing/null and tested non-string rows treated as non-matches. Current fuzzer coverage is limited to the no-full-text-index subset on STRING fields, because the fuzzer still creates KEYWORD indexes rather than full-text indexes for those fields; this is our oracle assumption, not an official claim."
+oracle_mapping: "`text_any` is mapped to pandas/PQS by splitting the query on whitespace and matching present scalar string values when any query term occurs as a substring, with missing/null and tested non-string rows treated as non-matches; current fuzzer coverage is limited to the no-full-text-index subset on STRING fields because the fuzzer still creates KEYWORD indexes rather than full-text indexes. This is our oracle assumption, not an official claim."
