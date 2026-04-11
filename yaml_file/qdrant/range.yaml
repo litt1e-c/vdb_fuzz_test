@@ -1,0 +1,33 @@
+operator_id: range
+family: range_condition
+syntax_examples:
+  - '{"key":"price","range":{"gte":100.0,"lte":450.0}}'
+  - '{"key":"count","range":{"gt":10}}'
+  - '{"key":"sizes","range":{"gte":35,"lte":38}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/filtering/
+  - https://qdrant.tech/documentation/concepts/payload/
+doc_supported_types:
+  - integer
+  - float
+doc_semantics: "`range` constrains numeric payload values with `gt`, `gte`, `lt`, and `lte`; multiple bounds are conjunctive, integer and float payloads are documented, and array payloads satisfy the condition if at least one element meets the range."
+doc_notes:
+  - "The checked payload docs state that a filter is not satisfied when the stored value type does not fit the filtering condition."
+  - "The checked docs document datetime range separately from numeric `Range`."
+  - "The checked docs do not specify precision or transport behavior at extreme numeric boundaries."
+
+verify_status: mismatch_observed
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, the safe non-extreme subset passed on REST and gRPC for integer/float scalar ranges, conjunctive bounds, array any-element matching, missing/null exclusion, and tested string type mismatch; local historical range repros document mismatches near int64 extreme values and ±float32 maximum finite values."
+oracle_support:
+  - non-extreme integer and float scalar Range predicates
+  - non-extreme array-of-integer and array-of-float any-element Range predicates
+  - integer timestamp surrogate ranges for current DATETIME fields
+  - default exclusion of known unstable int64 extremes and ±float32 maximum finite boundaries
+case_refs:
+  - poc_qdrant_issue8538_int64_float_precision_loss
+  - poc_qdrant_issue8617_float32_min_boundary_filtering
+repro_path: /home/caihao/compare_test/operator_test/qdrant/range_operator.py
+
+oracle_mapping: "`range` is mapped to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds, scalar rows matching direct comparison and array rows matching when any numeric element satisfies the range; missing/null and tested type-mismatched rows are treated as non-matches. Current fuzzer coverage excludes known unstable int64 extreme values and ±float32 maximum finite boundary values by default unless explicitly re-enabled, and current DATETIME support is an integer timestamp surrogate rather than official datetime range; this is our oracle assumption, not an official claim."
