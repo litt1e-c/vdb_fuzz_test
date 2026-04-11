@@ -1,0 +1,28 @@
+operator_id: nested_key
+family: payload_key_path
+syntax_examples:
+  - '{"key":"country.name","match":{"value":"Germany"}}'
+  - '{"key":"country.cities[].population","range":{"gte":9.0}}'
+  - '{"key":"country.cities[].sightseeing","match":{"value":"Osaka Castle"}}'
+
+doc_status: family_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/filtering/
+doc_supported_types:
+  - unknown
+doc_semantics: "Dot notation addresses nested object fields, and `[]` projects over nested arrays so a condition matches if any projected value matches the child predicate; same-element semantics for arrays of objects require `nested`, not plain key paths."
+doc_notes:
+  - "The checked docs show `country.name`, `country.cities[].population`, and `country.cities[].sightseeing` as representative payload-key examples."
+  - "The checked docs distinguish plain key-path matching over arrays of objects from `nested` same-element filtering."
+  - "The checked docs do not clearly specify numeric index syntax such as `[0]`."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched dot-key access, `[]` projection over arrays of objects, and projected leaf-array matching; missing/null/empty parent paths did not satisfy ordinary nested-key predicates, and plain projected-path conjunctions could match across different elements while same-element semantics required `nested`."
+oracle_support:
+  - documented dot-key access over validated JSON object paths
+  - documented `[]` projection over validated JSON array-of-object paths
+  - plain projected-path and `nested` same-element distinction in the validated subset
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/nested_key_operator.py
+
+oracle_mapping: "`nested_key` is mapped to pandas/PQS by traversing validated JSON paths with dot notation and by projecting `[]` over array-of-object values so that any projected leaf satisfying the child predicate is a match; missing/null/empty parent paths are treated as non-matches for ordinary predicates. Current fuzzer coverage is the validated subset over `meta_json.country.name`, `meta_json.country.cities[].name`, `meta_json.country.cities[].population`, `meta_json.country.cities[].sightseeing`, and `meta_json.config.version`, and it does not upgrade broader generic JSON-path fallbacks into this operator claim. This is our oracle assumption, not an official claim."

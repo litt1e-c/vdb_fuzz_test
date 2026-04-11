@@ -1,0 +1,29 @@
+operator_id: text_any
+family: match_condition
+syntax_examples:
+  - '{"key":"description","match":{"text_any":"good cheap"}}'
+  - '{"key":"title","match":{"text_any":"cheap hardware"}}'
+  - '{"key":"title","match":{"text_any":"needle token"}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/filtering/
+  - https://qdrant.tech/documentation/concepts/indexing/
+doc_supported_types:
+  - string
+doc_semantics: "`text_any` is documented as a full-text match condition similar to `text`, but it matches text fields containing any query term instead of requiring all query terms."
+doc_notes:
+  - "Available as of v1.16.0."
+  - "The checked docs make full-text matching index-sensitive through text index configuration."
+  - "The current fuzzer does not create full-text indexes for STRING fields, so indexed token-level semantics are outside current implementation scope."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched `MatchTextAny` on present scalar string values when any whitespace-separated query term appeared as a substring without a full-text index, including a subtoken match such as `good` matching `goodness`; missing/null and the tested non-string row did not satisfy ordinary `text_any` predicates."
+oracle_support:
+  - scalar STRING MatchTextAny without full-text index
+  - MatchTextAny generation in the main oracle workflow
+  - MatchTextAny generation in the PQS workflow
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/text_any_operator.py
+
+oracle_mapping: "`text_any` is mapped to pandas/PQS by splitting the query on whitespace and matching present scalar string values when any query term occurs as a substring, with missing/null and tested non-string rows treated as non-matches. Current fuzzer coverage is limited to the no-full-text-index subset on STRING fields, because the fuzzer still creates KEYWORD indexes rather than full-text indexes for those fields; this is our oracle assumption, not an official claim."

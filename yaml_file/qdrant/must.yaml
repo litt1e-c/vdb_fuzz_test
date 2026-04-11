@@ -1,0 +1,27 @@
+operator_id: must
+family: filtering_clause
+syntax_examples:
+  - '{"must":[{"key":"city","match":{"value":"London"}},{"key":"color","match":{"value":"red"}}]}'
+  - '{"must":[{"key":"city","match":{"value":"London"}}],"must_not":[{"key":"color","match":{"value":"red"}}]}'
+  - '{"must":[{"nested":{"key":"diet","filter":{"must":[{"key":"food","match":{"value":"meat"}},{"key":"likes","match":{"value":true}}]}}}]}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/search/filtering/
+doc_supported_types:
+  - unknown
+doc_semantics: "`must` is true only if every listed condition is satisfied, so it is equivalent to `AND`; filtering clauses can be recursively nested, and multiple top-level clauses are combined by `AND`."
+doc_notes:
+  - "The checked docs also show that plain path conditions over arrays of objects can satisfy different `must` children on different elements; same-element semantics require `nested`."
+  - "The checked docs do not clearly specify the behavior of an empty `must` list."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched conjunction semantics for ordinary and recursively nested `must`, excluded missing/null rows for ordinary predicates inside `must`, and preserved the documented distinction between plain array-path conjunction and `nested` same-element matching."
+oracle_support:
+  - non-empty conjunction of generated child conditions
+  - recursive conjunction over nested Filter children
+  - array-of-object same-element logic delegated to nested
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/must_operator.py
+
+oracle_mapping: "`must` is mapped to pandas/PQS conjunction by applying `&` to child masks after filling child non-matches, including missing/null for ordinary predicates, with `False`; current fuzzer coverage is the non-empty conjunction subset over generated child `FieldCondition` and recursively nested `Filter` objects, while same-element array-of-object semantics are modeled only through `nested`, not plain `must`. This is our oracle assumption, not an official claim."

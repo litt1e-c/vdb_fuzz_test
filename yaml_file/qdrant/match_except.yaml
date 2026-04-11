@@ -1,0 +1,30 @@
+operator_id: match_except
+family: match_condition
+syntax_examples:
+  - '{"key":"city","match":{"except":["London","Moscow"]}}'
+  - '{"key":"count","match":{"except":[10,30]}}'
+  - '{"key":"tags","match":{"except":["red","blue"]}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/search/filtering/
+  - https://qdrant.tech/documentation/concepts/payload/
+doc_supported_types:
+  - keyword
+  - integer
+doc_semantics: "`match.except` is true when the stored value is not among the listed values; the checked docs document it for keyword and integer payloads, and array payloads satisfy the condition if at least one stored element is not excluded."
+doc_notes:
+  - "The checked docs do not clearly specify missing/null participation for ordinary `match.except` predicates."
+  - "The checked docs do not clearly specify type-mismatch behavior for `match.except`."
+  - "The checked docs do not clearly specify the behavior of an empty `except` list."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched scalar and array `match.except` semantics for keyword/integer values, excluded missing/null rows from ordinary `match.except`, and on the tested paths treated type-mismatched excluded values and `except=[]` as keeping all present rows."
+oracle_support:
+  - non-empty MatchExcept over scalar keyword and integer fields
+  - non-empty MatchExcept over array-of-keyword and array-of-integer fields
+  - scalar and array MatchExcept in the main oracle workflow
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/match_except_operator.py
+
+oracle_mapping: "`match_except` is mapped to pandas/PQS as complement-style membership over a non-empty excluded set: scalar rows match when the normalized present value is not excluded, and array rows match when at least one normalized element is not excluded; missing/null rows are treated as non-matches. The locally observed type-mismatch and empty-list behaviors are modeled as keeping present rows, but this is our oracle assumption, not an official claim."

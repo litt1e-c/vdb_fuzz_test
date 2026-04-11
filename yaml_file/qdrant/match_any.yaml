@@ -1,0 +1,29 @@
+operator_id: match_any
+family: match_condition
+syntax_examples:
+  - '{"key":"city","match":{"any":["London","Moscow"]}}'
+  - '{"key":"count","match":{"any":[10,30]}}'
+  - '{"key":"tags","match":{"any":["blue","green"]}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/search/filtering/
+  - https://qdrant.tech/documentation/concepts/payload/
+doc_supported_types:
+  - keyword
+  - integer
+doc_semantics: "`match.any` is true when the stored value matches at least one value from the query list; the checked docs document it for keyword and integer payloads, and array payloads satisfy the condition if at least one stored element matches."
+doc_notes:
+  - "The checked payload docs state that a filter is not satisfied when the stored value type does not fit the filtering condition."
+  - "The checked docs do not clearly specify the behavior of an empty `any` list."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched documented disjunction semantics for scalar keyword/integer fields and for arrays of those types, excluded missing/null and tested type-mismatched rows from ordinary `match.any`, and on the tested scroll path returned an empty result for `MatchAny(any=[])`."
+oracle_support:
+  - non-empty MatchAny over scalar keyword and integer fields
+  - non-empty MatchAny over array-of-keyword and array-of-integer fields
+  - MatchAny-to-OR equivalence mutation
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/match_any_operator.py
+
+oracle_mapping: "`match_any` is mapped to pandas/PQS as non-empty set-membership over the candidate list, with scalar rows matching when the stored value is in the query set and array rows matching when any stored element is in the query set; missing/null and tested type-mismatched rows are treated as non-matches. Current fuzzer coverage is limited to non-empty scalar `INT/STRING` and array `ARRAY_INT/ARRAY_STR` subsets, and it does not rely on undocumented empty-list behavior; this is our oracle assumption, not an official claim."

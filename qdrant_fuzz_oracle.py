@@ -2008,8 +2008,11 @@ class OracleQueryGenerator:
         elif ftype == FieldType.STRING:
             str_ops = ["==", "!=", "in", "not_in"]
             non_empty_strings = [str(x) for x in self.df[name].dropna().tolist() if isinstance(x, str) and x]
+            text_any_sources = [x for x in non_empty_strings if any(part for part in x.split())]
             if hasattr(models, "MatchText") and non_empty_strings:
                 str_ops.append("text")
+            if hasattr(models, "MatchTextAny") and text_any_sources:
+                str_ops.append("text_any")
             if hasattr(models, "MatchPhrase"):
                 str_ops.append("phrase")
             op = random.choice(str_ops)
@@ -2050,6 +2053,21 @@ class OracleQueryGenerator:
                 # 因而 text 条件按官方文档的“无 full-text index -> exact substring match”子集建模。
                 mask = self._safe_apply(series, lambda x, q=query_text: isinstance(x, str) and q in x)
                 expr_str = f'{name} text "{query_text}"'
+            elif op == "text_any":
+                source_terms = [part for part in random.choice(text_any_sources).split() if part]
+                term_source = random.choice(source_terms)
+                if len(term_source) >= 4:
+                    start = random.randint(0, max(0, len(term_source) - 3))
+                    real_term = term_source[start:start + random.randint(2, min(8, len(term_source) - start))]
+                else:
+                    real_term = term_source
+                terms = [real_term, random.choice(["unlikelyterm", "absenttoken", "zzznomatch"])]
+                random.shuffle(terms)
+                query_text = " ".join(terms)
+                filter_cond = FieldCondition(key=name, match=models.MatchTextAny(text_any=query_text))
+                # 当前无 full-text index 子集下，本地 v1.17.0 表现为任一 query term 子串命中。
+                mask = self._safe_apply(series, lambda x, ts=terms: isinstance(x, str) and any(t in x for t in ts))
+                expr_str = f'{name} text_any "{query_text}"'
             elif op == "in":
                 # 生成多个值的列表
                 valid_vals = [str(x) for x in self.df[name].dropna().unique()[:5].tolist()]
@@ -3880,6 +3898,23 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 strategies.append((
                     FieldCondition(key=fname, match=models.MatchText(text=query_text)),
                     f'{fname} text "{query_text}"'
+                ))
+            # 策略5: MatchTextAny（当前实现仅声明无 full-text index 的任一 query term 子串命中子集）
+            val_stripped = val_str.strip()
+            if hasattr(models, "MatchTextAny") and val_stripped:
+                source_terms = [part for part in val_stripped.split() if part]
+                term_source = random.choice(source_terms)
+                if len(term_source) >= 4:
+                    start = random.randint(0, max(0, len(term_source) - 3))
+                    real_term = term_source[start:start + random.randint(2, min(8, len(term_source) - start))]
+                else:
+                    real_term = term_source
+                terms = [real_term, random.choice(["unlikelyterm", "absenttoken", "zzznomatch"])]
+                random.shuffle(terms)
+                query_text = " ".join(terms)
+                strategies.append((
+                    FieldCondition(key=fname, match=models.MatchTextAny(text_any=query_text)),
+                    f'{fname} text_any "{query_text}"'
                 ))
             return random.choice(strategies)
 

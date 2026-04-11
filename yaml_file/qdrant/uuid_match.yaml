@@ -1,0 +1,29 @@
+operator_id: uuid_match
+family: match_condition
+syntax_examples:
+  - '{"key":"uuid","match":{"value":"f47ac10b-58cc-4372-a567-0e02b2c3d479"}}'
+  - '{"must":[{"key":"uuid","match":{"value":"f47ac10b-58cc-4372-a567-0e02b2c3d479"}}]}'
+  - '{"key":"uuids","match":{"value":"550e8400-e29b-41d4-a716-446655440000"}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/search/filtering/
+  - https://qdrant.tech/documentation/concepts/payload/
+doc_supported_types:
+  - uuid
+  - keyword
+doc_semantics: "UUID Match works similarly to the regular string `match` condition; functionally it works the same with `keyword` and `uuid` indexes, and if several values are stored at least one of them should match."
+doc_notes:
+  - "Available as of v1.11.0."
+  - "The checked docs say the `uuid` index is more memory efficient than `keyword` for UUID payloads."
+  - "The checked docs do not clearly specify how invalid UUID literals in the query are handled."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched scalar UUID equality, UUID-array any-element matching, excluded missing/null rows from ordinary UUID match predicates, returned no rows for the tested integer type-mismatch query, and accepted `PayloadSchemaType.UUID` index creation."
+oracle_support:
+  - scalar UUID exact equality on generated UUID fields
+  - UUID match support in the main oracle and PQS workflows
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/uuid_match_operator.py
+
+oracle_mapping: "`uuid_match` is mapped to pandas/PQS as exact equality on canonical UUID strings using `str(uuid.UUID(...))`, with missing/null treated as non-matches. Current fuzzer coverage is limited to scalar UUID payload fields and does not yet generate UUID arrays, so array any-element behavior is locally validated but outside current implementation scope; this is our oracle assumption, not an official claim."

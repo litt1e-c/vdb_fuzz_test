@@ -1,0 +1,27 @@
+operator_id: should
+family: filtering_clause
+syntax_examples:
+  - '{"should":[{"key":"city","match":{"value":"London"}},{"key":"color","match":{"value":"red"}}]}'
+  - '{"should":[{"key":"country.name","match":{"value":"Germany"}}]}'
+  - '{"should":[{"key":"country.cities[].population","range":{"gte":9.0}}]}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/search/filtering/
+doc_supported_types:
+  - unknown
+doc_semantics: "`should` is true if at least one listed condition is satisfied, so it is equivalent to `OR`; filtering clauses can be recursively nested, and when several top-level clauses are present they are combined by `AND`."
+doc_notes:
+  - "The checked docs do not clearly specify missing/null participation for ordinary predicates inside `should`."
+  - "The checked docs do not clearly specify the behavior of an empty `should` list."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched disjunction semantics for ordinary and recursively nested `should`, excluded missing/null rows when all disjuncts were ordinary predicates, returned all rows for `A OR NOT A`, and on the tested scroll path treated `should=[]` as matching all rows."
+oracle_support:
+  - non-empty disjunction of generated child conditions
+  - recursive disjunction over nested Filter children
+  - no reliance on empty should behavior
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/should_operator.py
+
+oracle_mapping: "`should` is mapped to pandas/PQS disjunction by applying `|` to child masks after filling child non-matches, including missing/null for ordinary predicates, with `False`; current fuzzer coverage is the non-empty disjunction subset over generated child `FieldCondition` and recursively nested `Filter` objects, and it does not rely on undocumented empty-`should` behavior. This is our oracle assumption, not an official claim."

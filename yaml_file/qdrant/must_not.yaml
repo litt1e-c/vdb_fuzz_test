@@ -1,0 +1,29 @@
+operator_id: must_not
+family: filtering_clause
+syntax_examples:
+  - '{"must_not":[{"key":"city","match":{"value":"London"}},{"key":"color","match":{"value":"red"}}]}'
+  - '{"must":[{"key":"city","match":{"value":"London"}}],"must_not":[{"key":"color","match":{"value":"red"}}]}'
+  - '{"must_not":[{"must":[{"key":"city","match":{"value":"London"}},{"key":"color","match":{"value":"red"}}]}]}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/search/filtering/
+doc_supported_types:
+  - unknown
+doc_semantics: "`must_not` is true if none of its listed conditions is satisfied, so it is equivalent to `(NOT A) AND (NOT B) AND (NOT C)`; filtering clauses can be recursively nested, and when several top-level clauses are present they are combined by `AND`."
+doc_notes:
+  - "The checked docs explicitly show recursive nesting of a `must` filter inside `must_not`."
+  - "The checked docs note that `must_not` is often useful with `is_empty` to select non-empty values."
+  - "The checked docs do not clearly specify missing/null participation for ordinary predicates inside `must_not`."
+  - "The checked docs do not clearly specify the behavior of an empty `must_not` list."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, both REST and gRPC matched complement semantics for ordinary and recursively nested `must_not`, kept missing/null rows when ordinary inner predicates did not match, preserved double negation, and for nested data both outer `must_not` and inner nested `must_not` behaved consistently with complement-style semantics."
+oracle_support:
+  - non-empty negation of generated child conditions
+  - recursive negation over nested Filter children
+  - nested outer and inner must_not subset
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/must_not_operator.py
+
+oracle_mapping: "`must_not` is mapped to pandas/PQS by taking the complement of the child match set with `~mask.fillna(False)`, so missing/null rows are preserved when ordinary inner predicates do not match; current fuzzer coverage is the non-empty `must_not` subset over generated child `FieldCondition` and recursively nested `Filter` objects, including validated outer and inner nested cases. This is our oracle assumption, not an official claim."
