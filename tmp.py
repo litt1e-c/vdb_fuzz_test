@@ -39,11 +39,11 @@ def main():
             collection_name=COLLECTION,
             wait=True,
             points=[
-                # 标量 dict：按官方文档应视为“非数组”，count == 1
+                # Scalar dict: should be treated as a single element per docs, count == 1
                 PointStruct(id=1, vector=[0.1, 0.2], payload={"vc": {"a": 1, "b": 2}}),
-                # 真数组：count == 2
+                # Actual array: count == 2
                 PointStruct(id=2, vector=[0.2, 0.3], payload={"vc": ["x", "y"]}),
-                # 普通标量：count == 1
+                # Normal scalar: count == 1
                 PointStruct(id=3, vector=[0.3, 0.4], payload={"vc": 7}),
             ],
         )
@@ -83,13 +83,13 @@ def main():
     print("gt=1  should match only id=2")
     print("lte=1 should match ids=1,3")
 
-    # 可选断言：remote 应通过，local 当前大概率失败
+    # Assertions: remote will pass, local will currently fail
     assert remote_gt == [2], f"Unexpected remote gt=1 result: {remote_gt}"
     assert remote_lte == [1, 3], f"Unexpected remote lte=1 result: {remote_lte}"
 
-    # 这两句如果当前 bug 存在，会触发 AssertionError
-    assert local_gt == [2], f"BUG: local gt=1 result is {local_gt}"
-    assert local_lte == [1, 3], f"BUG: local lte=1 result is {local_lte}"
+    # This will trigger an AssertionError under Local mode due to the bug
+    assert local_gt ==[2], f"local gt=1 result is {local_gt}"
+    assert local_lte ==[1, 3], f"local lte=1 result is {local_lte}"
 
 
 if __name__ == "__main__":

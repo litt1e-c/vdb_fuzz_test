@@ -1832,9 +1832,16 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).not_equal(not bool(val)), f"{fname} != {not bool(val)}"
             elif ftype == FieldType.INT:
                 vi = int(val)
-                strat = random.choice(["eq", "range_tight", "range_pm1", "not_lt", "neq_fake"])
+                strat = random.choice(["eq", "ge_self", "lt_above", "range_tight", "range_pm1", "not_lt", "neq_fake"])
                 if strat == "eq":
                     return Filter.by_property(fname).equal(vi), f"{fname} == {vi}"
+                elif strat == "ge_self":
+                    return Filter.by_property(fname).greater_or_equal(vi), f"{fname} >= {vi}"
+                elif strat == "lt_above":
+                    if vi < WEAVIATE_SAFE_INT_MAX:
+                        upper = clamp_weaviate_int(vi + 1)
+                        return Filter.by_property(fname).less_than(upper), f"{fname} < {upper}"
+                    return Filter.by_property(fname).less_or_equal(vi), f"{fname} <= {vi}"
                 elif strat == "range_tight":
                     return Filter.by_property(fname).greater_or_equal(vi) & Filter.by_property(fname).less_or_equal(vi), f"{fname} [{vi},{vi}]"
                 elif strat == "range_pm1":
@@ -1846,11 +1853,15 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).not_equal(fake) & Filter.by_property(fname).equal(vi), f"{fname} != {fake} AND {fname} == {vi}"
             elif ftype == FieldType.NUMBER:
                 vf = float(val)
-                strat = random.choice(["range", "not_gt"])
+                strat = random.choice(["ge_self", "lt_above", "range", "not_gt"])
                 lo, hi = float_window(vf)
                 if lo is None:
                     continue
-                if strat == "range":
+                if strat == "ge_self":
+                    return Filter.by_property(fname).greater_or_equal(vf), f"{fname}>={vf}"
+                elif strat == "lt_above":
+                    return Filter.by_property(fname).less_than(hi), f"{fname}<{hi}"
+                elif strat == "range":
                     return Filter.by_property(fname).greater_or_equal(lo) & Filter.by_property(fname).less_or_equal(hi), f"{fname} ≈ {vf}"
                 else:
                     return Filter.not_(Filter.by_property(fname).greater_than(hi)) & Filter.by_property(fname).greater_or_equal(lo), f"NOT({fname}>{hi}) AND {fname}>={lo}"
@@ -1879,6 +1890,14 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 else:
                     return Filter.by_property(fname).equal(sv), f'{fname} == "{sv}"'
             elif ftype == FieldType.DATE:
+                strat = random.choice(["eq", "ge_self", "lt_above"])
+                if strat == "ge_self":
+                    return Filter.by_property(fname).greater_or_equal(str(val)), f'{fname} >= "{val}"'
+                if strat == "lt_above":
+                    ts = to_utc_timestamp(val)
+                    if ts is not None:
+                        upper = (ts + pd.Timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+                        return Filter.by_property(fname).less_than(upper), f'{fname} < "{upper}"'
                 return Filter.by_property(fname).equal(str(val)), f'{fname} == "{val}"'
             elif ftype in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]:
                 if not isinstance(val, list) or not val: continue
