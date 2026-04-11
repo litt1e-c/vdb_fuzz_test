@@ -1,0 +1,27 @@
+operator_id: or
+family: logical
+syntax_examples:
+  - 'Filter.by_property("round").equal("Jeopardy") | Filter.by_property("points").less_than(150)'
+  - 'Filter.any_of([Filter.by_property("points").greater_than(700), Filter.by_property("answer").equal("Fish")])'
+  - 'where: { operator: Or, operands: [...] }'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - filter_operands
+  - property_filter_predicates
+doc_semantics: "OR combines multiple filter conditions so that objects satisfying at least one operand filter are matched; in the GraphQL where structure, `Or` uses an operands list, and the Python v4 client exposes both pairwise `|` and list-style `Filter.any_of([...])` composition."
+doc_notes:
+  - "The checked Filters guide states that multiple conditions use `And`, `Or`, and `Not`; it documents Python v4 `Filter.any_of([...])` and `|` as OR composition forms."
+  - "The checked API reference lists `Or` as a where-filter operator and states that if the operator is `And` or `Or`, operands are a list of where filters."
+  - "The checked docs show nested And/Or filters, but do not specify empty operand lists, evaluation order, short-circuit behavior, or complete null/missing truth tables."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.18.1, `or_operator.py` passed the tested subset: pairwise `|`, `Filter.any_of` with three operands, nested OR/AND, OR with a NOT operand, OR between a numeric predicate and `is_none(True)` over explicit-null/omitted scalar rows, OR between a numeric predicate and OBJECT `is_none(True)` over explicit-null/omitted object rows, and OR where an ordinary positive comparison over a missing scalar value behaved as a non-match before disjunction. The null/missing and OBJECT checks are local evidence for the fuzzer subset, not official OR-specific semantics; GitHub issue10642 is currently labeled as discussion/feature request/reproducible rather than a confirmed bug, so OBJECT `is_none(False)` is treated here as an unimplemented or unsupported feature boundary outside this OR record's validated subset."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - issue10642
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/or_operator.py"
+oracle_mapping: "Current fuzzer maps OR to pandas boolean disjunction (`mask_l | mask_r`) over generated subfilter masks, uses Python-client `|` to build Weaviate filters, and has PQS compose OR with a pivot-true operand plus a false or noise operand so the pivot must survive even when the noise branch is not fully predicted. Support is partial but sound for the generated filter subset: scalar predicates, array contains predicates, selected null checks, NOT subfilters, and OBJECT `is_none(True)` as validated here. Metadata filters, reference filters, property length, cross-reference paths, arbitrary object paths, OBJECT `is_none(False)`, and undocumented empty-operand behavior are not covered. This is our oracle assumption, not an official claim."
