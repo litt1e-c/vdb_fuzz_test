@@ -17,7 +17,7 @@ doc_notes:
   - "The checked payload docs say a filter is not satisfied when the stored value type does not fit the filtering condition, but `is_empty` is documented by value state rather than by a narrow payload type family."
 
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: missing keys, explicit null, and [] matched `is_empty`; empty strings, empty objects, and [None] did not; array-of-object [] matched while a non-empty object array did not; nested-path `meta.reports` followed the same tested subset semantics; and `must_not is_empty` returned the tested complement set."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST, gRPC, and Python `:memory:` agreed on the tested subset: missing keys, explicit null, and [] matched `is_empty`; empty strings, empty objects, and [None] did not; array-of-object [] matched while a non-empty object array did not; nested-path `meta.reports` followed the same tested subset semantics; and `must_not is_empty` returned the tested complement set."
 oracle_support:
   - top-level is_empty and must_not-is_empty over generated ARRAY_INT, ARRAY_STR, ARRAY_FLOAT, and ARRAY_OBJECT fields
   - evolved-field empty semantics for missing/null/[] when explicit null backfill is disabled

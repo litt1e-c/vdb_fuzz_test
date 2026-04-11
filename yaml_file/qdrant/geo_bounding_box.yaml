@@ -18,7 +18,7 @@ doc_notes:
   - "A local historical case exists for issue 8539, where an exact geo bounding-box boundary point can be handled inconsistently; this is secondary evidence, not official semantics."
 
 verify_status: mismatch_observed
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST and gRPC agreed on the tested server subset: a scalar point strictly inside the box matched, all tested exact edge/corner scalar points were excluded, a geo array with a non-boundary inside element matched, and missing/null plus tested non-geo rows were excluded. Python `:memory:` differed by including all tested exact edge/corner scalar points and a boundary-only geo array."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1, REST and gRPC agreed on the tested server subset: a scalar point strictly inside the box matched, all tested exact edge/corner scalar points were excluded, a geo array with a non-boundary inside element matched, and missing/null plus tested non-geo rows were excluded. Python `:memory:` differed by including all tested exact edge/corner scalar points and a boundary-only geo array."
 oracle_support:
   - scalar non-boundary geo bounding-box predicates on present geo objects
   - PQS scalar non-boundary geo bounding-box predicates when the generated box is not clamped to a global boundary
