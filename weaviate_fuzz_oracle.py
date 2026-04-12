@@ -4094,23 +4094,38 @@ def run_groupby_mode(rounds=100, seed=None):
                     gb = GroupBy(prop=gf["name"], number_of_groups=n_groups, objects_per_group=per_group)
                     res = col.query.near_vector(near_vector=qv, group_by=gb, limit=n_groups * per_group)
                     objs = res.objects
-                    # Validate: count groups and per-group counts
+
+                    response_groups = getattr(res, "groups", None)
                     groups = {}
-                    for o in objs:
-                        gval = o.properties.get(gf["name"])
-                        gkey = str(gval)
-                        groups.setdefault(gkey, []).append(str(o.uuid))
+                    group_source = "flattened objects"
+                    if isinstance(response_groups, dict):
+                        group_source = "response.groups"
+                        for group_name, group_data in response_groups.items():
+                            groups[str(group_name)] = [str(o.uuid) for o in (getattr(group_data, "objects", None) or [])]
+                    else:
+                        group_source = "belongs_to_group"
+                        for o in objs:
+                            gkey = getattr(o, "belongs_to_group", None)
+                            if gkey is None:
+                                gval = o.properties.get(gf["name"])
+                                gkey = "" if gval is None else str(gval)
+                            groups.setdefault(str(gkey), []).append(str(o.uuid))
+
                     actual_groups = len(groups)
                     max_per = max(len(v) for v in groups.values()) if groups else 0
-                    flog(f"  groups={actual_groups}/{n_groups} max_per={max_per}/{per_group} total={len(objs)}")
+                    flattened_total = len(objs)
+                    grouped_total = sum(len(v) for v in groups.values())
+                    flog(f"  groups={actual_groups}/{n_groups} max_per={max_per}/{per_group} total={flattened_total} grouped_total={grouped_total} via={group_source}")
                     if actual_groups > n_groups:
                         flog(f"  ❌ Too many groups!")
                         errs.append({"id": i, "detail": f"groups {actual_groups}>{n_groups}"})
                     elif max_per > per_group:
                         flog(f"  ❌ Too many per group!")
                         errs.append({"id": i, "detail": f"per_group {max_per}>{per_group}"})
+                    elif grouped_total != flattened_total:
+                        flog(f"  ❌ Group/object total mismatch!")
+                        errs.append({"id": i, "detail": f"group_total {grouped_total}!={flattened_total}"})
                     else:
-                        # Check for key splitting (same value different keys)
                         flog(f"  PASS")
                         ok += 1
                 except Exception as e:
