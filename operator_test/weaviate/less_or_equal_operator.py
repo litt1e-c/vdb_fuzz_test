@@ -2,7 +2,6 @@ import sys
 import time
 import uuid
 
-import numpy as np
 import weaviate
 from weaviate.classes.config import Configure, DataType, Property, Tokenization
 from weaviate.classes.data import DataObject
@@ -12,24 +11,11 @@ from weaviate.classes.query import Filter
 HOST = "127.0.0.1"
 PORT = 8080
 GRPC_PORT = 50051
-COLLECTION_PREFIX = "GreaterThanOperatorValidation"
+COLLECTION_PREFIX = "LessOrEqualOperatorValidation"
 
 
 def deterministic_uuid(label):
-    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"weaviate-greater-than-operator-{label}"))
-
-
-UNIT_PREV = float(np.nextafter(np.float64(1.0), np.float64(-np.inf)))
-UNIT_BASE = 1.0
-UNIT_NEXT = float(np.nextafter(np.float64(1.0), np.float64(np.inf)))
-ZERO_BELOW = float(np.nextafter(np.float64(0.0), np.float64(-np.inf)))
-ZERO_ABOVE = float(np.nextafter(np.float64(0.0), np.float64(np.inf)))
-LARGE_PREV = float(np.nextafter(np.float64(1e12), np.float64(-np.inf)))
-LARGE_BASE = 1e12
-LARGE_NEXT = float(np.nextafter(np.float64(1e12), np.float64(np.inf)))
-DATE_MICRO_0 = "2024-03-01T00:00:00Z"
-DATE_MICRO_1 = "2024-03-01T00:00:00.000001Z"
-DATE_MICRO_2 = "2024-03-01T00:00:00.000002Z"
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"weaviate-less-or-equal-operator-{label}"))
 
 
 ROWS = [
@@ -43,10 +29,6 @@ ROWS = [
             "zeroNumberVal": -1.0,
             "dateVal": "2024-02-29T23:59:58Z",
             "nullableInt": 1,
-            "unitAdjacent": UNIT_PREV,
-            "zeroAdjacent": ZERO_BELOW,
-            "largeAdjacent": LARGE_PREV,
-            "dateMicro": DATE_MICRO_0,
         },
         vector=[1.0, 0.0, 0.0],
     ),
@@ -60,10 +42,6 @@ ROWS = [
             "zeroNumberVal": -0.0,
             "dateVal": "2024-02-29T23:59:59+08:00",
             "nullableInt": None,
-            "unitAdjacent": UNIT_BASE,
-            "zeroAdjacent": 0.0,
-            "largeAdjacent": LARGE_BASE,
-            "dateMicro": DATE_MICRO_1,
         },
         vector=[0.0, 1.0, 0.0],
     ),
@@ -77,10 +55,6 @@ ROWS = [
             "zeroNumberVal": 0.0,
             "dateVal": "2024-02-29T15:59:59Z",
             "nullableInt": 5,
-            "unitAdjacent": UNIT_NEXT,
-            "zeroAdjacent": ZERO_ABOVE,
-            "largeAdjacent": LARGE_NEXT,
-            "dateMicro": DATE_MICRO_2,
         },
         vector=[0.0, 0.0, 1.0],
     ),
@@ -153,30 +127,6 @@ def create_collection(client, name):
                 index_range_filterable=True,
             ),
             Property(
-                name="unitAdjacent",
-                data_type=DataType.NUMBER,
-                index_filterable=True,
-                index_range_filterable=True,
-            ),
-            Property(
-                name="zeroAdjacent",
-                data_type=DataType.NUMBER,
-                index_filterable=True,
-                index_range_filterable=True,
-            ),
-            Property(
-                name="largeAdjacent",
-                data_type=DataType.NUMBER,
-                index_filterable=True,
-                index_range_filterable=True,
-            ),
-            Property(
-                name="dateMicro",
-                data_type=DataType.DATE,
-                index_filterable=True,
-                index_range_filterable=True,
-            ),
-            Property(
                 name="nullableInt",
                 data_type=DataType.INT,
                 index_filterable=True,
@@ -243,11 +193,11 @@ def main():
         observations = []
 
         checks.append(print_check(
-            "int_greater_than_filter_only",
-            "GreaterThan is a documented comparison operator for typed property values.",
-            "Current oracle maps INT greater_than to strict pandas > on present values.",
-            ["c", "d", "e"],
-            fetch_tags(collection, Filter.by_property("intFilterOnly").greater_than(10)),
+            "int_less_or_equal_filter_only",
+            "LessThanEqual is a documented comparison operator for typed property values.",
+            "Current oracle maps INT less_or_equal to strict pandas <= on present values.",
+            ["a", "b"],
+            fetch_tags(collection, Filter.by_property("intFilterOnly").less_or_equal(10)),
         ))
 
         cfg = client.collections.get(collection_name).config.get()
@@ -258,11 +208,11 @@ def main():
         try:
             range_only_result = fetch_tags(
                 collection,
-                Filter.by_property("intRangeOnlyObservation").greater_than(10),
+                Filter.by_property("intRangeOnlyObservation").less_or_equal(10),
             )
             observations.append(("range_only_query_result", range_only_result))
             print_observation(
-                "int_greater_than_range_only_observation",
+                "int_less_or_equal_range_only_observation",
                 "Official indexing docs suggest comparison filters can rely on range indexing, but this path is observation-only because it is outside the current fuzzer subset.",
                 {
                     "property_config": str(range_only_cfg),
@@ -272,8 +222,8 @@ def main():
         except Exception as exc:
             observations.append(("range_only_query_error", str(exc)))
             print_observation(
-                "int_greater_than_range_only_observation",
-                "The local client/server combination did not preserve or use the requested range-only property configuration; this keeps range-only greater_than outside the validated oracle subset.",
+                "int_less_or_equal_range_only_observation",
+                "The local client/server combination did not preserve or use the requested range-only property configuration; this keeps range-only less_or_equal outside the validated oracle subset.",
                 {
                     "property_config": str(range_only_cfg),
                     "query_error": str(exc),
@@ -281,88 +231,40 @@ def main():
             )
 
         checks.append(print_check(
-            "number_greater_than_regular_value",
-            "GreaterThan is documented for numeric values.",
-            "Current oracle maps NUMBER greater_than to strict float > for regular finite values.",
-            ["d", "e"],
-            fetch_tags(collection, Filter.by_property("numberVal").greater_than(0.0)),
+            "number_less_or_equal_regular_value",
+            "LessThanEqual is documented for numeric values.",
+            "Current oracle maps NUMBER less_or_equal to strict float <= for regular finite values.",
+            ["a", "b", "c", "d"],
+            fetch_tags(collection, Filter.by_property("numberVal").less_or_equal(0.5)),
         ))
 
         checks.append(print_check(
-            "date_greater_than_utc_normalized",
+            "date_less_or_equal_utc_normalized",
             "Docs state RFC3339 dates can be filtered similarly to numbers.",
-            "Current oracle normalizes DATE values to UTC instants and applies strict >.",
-            ["a", "d", "e"],
-            fetch_tags(collection, Filter.by_property("dateVal").greater_than("2024-02-29T15:59:59Z")),
+            "Current oracle normalizes DATE values to UTC instants and applies strict <=.",
+            ["a", "b", "c", "d"],
+            fetch_tags(collection, Filter.by_property("dateVal").less_or_equal("2024-03-01T00:00:00Z")),
         ))
 
         checks.append(print_check(
-            "nullable_int_greater_than_excludes_null_missing",
-            "The docs define comparison filtering but do not document a greater_than-specific null or missing truth table.",
-            "Current oracle treats null or omitted scalar values as non-matches for strict greater_than.",
-            ["c", "e"],
-            fetch_tags(collection, Filter.by_property("nullableInt").greater_than(1)),
-        ))
-
-        checks.append(print_check(
-            "number_greater_than_adjacent_unit_prev",
-            "GreaterThan is documented for numeric values; docs do not special-case adjacent representable IEEE-754 values.",
-            "Current main fuzzer subset now includes adjacent finite float thresholds around observed non-signed-zero values.",
-            ["b", "c"],
-            fetch_tags(collection, Filter.by_property("unitAdjacent").greater_than(UNIT_PREV)),
-        ))
-
-        checks.append(print_check(
-            "number_greater_than_adjacent_unit_base",
-            "GreaterThan is documented for numeric values.",
-            "Current oracle expects strict > to separate 1.0 from its next representable float.",
-            ["c"],
-            fetch_tags(collection, Filter.by_property("unitAdjacent").greater_than(UNIT_BASE)),
-        ))
-
-        checks.append(print_check(
-            "number_greater_than_adjacent_zero_negative_subnormal",
-            "GreaterThan is documented for numeric values.",
-            "Current oracle includes the safe near-zero subset using the negative smallest subnormal, while keeping signed -0.0 outside the main generated subset.",
-            ["b", "c"],
-            fetch_tags(collection, Filter.by_property("zeroAdjacent").greater_than(ZERO_BELOW)),
-        ))
-
-        checks.append(print_check(
-            "number_greater_than_adjacent_large_prev",
-            "GreaterThan is documented for numeric values.",
-            "Current oracle includes adjacent finite thresholds around large magnitudes to probe precision-sensitive boundaries.",
-            ["b", "c"],
-            fetch_tags(collection, Filter.by_property("largeAdjacent").greater_than(LARGE_PREV)),
-        ))
-
-        checks.append(print_check(
-            "date_greater_than_microsecond_boundary",
-            "Docs state RFC3339 dates can be filtered similarly to numbers.",
-            "Current oracle treats RFC3339 DATE values as UTC-normalized instants and includes microsecond-resolution greater_than boundaries.",
-            ["b", "c"],
-            fetch_tags(collection, Filter.by_property("dateMicro").greater_than(DATE_MICRO_0)),
-        ))
-
-        checks.append(print_check(
-            "date_greater_than_microsecond_boundary_strict",
-            "Docs state RFC3339 dates can be filtered similarly to numbers.",
-            "Current oracle expects strict > to separate consecutive microsecond timestamps.",
-            ["c"],
-            fetch_tags(collection, Filter.by_property("dateMicro").greater_than(DATE_MICRO_1)),
+            "nullable_int_less_or_equal_excludes_null_missing",
+            "The docs define comparison filtering but do not document a less_or_equal-specific null or missing truth table.",
+            "Current oracle treats null or omitted scalar values as non-matches for strict less_or_equal.",
+            ["a", "c"],
+            fetch_tags(collection, Filter.by_property("nullableInt").less_or_equal(5)),
         ))
 
         signed_zero_mismatches = []
         for name, expected, actual in [
             (
-                "number_greater_than_positive_zero_signed_zero_probe",
-                ["d", "e"],
-                fetch_tags(collection, Filter.by_property("zeroNumberVal").greater_than(0.0)),
+                "number_less_or_equal_positive_zero_signed_zero_probe",
+                ["a", "b", "c"],
+                fetch_tags(collection, Filter.by_property("zeroNumberVal").less_or_equal(0.0)),
             ),
             (
-                "number_greater_than_negative_zero_signed_zero_probe",
-                ["d", "e"],
-                fetch_tags(collection, Filter.by_property("zeroNumberVal").greater_than(-0.0)),
+                "number_less_or_equal_negative_zero_signed_zero_probe",
+                ["a", "b", "c"],
+                fetch_tags(collection, Filter.by_property("zeroNumberVal").less_or_equal(-0.0)),
             ),
         ]:
             ok = print_mismatch_probe(
@@ -376,19 +278,18 @@ def main():
 
         if observations:
             print(f"Observation summary: {observations}")
-
         if signed_zero_mismatches:
             print(f"Signed-zero mismatch probes: {signed_zero_mismatches}")
 
         if all(checks):
-            print("Summary: all greater_than operator checks passed on the local Weaviate service.")
+            print("Summary: all less_or_equal operator checks passed on the local Weaviate service.")
             if observations:
                 print("Summary note: range-only comparison indexing remained observation-only outside the current validated subset.")
             if signed_zero_mismatches:
-                print("Summary note: signed-zero NUMBER greater_than mismatches were observed outside the current validated subset.")
+                print("Summary note: signed-zero NUMBER less_or_equal mismatches were observed outside the current validated subset.")
             return 0
 
-        print("Summary: one or more greater_than operator checks failed.")
+        print("Summary: one or more less_or_equal operator checks failed.")
         return 1
     finally:
         try:

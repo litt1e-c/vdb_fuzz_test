@@ -1,72 +1,174 @@
-import time
-from pymilvus import connections, Collection, FieldSchema, CollectionSchema, DataType, utility
+import sys
+import traceback
+
+import weaviate
+import weaviate.classes as wvc
+from weaviate.classes.config import Configure, DataType, Property
+from weaviate.classes.data import DataObject
+from weaviate.classes.query import Filter
 
 HOST = "127.0.0.1"
-PORT = "19531"  # 替换为你实际的 Docker 端口
-COLLECTION = "bug_null_array_index"
+PORT = 8080
+GRPC_PORT = 50051
+CLASS_NAME = "BugLengthFilterableArrayParity"
 
-def run_array_index_bug_repro():
-    print(f"🔌 连接 Milvus {HOST}:{PORT}...")
-    connections.connect(host=HOST, port=PORT)
-    
-    if utility.has_collection(COLLECTION):
-        utility.drop_collection(COLLECTION)
+ROWS = [
+    DataObject(
+        uuid="00000000-0000-0000-0000-000000000001",
+        properties={
+            "tag": "r1",
+            "text_search_only": "abc",      # len = 3
+            "ints_non_filterable": [1, 2],  # len = 2
+            "ints_filterable": [1, 2],      # len = 2
+        },
+        vector=[0.0, 0.0, 0.0],
+    ),
+    DataObject(
+        uuid="00000000-0000-0000-0000-000000000002",
+        properties={
+            "tag": "r2",
+            "text_search_only": "abcd",         # len = 4
+            "ints_non_filterable": [1, 2, 3],   # len = 3
+            "ints_filterable": [1, 2, 3],       # len = 3
+        },
+        vector=[0.0, 0.0, 0.0],
+    ),
+    DataObject(
+        uuid="00000000-0000-0000-0000-000000000003",
+        properties={
+            "tag": "r3",
+            "text_search_only": "",   # len = 0
+            "ints_non_filterable": [],# len = 0
+            "ints_filterable": [],    # len = 0
+        },
+        vector=[0.0, 0.0, 0.0],
+    ),
+]
 
-    schema = CollectionSchema([
-        FieldSchema("id", DataType.INT64, is_primary=True, auto_id=False),
-        FieldSchema("vec", DataType.FLOAT_VECTOR, dim=2),
-        FieldSchema("meta", DataType.JSON, nullable=True),
-    ])
-    col = Collection(COLLECTION, schema)
 
-    # 我们只插入两条数据
-    # ID 1: 正常数据，包含普通键和数组键
-    # ID 2: 危险数据，完全为空的 JSON {}
-    ids = [1, 2]
-    vecs = [[0.1, 0.2], [0.3, 0.4]]
-    metas = [
-        {"val": 1, "arr": [1]},  # ID 1
-        {}                       # ID 2 (Missing keys)
-    ]
-    
-    col.insert([ids, vecs, metas])
-    col.flush()
-    col.create_index("vec", {"metric_type": "L2", "index_type": "FLAT", "params": {}})
-    col.load()
-    time.sleep(1)
+def fetch_tags(collection, flt):
+    res = collection.query.fetch_objects(filters=flt, limit=20)
+    return sorted(obj.properties["tag"] for obj in res.objects)
 
-    print("\n=== 预备知识：基于当前的 3VL 逻辑 Bug ===")
-    print("在当前的 Milvus 中，not(缺失键 == 999) 会被错误地评估为 True。")
-    print("因此，ID 2 应该被返回。")
 
-    # --- 测试 1：对象键访问 (证明你之前的结论) ---
-    print("\n" + "=" * 50)
-    print("测试 1: 对象键访问 -> not (meta[\"val\"] == 999)")
-    expr_key = 'not (meta["val"] == 999)'
-    res_key = col.query(expr_key, output_fields=["id"])
-    ids_key = sorted([r["id"] for r in res_key])
-    print(f"实际返回 IDs: {ids_key}")
-    if 2 in ids_key:
-        print("💡 表现：如你的 Issue #47164 所述，ID 2 因 3VL 逻辑 Bug 被返回（多出数据）。")
+def run_case(collection, name, flt, expected=None):
+    print(f"\n[{name}]")
+    try:
+        actual = fetch_tags(collection, flt)
+        print("actual:  ", actual)
+        if expected is not None:
+            print("expected:", expected)
+            print("match:   ", actual == expected)
+        return ("ok", actual)
+    except Exception as e:
+        print("ERROR TYPE:", type(e).__name__)
+        print("ERROR MSG :", str(e))
+        tb = traceback.format_exc()
+        print(tb)
+        return ("err", f"{type(e).__name__}: {e}")
 
-    # --- 测试 2：数组下标访问 (证明新发现的物理崩溃 Bug) ---
-    print("\n" + "=" * 50)
-    print("测试 2: 数组下标访问 -> not (meta[\"arr\"][0] == 999)")
-    expr_arr = 'not (meta["arr"][0] == 999)'
-    res_arr = col.query(expr_arr, output_fields=["id"])
-    ids_arr = sorted([r["id"] for r in res_arr])
-    print(f"实际返回 IDs: {ids_arr}")
-    if 2 not in ids_arr:
-        print("🚨 致命 Bug 触发：ID 2 消失了！")
-        print("原因：底层在计算 meta[\"arr\"][0] 时，由于 meta[\"arr\"] 是 null，")
-        print("强行执行 [0] 引发了 C++ 异常。表达式静默崩溃，整行被判为 False，外层的 not 失效！")
 
-    print("\n" + "=" * 50)
-    print("结论对比：")
-    print(f"同是缺失键，对象访问返回 {ids_key}，数组访问返回 {ids_arr}。")
-    print("这证明数组下标操作缺乏 Null Type Guard（类型安全检查）。")
-    
-    utility.drop_collection(COLLECTION)
+def main():
+    client = weaviate.connect_to_local(host=HOST, port=PORT, grpc_port=GRPC_PORT)
+    try:
+        if client.collections.exists(CLASS_NAME):
+            client.collections.delete(CLASS_NAME)
+
+        col = client.collections.create(
+            name=CLASS_NAME,
+            vector_config=Configure.Vectors.self_provided(),
+            inverted_index_config=Configure.inverted_index(
+                index_property_length=True,
+                index_null_state=True,
+            ),
+            properties=[
+                Property(name="tag", data_type=DataType.TEXT, index_filterable=True),
+                Property(
+                    name="text_search_only",
+                    data_type=DataType.TEXT,
+                    index_filterable=False,
+                    index_searchable=True,
+                ),
+                Property(
+                    name="ints_non_filterable",
+                    data_type=DataType.INT_ARRAY,
+                    index_filterable=False,
+                ),
+                Property(
+                    name="ints_filterable",
+                    data_type=DataType.INT_ARRAY,
+                    index_filterable=True,
+                ),
+            ],
+        )
+
+        col.data.insert_many(ROWS)
+
+        print("[rows]")
+        for row in ROWS:
+            print(row.uuid, row.properties)
+
+        # 1) text_search_only 长度过滤：search-only text
+        run_case(
+            col,
+            'text_search_only len == 3',
+            Filter.by_property("text_search_only", length=True).equal(3),
+            expected=["r1"],
+        )
+
+        # 2) non-filterable INT_ARRAY 长度过滤：这是你想盯的点
+        run_case(
+            col,
+            'ints_non_filterable len == 2',
+            Filter.by_property("ints_non_filterable", length=True).equal(2),
+            expected=["r1"],
+        )
+
+        # 3) filterable INT_ARRAY 长度过滤：对照组
+        run_case(
+            col,
+            'ints_filterable len == 2',
+            Filter.by_property("ints_filterable", length=True).equal(2),
+            expected=["r1"],
+        )
+
+        # 再补几组，避免只测一个长度
+        run_case(
+            col,
+            'text_search_only len == 0',
+            Filter.by_property("text_search_only", length=True).equal(0),
+            expected=["r3"],
+        )
+
+        run_case(
+            col,
+            'ints_non_filterable len == 0',
+            Filter.by_property("ints_non_filterable", length=True).equal(0),
+            expected=["r3"],
+        )
+
+        run_case(
+            col,
+            'ints_filterable len == 0',
+            Filter.by_property("ints_filterable", length=True).equal(0),
+            expected=["r3"],
+        )
+
+        print("\n[diagnosis guide]")
+        print("- 如果三个都成功：说明这个最小 case 里没有复现。")
+        print("- 如果 text_search_only 成功，ints_filterable 成功，但 ints_non_filterable 报错：强烈怀疑 non-filterable INT_ARRAY length 实现不一致。")
+        print("- 如果 text_search_only 成功，而两个 INT_ARRAY 都报错：怀疑 array-length 整体链路有问题。")
+        print("- 如果三个都报错：先检查 index_property_length 是否真的生效。")
+
+        return 0
+
+    finally:
+        try:
+            if client.collections.exists(CLASS_NAME):
+                client.collections.delete(CLASS_NAME)
+        finally:
+            client.close()
+
 
 if __name__ == "__main__":
-    run_array_index_bug_repro()
+    sys.exit(main())

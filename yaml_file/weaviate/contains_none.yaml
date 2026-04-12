@@ -1,0 +1,32 @@
+operator_id: contains_none
+family: membership
+syntax_examples:
+  - 'Filter.by_property("answer").contains_none(["australia", "india"])'
+  - 'Filter.by_property("labelsArray").contains_none(["Alpha", "alpha"])'
+  - 'where: { path: ["answer"], operator: ContainsNone, valueText: ["australia", "india"] }'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+  - "https://docs.weaviate.io/weaviate/config-refs/collections"
+doc_supported_types:
+  - text
+  - text_array
+  - int_array
+  - number_array
+  - boolean_array
+doc_semantics: "ContainsNone is a documented where-filter operator for array and text properties. It expects an array of input values and returns objects where none of the input values are present. For text properties, the docs say the text is treated as an array of tokens according to the property's tokenization scheme."
+doc_notes:
+  - "The checked Filters guide documents `contains_none(...)` on a text property and says it matches objects where the property contains none of the input values."
+  - "The checked GraphQL filter reference lists `ContainsNone` as valid only for array and text properties."
+  - "The checked GraphQL filter reference says text is treated as an array of tokens based on the chosen tokenization scheme when using `ContainsAny`, `ContainsAll`, and `ContainsNone`."
+  - "The checked collections reference says tokenization influences where filters; `field` treats the entire text value as one token, while `word` splits on non-alphanumeric characters and lowercases the resulting tokens."
+  - "The checked docs do not provide a ContainsNone-specific null or missing truth table, explicit empty-array truth table, or a precise statement about whether scalar-text ContainsNone requires `indexFilterable`, `indexSearchable`, or either in the current client/server combination."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `contains_none_operator.py` passed the validated subset for INT_ARRAY, NUMBER_ARRAY, BOOL_ARRAY, FIELD-tokenized TEXT_ARRAY exact element exclusion, and FIELD-tokenized scalar TEXT exact whole-value-token exclusion. Observation-only checks exposed four important boundaries. First, explicit-null and omitted TEXT_ARRAY rows matched `contains_none([\"red\"])` locally, and explicit-null and omitted scalar FIELD TEXT rows also matched `contains_none([\"Alpha Beta\"])`; this local null/missing behavior is not specified in the checked docs. Second, scalar TEXT `contains_none(...)` also worked on a FIELD-tokenized property created with `index_filterable=False` and `index_searchable=True`, so local queryability is broader than the previous filterable-only text subset. Third, WORD-tokenized scalar TEXT `contains_none([\"alpha\"])` matched only the empty-string row in the dedicated local test, consistent with lowercased tokenized exclusion but outside the current main oracle subset. Fourth, an explicit empty TEXT_ARRAY was successfully inserted and fetched back as `[]`, and that empty-array row matched `contains_none([\"red\"])` locally, even though the current fuzzer still normalizes generated empty arrays to null/omitted rows. These null/missing, searchable-only, WORD-tokenization, and explicit-empty-array results are treated as local observations rather than full official semantics."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/contains_none_operator.py"
+oracle_mapping: "Current fuzzer models contains_none with pandas exclusion over present array values for INT_ARRAY, NUMBER_ARRAY, BOOL_ARRAY, and FIELD-tokenized TEXT_ARRAY, and null or omitted array rows are treated as matches for positive contains_none based on local validation. After the local refinement in this round, scalar FIELD TEXT `contains_none` is also generated and modeled as exact whole-field token exclusion, and null or omitted scalar-text rows are likewise treated as matches in the oracle based on local validation. This scalar-text generation now covers locally queryable FIELD text properties reachable through either `index_filterable` or `index_searchable`. PQS contains direct pivot-true contains_none generation for arrays and scalar FIELD text through noise targets that are absent from the pivot value. The main fuzzer still normalizes dynamically generated empty arrays to null/omitted rows, so explicit empty-array semantics are not part of the main generated oracle subset even though the local engine can store `[]` and local `contains_none` matched it. WORD or other non-FIELD tokenizations, metadata filters, reference filters, objects, and undocumented index interactions are not claimed. This is our oracle assumption, not an official claim."

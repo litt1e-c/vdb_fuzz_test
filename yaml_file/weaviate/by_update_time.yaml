@@ -1,0 +1,30 @@
+operator_id: by_update_time
+family: metadata_filter
+syntax_examples:
+  - 'Filter.by_update_time().greater_than(datetime(2024, 1, 1, tzinfo=timezone.utc))'
+  - 'Filter.by_update_time().contains_any([updated_at_a, updated_at_b])'
+  - 'where: { path: ["_lastUpdateTimeUnix"], operator: GreaterThan, valueDate: "2024-01-01T00:00:00+00:00" }'
+doc_status: metadata_entry_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index"
+  - "https://docs.weaviate.io/weaviate/api/graphql/additional-operators"
+  - "https://weaviate-python-client.readthedocs.io/en/stable/weaviate.collections.classes.html"
+doc_supported_types:
+  - metadata_timestamp
+doc_semantics: "by_update_time is a documented metadata-filter entry point for filtering objects by their Weaviate last-update timestamp rather than by a user-defined schema property. The checked official references state that timestamp metadata is indexed through `indexTimestamps`, expose `_lastUpdateTimeUnix` as the metadata property name, and the checked official Python client exposes `Filter.by_update_time()` as the update-time filter entry point."
+doc_notes:
+  - "The checked inverted-index reference says `indexTimestamps=true` indexes object timestamps and enables filtering by object creation and update timestamps."
+  - "The checked official GraphQL/additional-operators reference lists `_lastUpdateTimeUnix` as the metadata property name for last-update timestamps."
+  - "The checked official Python-client API docs expose `Filter.by_update_time()` as an update-time metadata filter entry point, with comparison and membership-style methods inherited from the time-filter helper."
+  - "The checked filters guide documents object timestamp filtering as metadata filtering, but does not provide an update-time-specific truth table."
+  - "The checked docs do not provide an update-time-specific truth table for equality precision, timezone normalization, valid absent timestamps, empty timestamp lists, or exact behavior under different update APIs."
+  - "This record treats `by_update_time` as a metadata filter entry point, not as a core scalar property operator."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `by_update_time_operator.py` validated the current subset on a temporary collection using both `replace()` and partial `update()` to advance server-returned last-update timestamps. Exact equality, `not_equal`, range comparisons, `contains_any`, and `contains_none` matched the expected sets over UTC-normalized `last_update_time` metadata. Untouched rows kept their earlier update time, updated rows advanced, and update-time filtering worked independently of ordinary property `index_filterable` settings and composed cleanly with ordinary property filters. Focused oracle, PQS, and equivalence regressions exercised generated `update_time` predicates after the fuzzer was updated to sync server-returned last-update timestamps after insert, update, and upsert(existing) paths. No standalone `by_update_time` engine bug was reproduced in this round."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/by_update_time_operator.py"
+oracle_mapping: "Current fuzzer treats `by_update_time` as metadata over a synced dataframe `_update_time` column populated from server-returned object metadata. pandas maps `equal`, `not_equal`, `less_than`, `less_or_equal`, `greater_than`, `greater_or_equal`, `contains_any`, and `contains_none` to UTC-normalized last-update timestamp equality, ordering, membership, and non-membership over that column. Oracle mode syncs `_update_time` after initial insert and after dynamic `replace()`/`update()`/upsert(existing) paths before generating new predicates. PQS uses pivot-true update-time predicates based on the pivot row's synced timestamp plus absent future timestamps, and equivalence mode uses the same atomic generator subset. Empty timestamp lists, invalid timestamp values, unsynced metadata, delete semantics, vector-only update semantics, GraphQL-path generation, and undocumented update-path differences are not claimed. This is our oracle assumption, not an official claim."

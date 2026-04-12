@@ -39,7 +39,7 @@ from weaviate.classes.config import (
     Configure, Property, DataType, Reconfigure,
     VectorDistances, Tokenization,
 )
-from weaviate.classes.query import Filter, GroupBy, Sort
+from weaviate.classes.query import Filter, GeoCoordinate, GroupBy, Sort, MetadataQuery
 from weaviate.classes.data import DataObject
 from weaviate.classes.config import ConsistencyLevel
 
@@ -84,33 +84,129 @@ INT_BOUNDARY_VALUES = [
 INT64_MIN = -(2**63)
 INT64_MAX = (2**63) - 1
 
-NUMBER_BOUNDARY_VALUES = [
-    float(-np.finfo(np.float64).tiny),
-    -1e12,
-    -1e6,
-    -1.0,
-    -1e-12,
-    # -0.0,
-    # 暂时注释掉-0.0，避免重复问题反复出现
-    0.0,
-    np.finfo(np.float64).smallest_subnormal,
-    np.finfo(np.float64).tiny,
-    1e-12,
-    1.0,
-    1e6,
-    1e12,
-]
+def next_float(value, toward):
+    if value is None:
+        return None
+    try:
+        fv = np.float64(value)
+        tv = np.float64(toward)
+    except Exception:
+        return None
+    if not np.isfinite(fv) or not np.isfinite(tv):
+        return None
+    nxt = np.nextafter(fv, tv)
+    if not np.isfinite(nxt):
+        return None
+    return float(nxt)
+
+
+def unique_float_values(values):
+    out, seen = [], set()
+    for value in values:
+        try:
+            fv = np.float64(value)
+        except Exception:
+            continue
+        if not np.isfinite(fv):
+            continue
+        bits = int(fv.view(np.uint64))
+        if bits in seen:
+            continue
+        seen.add(bits)
+        out.append(float(fv))
+    return out
+
+
+def format_rfc3339_timestamp(ts, offset_minutes=0):
+    if ts is None:
+        return None
+    try:
+        pts = pd.Timestamp(ts)
+    except Exception:
+        return None
+    if pd.isna(pts):
+        return None
+    if pts.tzinfo is None:
+        pts = pts.tz_localize("UTC")
+    else:
+        pts = pts.tz_convert("UTC")
+    tz = timezone(timedelta(minutes=int(offset_minutes or 0)))
+    dt = pts.to_pydatetime().astimezone(tz)
+    timespec = "microseconds" if dt.microsecond else "seconds"
+    out = dt.isoformat(timespec=timespec)
+    return out.replace("+00:00", "Z")
+
+
+def build_number_boundary_values():
+    finfo = np.finfo(np.float64)
+    base = [
+        float(-finfo.tiny),
+        -1e12,
+        -1e6,
+        -1.0,
+        -1e-12,
+        # Keep -0.0 out of the main fuzz subset; see issue10917 probes.
+        next_float(0.0, -np.inf),
+        0.0,
+        finfo.smallest_subnormal,
+        finfo.tiny,
+        1e-12,
+        1.0,
+        1e6,
+        1e12,
+    ]
+    anchors = [
+        -1e12,
+        -1.0,
+        -1e-12,
+        0.0,
+        1e-12,
+        1.0,
+        1e12,
+        -finfo.tiny,
+        finfo.tiny,
+    ]
+    expanded = list(base)
+    for anchor in anchors:
+        lower = next_float(anchor, -np.inf)
+        upper = next_float(anchor, np.inf)
+        if lower is not None:
+            expanded.append(lower)
+        if upper is not None:
+            expanded.append(upper)
+    return unique_float_values(expanded)
+
+
+NUMBER_BOUNDARY_VALUES = build_number_boundary_values()
 
 DATE_BOUNDARY_VALUES = [
     "1969-12-31T23:59:59Z",
     "1970-01-01T00:00:00Z",
+    "1970-01-01T00:00:00.000001Z",
     "1999-12-31T23:59:59Z",
     "2000-02-29T00:00:00Z",
     "2001-09-09T01:46:40Z",
     "2016-12-31T23:59:59-08:00",
     "2020-02-29T12:34:56+00:00",
+    "2024-02-29T15:59:59.999999Z",
     "2024-02-29T23:59:59+08:00",
+    "2024-03-01T00:00:00.000001Z",
+    "2024-03-01T08:00:00.000001+08:00",
     "2025-12-31T23:59:59Z",
+]
+
+EARTH_RADIUS_M = 6_371_000.0
+MAX_GEO_FILTER_CANDIDATES = 800
+GEO_DISTANCE_BOUNDARY_GUARD_M = 25.0
+GEO_BOUNDARY_VALUES = [
+    {"latitude": 0.0, "longitude": 0.0},
+    {"latitude": -0.0, "longitude": -0.0},
+    {"latitude": 0.0, "longitude": 179.9999},
+    {"latitude": 0.0, "longitude": -179.9999},
+    {"latitude": 89.9999, "longitude": 0.0},
+    {"latitude": -89.9999, "longitude": 0.0},
+    {"latitude": 45.0, "longitude": 45.0},
+    {"latitude": -45.0, "longitude": -45.0},
 ]
 
 TEXT_BOUNDARY_VALUES = [
@@ -203,6 +299,7 @@ class FieldType:
     NUMBER = "NUMBER"
     BOOL = "BOOL"
     TEXT = "TEXT"
+    GEO = "GEO_COORDINATES"
     INT_ARRAY = "INT_ARRAY"
     TEXT_ARRAY = "TEXT_ARRAY"
     NUMBER_ARRAY = "NUMBER_ARRAY"
@@ -216,6 +313,7 @@ def get_weaviate_datatype(ftype):
         FieldType.NUMBER: DataType.NUMBER,
         FieldType.BOOL: DataType.BOOL,
         FieldType.TEXT: DataType.TEXT,
+        FieldType.GEO: DataType.GEO_COORDINATES,
         FieldType.INT_ARRAY: DataType.INT_ARRAY,
         FieldType.TEXT_ARRAY: DataType.TEXT_ARRAY,
         FieldType.NUMBER_ARRAY: DataType.NUMBER_ARRAY,
@@ -342,6 +440,56 @@ def clamp_weaviate_int(value):
     return max(WEAVIATE_SAFE_INT_MIN, min(WEAVIATE_SAFE_INT_MAX, int(value)))
 
 
+def clamp_latitude(value):
+    return max(-90.0, min(90.0, float(value)))
+
+
+def wrap_longitude(value):
+    lon = ((float(value) + 180.0) % 360.0) - 180.0
+    if lon == -180.0 and float(value) > 0:
+        return 180.0
+    return lon
+
+
+def normalize_geo_value(value):
+    if value is None:
+        return None
+    if hasattr(value, "latitude") and hasattr(value, "longitude"):
+        lat = getattr(value, "latitude")
+        lon = getattr(value, "longitude")
+    elif isinstance(value, dict):
+        lat = value.get("latitude")
+        lon = value.get("longitude")
+    else:
+        return None
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except Exception:
+        return None
+    if not np.isfinite(lat) or not np.isfinite(lon):
+        return None
+    if lat < -90.0 or lat > 90.0 or lon < -180.0 or lon > 180.0:
+        return None
+    return {"latitude": lat, "longitude": lon}
+
+
+def geo_distance_m(a, b):
+    ga = normalize_geo_value(a)
+    gb = normalize_geo_value(b)
+    if ga is None or gb is None:
+        return None
+    lat1 = np.radians(ga["latitude"])
+    lat2 = np.radians(gb["latitude"])
+    dlat = lat2 - lat1
+    dlon = np.radians(gb["longitude"] - ga["longitude"])
+    h = (
+        np.sin(dlat / 2.0) ** 2
+        + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    )
+    return float(2.0 * EARTH_RADIUS_M * np.arcsin(min(1.0, np.sqrt(h))))
+
+
 def normalize_scalar_for_compare(ftype, value):
     if value is None:
         return None
@@ -358,6 +506,8 @@ def normalize_scalar_for_compare(ftype, value):
         return None if value == "" else str(value)
     if ftype == FieldType.DATE:
         return canonicalize_date_string(value)
+    if ftype == FieldType.GEO:
+        return normalize_geo_value(value)
     return value
 
 
@@ -448,10 +598,7 @@ class DataManager:
 
     def _format_timestamp(self, ts):
         offset_minutes = self.py_rng.choice([0, 0, 0, 60, 330, -480])
-        tz = timezone(timedelta(minutes=offset_minutes))
-        dt = ts.to_pydatetime().astimezone(tz)
-        out = dt.isoformat(timespec="seconds")
-        return out.replace("+00:00", "Z")
+        return format_rfc3339_timestamp(ts, offset_minutes=offset_minutes)
 
     def _random_date(self, boundary=True):
         if boundary and BOUNDARY_INJECTION_RATE and self.py_rng.random() < BOUNDARY_INJECTION_RATE:
@@ -465,7 +612,12 @@ class DataManager:
             anchor = to_utc_timestamp(self.py_rng.choice(DATE_BOUNDARY_VALUES))
             if anchor is None:
                 anchor = pd.Timestamp("2024-01-01T00:00:00Z")
-            ts = anchor + pd.Timedelta(days=self.py_rng.randint(-3, 3), hours=self.py_rng.randint(-6, 6))
+            micro_jitter = self.py_rng.choice([0, 0, 0, -17, -1, 1, 17, 123456, 999999])
+            ts = anchor + pd.Timedelta(
+                days=self.py_rng.randint(-3, 3),
+                hours=self.py_rng.randint(-6, 6),
+                microseconds=micro_jitter,
+            )
         else:
             year = self.py_rng.randint(1998, 2026)
             month = self.py_rng.randint(1, 12)
@@ -473,8 +625,32 @@ class DataManager:
             hour = self.py_rng.randint(0, 23)
             minute = self.py_rng.randint(0, 59)
             second = self.py_rng.randint(0, 59)
-            ts = pd.Timestamp(year=year, month=month, day=day, hour=hour, minute=minute, second=second, tz="UTC")
+            microsecond = self.py_rng.choice([0, 0, 0, 1, 2, 17, 123456, 999999])
+            ts = pd.Timestamp(
+                year=year,
+                month=month,
+                day=day,
+                hour=hour,
+                minute=minute,
+                second=second,
+                microsecond=microsecond,
+                tz="UTC",
+            )
         return self._format_timestamp(ts)
+
+    def _random_geo(self, boundary=True):
+        if boundary and BOUNDARY_INJECTION_RATE and self.py_rng.random() < BOUNDARY_INJECTION_RATE:
+            return dict(self.py_rng.choice(GEO_BOUNDARY_VALUES))
+
+        anchor = self.py_rng.choice(GEO_BOUNDARY_VALUES)
+        jitter_m = self.py_rng.choice([0.0, 1.0, 10.0, 100.0, 1000.0, 100000.0])
+        bearing = self.py_rng.uniform(0.0, 2.0 * np.pi)
+        lat_scale = jitter_m / 111_320.0
+        lat = clamp_latitude(anchor["latitude"] + lat_scale * np.cos(bearing))
+        lon_denom = max(0.01, np.cos(np.radians(anchor["latitude"])))
+        lon_scale = jitter_m / (111_320.0 * lon_denom)
+        lon = wrap_longitude(anchor["longitude"] + lon_scale * np.sin(bearing))
+        return {"latitude": float(lat), "longitude": float(lon)}
 
     def _random_array_length(self):
         if self.py_rng.random() < 0.35:
@@ -528,6 +704,8 @@ class DataManager:
             return self._random_string(1, 48, boundary=True)
         if ftype == FieldType.DATE:
             return self._random_date(boundary=True)
+        if ftype == FieldType.GEO:
+            return self._random_geo(boundary=True)
         return None
 
     def normalize_dataframe_types(self):
@@ -574,6 +752,7 @@ class DataManager:
         self.schema_config.append({"name": "labelsArray", "type": FieldType.TEXT_ARRAY, "max_capacity": self.array_capacity})
         self.schema_config.append({"name": "scoresArray", "type": FieldType.NUMBER_ARRAY, "max_capacity": self.array_capacity})
         self.schema_config.append({"name": "flagsArray", "type": FieldType.BOOL_ARRAY, "max_capacity": self.array_capacity})
+        self.schema_config.append({"name": "geoLocation", "type": FieldType.GEO})
         self.schema_config.append({"name": "metaObj", "type": FieldType.OBJECT, "nested": [
             {"name": "price", "type": FieldType.INT},
             {"name": "color", "type": FieldType.TEXT},
@@ -597,6 +776,8 @@ class DataManager:
 
             if ftype in {FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE}:
                 row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_scalar_value(ftype)
+            elif ftype == FieldType.GEO:
+                row[fname] = None if self.py_rng.random() < self.null_ratio else self._random_geo(boundary=True)
             elif ftype == FieldType.INT_ARRAY:
                 row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.INT)
             elif ftype == FieldType.TEXT_ARRAY:
@@ -667,6 +848,18 @@ class WeaviateManager:
         if self.client:
             self.client.close()
 
+    @staticmethod
+    def _normalize_metadata_time(value):
+        if value is None:
+            return pd.NaT
+        try:
+            ts = pd.Timestamp(value)
+        except Exception:
+            return pd.NaT
+        if ts.tzinfo is None:
+            return ts.tz_localize("UTC")
+        return ts.tz_convert("UTC")
+
     def reset_collection(self, schema_config):
         try:
             self.client.collections.delete(CLASS_NAME)
@@ -677,6 +870,7 @@ class WeaviateManager:
         properties = []
         index_config_log = []
         filterable_fields = set()  # Track which fields have index_filterable=True
+        searchable_text_fields = set()
         for field in schema_config:
             if field["type"] == FieldType.OBJECT:
                 # Nested object property
@@ -696,7 +890,7 @@ class WeaviateManager:
             wv_type = get_weaviate_datatype(field["type"])
             if wv_type:
                 # Scalar index config fuzzing (对标 Milvus 标量索引随机创建)
-                idx_filterable = random.choice([True, True, True, False])  # 75% on
+                idx_filterable = True if field["type"] == FieldType.GEO else random.choice([True, True, True, False])  # 75% on
                 idx_searchable = random.choice([True, False]) if field["type"] == FieldType.TEXT else False
                 idx_range = random.choice([True, False]) if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.DATE) else False
                 # TEXT/TEXT_ARRAY 使用 Tokenization.FIELD: 精确匹配, 区分大小写, 无停用词过滤
@@ -711,6 +905,8 @@ class WeaviateManager:
                 properties.append(p)
                 if idx_filterable:
                     filterable_fields.add(field["name"])
+                if field["type"] == FieldType.TEXT and idx_searchable:
+                    searchable_text_fields.add(field["name"])
                 index_config_log.append(f"{field['name']}: filt={idx_filterable} search={idx_searchable} range={idx_range}")
         properties.append(Property(name="row_num", data_type=DataType.INT))
         if index_config_log:
@@ -742,7 +938,11 @@ class WeaviateManager:
                     vector_config=Configure.Vectors.self_provided(
                         vector_index_config=vi_config,
                     ),
-                    inverted_index_config=Configure.inverted_index(index_null_state=True, index_property_length=True),
+                    inverted_index_config=Configure.inverted_index(
+                        index_null_state=True,
+                        index_property_length=True,
+                        index_timestamps=True,
+                    ),
                 )
                 break
             except Exception as e:
@@ -772,7 +972,96 @@ class WeaviateManager:
                     if attempt == 2:
                         raise
         print("🛠️ Collection Created.")
+        self.searchable_text_fields = searchable_text_fields
         return filterable_fields
+
+    def sync_creation_times(self, dm, ids=None, retries=3):
+        if self.client is None or dm.df.empty:
+            return
+
+        collection = self.client.collections.get(CLASS_NAME)
+        target_ids = None if ids is None else [str(x) for x in ids]
+        mapping = {}
+
+        for attempt in range(retries):
+            kwargs = {
+                "limit": max(1, len(target_ids) if target_ids is not None else len(dm.df) + 10),
+                "return_metadata": MetadataQuery(creation_time=True),
+                "return_properties": False,
+            }
+            if target_ids:
+                if len(target_ids) == 1:
+                    kwargs["filters"] = Filter.by_id().equal(target_ids[0])
+                else:
+                    kwargs["filters"] = Filter.by_id().contains_any(target_ids)
+
+            response = collection.query.fetch_objects(**kwargs)
+            mapping = {
+                str(obj.uuid): self._normalize_metadata_time(
+                    getattr(getattr(obj, "metadata", None), "creation_time", None)
+                )
+                for obj in response.objects
+            }
+
+            if target_ids is None or all(target in mapping for target in target_ids):
+                break
+            time.sleep(SLEEP_INTERVAL * 2)
+
+        if "_creation_time" not in dm.df.columns:
+            dm.df["_creation_time"] = pd.NaT
+
+        if target_ids is None:
+            dm.df["_creation_time"] = pd.to_datetime(
+                dm.df["id"].map(mapping), utc=True, errors="coerce"
+            )
+        else:
+            mask = dm.df["id"].isin(target_ids)
+            dm.df.loc[mask, "_creation_time"] = dm.df.loc[mask, "id"].map(mapping)
+            dm.df["_creation_time"] = pd.to_datetime(dm.df["_creation_time"], utc=True, errors="coerce")
+
+    def sync_update_times(self, dm, ids=None, retries=3):
+        if self.client is None or dm.df.empty:
+            return
+
+        collection = self.client.collections.get(CLASS_NAME)
+        target_ids = None if ids is None else [str(x) for x in ids]
+        mapping = {}
+
+        for attempt in range(retries):
+            kwargs = {
+                "limit": max(1, len(target_ids) if target_ids is not None else len(dm.df) + 10),
+                "return_metadata": MetadataQuery(last_update_time=True),
+                "return_properties": False,
+            }
+            if target_ids:
+                if len(target_ids) == 1:
+                    kwargs["filters"] = Filter.by_id().equal(target_ids[0])
+                else:
+                    kwargs["filters"] = Filter.by_id().contains_any(target_ids)
+
+            response = collection.query.fetch_objects(**kwargs)
+            mapping = {
+                str(obj.uuid): self._normalize_metadata_time(
+                    getattr(getattr(obj, "metadata", None), "last_update_time", None)
+                )
+                for obj in response.objects
+            }
+
+            if target_ids is None or all(target in mapping for target in target_ids):
+                break
+            time.sleep(SLEEP_INTERVAL * 2)
+
+        if "_update_time" not in dm.df.columns:
+            dm.df["_update_time"] = pd.NaT
+
+        if target_ids is None:
+            dm.df["_update_time"] = pd.to_datetime(
+                dm.df["id"].map(mapping), utc=True, errors="coerce"
+            )
+        else:
+            mask = dm.df["id"].isin(target_ids)
+            dm.df.loc[mask, "_update_time"] = dm.df.loc[mask, "id"].map(mapping)
+            dm.df["_update_time"] = pd.to_datetime(dm.df["_update_time"], utc=True, errors="coerce")
 
     def insert(self, dm):
         print(f"⚡ 3. Inserting Data (Batch={BATCH_SIZE})...")
@@ -799,6 +1088,11 @@ class WeaviateManager:
             elif ftype == FieldType.BOOL: return bool(v)
             elif ftype == FieldType.NUMBER: return float(v)
             elif ftype in (FieldType.TEXT, FieldType.DATE): return str(v)
+            elif ftype == FieldType.GEO:
+                gv = normalize_geo_value(v)
+                if gv is None:
+                    return None
+                return GeoCoordinate(latitude=gv["latitude"], longitude=gv["longitude"])
             else: return convert_numpy_types(v)
 
         for start in range(0, total, BATCH_SIZE):
@@ -844,13 +1138,29 @@ class OracleQueryGenerator:
             self.schema = [f for f in dm.schema_config if f["name"] in filterable]
         else:
             self.schema = dm.schema_config
+        like_text_names = set(filterable or set()) | set(getattr(dm, "searchable_text_fields", set()) or set())
         self.df = dm.df
         self.dm = dm
         self.scalar_schema = [f for f in self.schema if f["type"] in [FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE]]
+        self.like_text_schema = [f for f in dm.schema_config if f["type"] == FieldType.TEXT and f["name"] in like_text_names]
+        self.geo_schema = [f for f in self.schema if f["type"] == FieldType.GEO]
         self.array_schema = [f for f in self.schema if f["type"] in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]]
+        property_length_text_names = like_text_names
+        property_length_array_names = {f["name"] for f in self.array_schema}
+        self.property_length_schema = [
+            f for f in dm.schema_config
+            if (f["type"] == FieldType.TEXT and f["name"] in property_length_text_names)
+            or (f["type"] in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY] and f["name"] in property_length_array_names)
+        ]
         self._field_values = {}
         self._field_stats = {}
-        for field in self.scalar_schema:
+        value_schema = list(self.scalar_schema)
+        value_schema_names = {f["name"] for f in value_schema}
+        for field in self.like_text_schema:
+            if field["name"] not in value_schema_names:
+                value_schema.append(field)
+                value_schema_names.add(field["name"])
+        for field in value_schema:
             fname, ftype = field["name"], field["type"]
             valid_values = self._extract_valid_values(fname, ftype)
             if not valid_values:
@@ -877,6 +1187,14 @@ class OracleQueryGenerator:
                         "max_ts": parsed.max(),
                         "samples": list(valid_values[:32]),
                     }
+        self.creation_time_series = (
+            pd.to_datetime(self.df["_creation_time"], utc=True, errors="coerce")
+            if "_creation_time" in self.df.columns else None
+        )
+        self.update_time_series = (
+            pd.to_datetime(self.df["_update_time"], utc=True, errors="coerce")
+            if "_update_time" in self.df.columns else None
+        )
 
     def _random_string(self, min_len=5, max_len=10):
         alphabet = string.ascii_letters + string.digits + "_-./@"
@@ -895,6 +1213,11 @@ class OracleQueryGenerator:
         if is_null_like(value):
             return True
         if ftype == FieldType.TEXT and value == "":
+            return True
+        if ftype in (FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY):
+            if isinstance(value, list) and len(value) == 0:
+                return True
+        if ftype == FieldType.GEO and normalize_geo_value(value) is None:
             return True
         return False
 
@@ -920,9 +1243,25 @@ class OracleQueryGenerator:
                 values.append(bool(value))
             elif ftype in (FieldType.TEXT, FieldType.DATE):
                 values.append(str(value))
+            elif ftype == FieldType.GEO:
+                geo = normalize_geo_value(value)
+                if geo is not None:
+                    values.append(geo)
             else:
                 values.append(value)
         return values
+
+    def _existing_ids(self):
+        if "id" not in self.df.columns:
+            return []
+        return [str(value) for value in self.df["id"].tolist() if value is not None]
+
+    def _random_absent_uuid(self, existing_ids=None):
+        existing = set(existing_ids or self._existing_ids())
+        while True:
+            candidate = str(uuid.uuid4())
+            if candidate not in existing:
+                return candidate
 
     def _date_cmp_mask(self, series, op, target):
         target_ts = to_utc_timestamp(target)
@@ -976,16 +1315,58 @@ class OracleQueryGenerator:
         elif ftype == FieldType.NUMBER:
             stats = self._field_stats.get(fname)
             if stats:
-                return random.choice([float(stats["max"]) + 1e5, float(stats["min"]) - 1e5])
+                anchors = [
+                    float(stats["min"]),
+                    float(stats["q1"]),
+                    float(stats["median"]),
+                    float(stats["q3"]),
+                    float(stats["max"]),
+                ]
+                nearby = unique_float_values(
+                    [
+                        candidate
+                        for anchor in anchors
+                        for candidate in (next_float(anchor, -np.inf), next_float(anchor, np.inf))
+                        if candidate is not None
+                    ]
+                )
+                if nearby and random.random() < 0.70:
+                    return random.choice(nearby)
+                outside = unique_float_values(
+                    [
+                        next_float(float(stats["min"]), -np.inf),
+                        next_float(float(stats["max"]), np.inf),
+                    ]
+                )
+                if outside:
+                    return random.choice(outside)
+                return random.choice(NUMBER_BOUNDARY_VALUES)
             return random.uniform(-200000.0, 200000.0)
         elif ftype == FieldType.BOOL:
             return random.choice([True, False])
         elif ftype == FieldType.TEXT:
             return ''.join(random.choices(string.ascii_letters + string.digits + "_-./@", k=random.randint(15, 30)))
         elif ftype == FieldType.DATE:
-            if fname in self._field_stats and "max_ts" in self._field_stats[fname]:
-                anchor = self._field_stats[fname]["max_ts"] + pd.Timedelta(days=30)
-                return anchor.isoformat().replace("+00:00", "Z")
+            stats = self._field_stats.get(fname)
+            if stats and stats.get("samples"):
+                parsed_samples = [to_utc_timestamp(value) for value in stats["samples"]]
+                parsed_samples = [value for value in parsed_samples if value is not None]
+                if parsed_samples:
+                    anchor = random.choice(parsed_samples)
+                    if random.random() < 0.70:
+                        delta = random.choice(
+                            [
+                                pd.Timedelta(microseconds=-1),
+                                pd.Timedelta(microseconds=1),
+                                pd.Timedelta(seconds=-1),
+                                pd.Timedelta(seconds=1),
+                            ]
+                        )
+                        return format_rfc3339_timestamp(anchor + delta)
+                    return format_rfc3339_timestamp(anchor)
+            if stats and "max_ts" in stats:
+                anchor = stats["max_ts"] + pd.Timedelta(days=30)
+                return format_rfc3339_timestamp(anchor)
             return "2030-01-01T00:00:00Z"
         return None
 
@@ -997,7 +1378,6 @@ class OracleQueryGenerator:
         fname, ftype = field["name"], field["type"]
         stats = self._field_stats[fname]
         series = self.df[fname]
-        bt = random.choice(["exact_min", "exact_max", "below_min", "above_max", "at_median", "range_q1_q3", "range_narrow"])
 
         def safe_cmp(op, val):
             def comp(x):
@@ -1013,6 +1393,7 @@ class OracleQueryGenerator:
             return comp
 
         if ftype == FieldType.INT:
+            bt = random.choice(["exact_min", "exact_max", "below_min", "above_max", "at_median", "range_q1_q3", "range_narrow"])
             min_v, max_v = int(stats["min"]), int(stats["max"])
             med = int(stats["median"])
             q1, q3 = int(stats["q1"]), int(stats["q3"])
@@ -1041,6 +1422,19 @@ class OracleQueryGenerator:
                 fc = Filter.by_property(fname).greater_or_equal(mid - delta) & Filter.by_property(fname).less_or_equal(mid + delta)
                 return fc, series.apply(lambda x: (mid - delta) <= x <= (mid + delta) if pd.notna(x) else False), f"{fname} [{mid-delta},{mid+delta}]"
         elif ftype == FieldType.NUMBER:
+            bt = random.choice(
+                [
+                    "exact_min",
+                    "exact_max",
+                    "below_min",
+                    "above_max",
+                    "at_median",
+                    "range_q1_q3",
+                    "range_narrow",
+                    "gt_prev_anchor",
+                    "lt_next_anchor",
+                ]
+            )
             min_v, max_v, med = float(stats["min"]), float(stats["max"]), float(stats["median"])
             if bt in ["exact_min", "exact_max", "at_median"]:
                 t = min_v if bt == "exact_min" else (max_v if bt == "exact_max" else med)
@@ -1050,31 +1444,64 @@ class OracleQueryGenerator:
                 fc = Filter.by_property(fname).greater_or_equal(lo) & Filter.by_property(fname).less_or_equal(hi)
                 return fc, series.apply(lambda x: lo <= x <= hi if pd.notna(x) else False), f"{fname} ≈ {t}"
             elif bt == "below_min":
-                v = min_v - 1.0
+                v = next_float(min_v, -np.inf) or (min_v - 1.0)
                 return Filter.by_property(fname).less_than(v), series.apply(safe_cmp("<", v)), f"{fname} < {v}"
             elif bt == "above_max":
-                v = max_v + 1.0
+                v = next_float(max_v, np.inf) or (max_v + 1.0)
                 return Filter.by_property(fname).greater_than(v), series.apply(safe_cmp(">", v)), f"{fname} > {v}"
+            elif bt == "gt_prev_anchor":
+                anchor = random.choice([min_v, med, max_v, float(stats["q1"]), float(stats["q3"])])
+                prev_val = next_float(anchor, -np.inf)
+                if prev_val is None:
+                    return None, None, None
+                return (
+                    Filter.by_property(fname).greater_than(prev_val),
+                    series.apply(safe_cmp(">", prev_val)),
+                    f"{fname} > prev({anchor})",
+                )
+            elif bt == "lt_next_anchor":
+                anchor = random.choice([min_v, med, max_v, float(stats["q1"]), float(stats["q3"])])
+                next_val = next_float(anchor, np.inf)
+                if next_val is None:
+                    return None, None, None
+                return (
+                    Filter.by_property(fname).less_than(next_val),
+                    series.apply(safe_cmp("<", next_val)),
+                    f"{fname} < next({anchor})",
+                )
             else:
                 mid = (min_v + max_v) / 2
                 delta = max(0.001, (max_v - min_v) / 10)
                 fc = Filter.by_property(fname).greater_or_equal(mid - delta) & Filter.by_property(fname).less_or_equal(mid + delta)
                 return fc, series.apply(lambda x: (mid - delta) <= x <= (mid + delta) if pd.notna(x) else False), f"{fname} [{mid-delta:.2f},{mid+delta:.2f}]"
         elif ftype == FieldType.DATE:
+            bt = random.choice(["exact_min", "exact_max", "below_min", "above_max", "sample_equal", "gt_before_sample_us", "lt_after_sample_us"])
             min_ts = stats["min_ts"]
             max_ts = stats["max_ts"]
             if bt == "exact_min":
-                target = min_ts.isoformat().replace("+00:00", "Z")
+                target = format_rfc3339_timestamp(min_ts)
                 return Filter.by_property(fname).equal(target), self._date_cmp_mask(series, "==", target), f"{fname} == {target} (min)"
             elif bt == "exact_max":
-                target = max_ts.isoformat().replace("+00:00", "Z")
+                target = format_rfc3339_timestamp(max_ts)
                 return Filter.by_property(fname).equal(target), self._date_cmp_mask(series, "==", target), f"{fname} == {target} (max)"
             elif bt == "below_min":
-                target = (min_ts - pd.Timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+                target = format_rfc3339_timestamp(min_ts - pd.Timedelta(microseconds=1))
                 return Filter.by_property(fname).less_than(target), self._date_cmp_mask(series, "<", target), f"{fname} < {target}"
             elif bt == "above_max":
-                target = (max_ts + pd.Timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+                target = format_rfc3339_timestamp(max_ts + pd.Timedelta(microseconds=1))
                 return Filter.by_property(fname).greater_than(target), self._date_cmp_mask(series, ">", target), f"{fname} > {target}"
+            elif bt == "gt_before_sample_us":
+                sample_ts = to_utc_timestamp(random.choice(stats["samples"]))
+                if sample_ts is None:
+                    return None, None, None
+                target = format_rfc3339_timestamp(sample_ts - pd.Timedelta(microseconds=1))
+                return Filter.by_property(fname).greater_than(target), self._date_cmp_mask(series, ">", target), f"{fname} > {target}"
+            elif bt == "lt_after_sample_us":
+                sample_ts = to_utc_timestamp(random.choice(stats["samples"]))
+                if sample_ts is None:
+                    return None, None, None
+                target = format_rfc3339_timestamp(sample_ts + pd.Timedelta(microseconds=1))
+                return Filter.by_property(fname).less_than(target), self._date_cmp_mask(series, "<", target), f"{fname} < {target}"
             else:
                 sample = random.choice(stats["samples"])
                 return Filter.by_property(fname).equal(sample), self._date_cmp_mask(series, "==", sample), f"{fname} == {sample}"
@@ -1118,6 +1545,423 @@ class OracleQueryGenerator:
             mask = series.apply(lambda x: not any(i in targets for i in x) if isinstance(x, list) else True)
             return fc, mask, f"{fname} contains_none {targets}"
 
+    def gen_geo_expr(self):
+        if not self.geo_schema:
+            return None, None, None
+        field = random.choice(self.geo_schema)
+        fname = field["name"]
+        series = self.df[fname]
+        valid_values = [normalize_geo_value(v) for v in series.tolist()]
+        valid_values = [v for v in valid_values if v is not None]
+        if not valid_values:
+            return None, None, None
+        center = random.choice(valid_values)
+        distance_series = series.apply(lambda value: geo_distance_m(center, value))
+        finite_distances = sorted(
+            float(dist) for dist in distance_series.tolist()
+            if dist is not None and np.isfinite(dist)
+        )
+        if not finite_distances:
+            return None, None, None
+
+        safe_cap = min(MAX_GEO_FILTER_CANDIDATES, len(finite_distances))
+        target_counts = {1, 2, 5, 10, 25, 50, 100, 200, 400, safe_cap}
+        if safe_cap > 1:
+            target_counts.update(
+                {
+                    max(1, safe_cap // 4),
+                    max(1, safe_cap // 2),
+                    max(1, (safe_cap * 3) // 4),
+                }
+            )
+
+        distance_candidates = []
+        for target_count in sorted(target_counts):
+            if target_count <= 0 or target_count > safe_cap:
+                continue
+            left = finite_distances[target_count - 1]
+            right = finite_distances[target_count] if target_count < len(finite_distances) else None
+            if right is None:
+                if len(finite_distances) <= MAX_GEO_FILTER_CANDIDATES:
+                    distance_candidates.append(left + 2.0 * GEO_DISTANCE_BOUNDARY_GUARD_M)
+                continue
+            if right - left > 2.0 * GEO_DISTANCE_BOUNDARY_GUARD_M:
+                distance_candidates.append((left + right) / 2.0)
+
+        seen_distances = set()
+        random.shuffle(distance_candidates)
+        for distance in distance_candidates:
+            distance = float(max(0.0, distance))
+            distance_key = round(distance, 6)
+            if distance_key in seen_distances:
+                continue
+            seen_distances.add(distance_key)
+            if distance > 0.0:
+                low = distance - GEO_DISTANCE_BOUNDARY_GUARD_M
+                high = distance + GEO_DISTANCE_BOUNDARY_GUARD_M
+                if any(low <= dist <= high for dist in finite_distances):
+                    continue
+            mask = distance_series.apply(
+                lambda dist, radius=distance: bool(
+                    dist is not None and np.isfinite(dist) and dist <= radius + 1e-6
+                )
+            )
+            match_count = int(mask.fillna(False).sum())
+            if match_count <= 0 or match_count > MAX_GEO_FILTER_CANDIDATES:
+                continue
+            fc = Filter.by_property(fname).within_geo_range(
+                coordinate=GeoCoordinate(latitude=center["latitude"], longitude=center["longitude"]),
+                distance=distance,
+            )
+            return fc, mask, f"{fname} within_geo_range ({center['latitude']:.6f},{center['longitude']:.6f}) <= {distance}m"
+        return None, None, None
+
+    def gen_id_expr(self):
+        id_values = self._existing_ids()
+        if not id_values:
+            return None, None, None
+        id_series = self.df["id"].astype(str)
+        fake_id = self._random_absent_uuid(id_values)
+        mode = random.choice(
+            ["equal_present", "equal_absent", "not_equal", "contains_any_present", "contains_any_absent", "contains_none"]
+        )
+
+        if mode == "equal_present":
+            target = random.choice(id_values)
+            return Filter.by_id().equal(target), id_series == target, f'id == "{target}"'
+
+        if mode == "equal_absent":
+            return Filter.by_id().equal(fake_id), id_series == fake_id, f'id == "{fake_id}"'
+
+        if mode == "not_equal":
+            if len(id_values) > 1 and random.random() < 0.6:
+                target = random.choice(id_values)
+            else:
+                target = fake_id
+            return Filter.by_id().not_equal(target), id_series != target, f'id != "{target}"'
+
+        if mode == "contains_any_present":
+            sample_size = min(len(set(id_values)), random.randint(1, 3))
+            targets = random.sample(list(set(id_values)), sample_size)
+            if random.random() < 0.5:
+                targets.append(fake_id)
+            targets = list(dict.fromkeys(targets))
+            return Filter.by_id().contains_any(targets), id_series.isin(targets), f"id contains_any {targets}"
+
+        if mode == "contains_any_absent":
+            targets = [fake_id]
+            return Filter.by_id().contains_any(targets), id_series.isin(targets), f"id contains_any {targets}"
+
+        sample_size = min(len(set(id_values)), random.randint(1, 3))
+        targets = random.sample(list(set(id_values)), sample_size)
+        if random.random() < 0.5:
+            targets.append(fake_id)
+        targets = list(dict.fromkeys(targets))
+        return Filter.by_id().contains_none(targets), ~id_series.isin(targets), f"id contains_none {targets}"
+
+    def _property_length_series(self, name, ftype):
+        series = self.df[name]
+
+        def length_of(value):
+            if value is None:
+                return 0
+            try:
+                if pd.isna(value):
+                    return 0
+            except Exception:
+                pass
+            if ftype == FieldType.TEXT:
+                return len(str(value))
+            if isinstance(value, list):
+                return len(value)
+            return 0
+
+        return series.apply(length_of).astype(int)
+
+    def gen_property_length_expr(self):
+        fields = self.property_length_schema[:]
+        random.shuffle(fields)
+        for field in fields:
+            name, ftype = field["name"], field["type"]
+            lengths = self._property_length_series(name, ftype)
+            if lengths.empty:
+                continue
+            observed_lengths = sorted(set(int(v) for v in lengths.tolist()))
+            target_pool = list(dict.fromkeys(observed_lengths + [0, 1, 2, max(observed_lengths) + 1]))
+            target = int(random.choice(target_pool))
+            op = random.choice(["equal", "not_equal", "less_than", "less_or_equal", "greater_than", "greater_or_equal"])
+            base = Filter.by_property(name, length=True)
+            if op == "equal":
+                return base.equal(target), lengths == target, f"len({name}) == {target}"
+            if op == "not_equal":
+                return base.not_equal(target), lengths != target, f"len({name}) != {target}"
+            if op == "less_than":
+                return base.less_than(target), lengths < target, f"len({name}) < {target}"
+            if op == "less_or_equal":
+                return base.less_or_equal(target), lengths <= target, f"len({name}) <= {target}"
+            if op == "greater_than":
+                return base.greater_than(target), lengths > target, f"len({name}) > {target}"
+            return base.greater_or_equal(target), lengths >= target, f"len({name}) >= {target}"
+        return None, None, None
+
+    def _creation_time_values(self):
+        if self.creation_time_series is None:
+            return []
+        values = self.creation_time_series.dropna().tolist()
+        uniq = []
+        seen = set()
+        for value in values:
+            ts = pd.Timestamp(value)
+            key = ts.isoformat()
+            if key not in seen:
+                seen.add(key)
+                uniq.append(ts)
+        return uniq
+
+    def _creation_time_cmp_mask(self, op, target):
+        if self.creation_time_series is None:
+            return pd.Series(False, index=self.df.index)
+        target_ts = pd.Timestamp(target)
+        if target_ts.tzinfo is None:
+            target_ts = target_ts.tz_localize("UTC")
+        else:
+            target_ts = target_ts.tz_convert("UTC")
+        series = self.creation_time_series
+        if op == "==":
+            return series == target_ts
+        if op == "!=":
+            return series != target_ts
+        if op == "<":
+            return series < target_ts
+        if op == "<=":
+            return series <= target_ts
+        if op == ">":
+            return series > target_ts
+        return series >= target_ts
+
+    def gen_creation_time_expr(self):
+        values = self._creation_time_values()
+        if not values:
+            return None, None, None
+
+        fake_old = min(values) - pd.Timedelta(days=365)
+        fake_future = max(values) + pd.Timedelta(days=365)
+        mode = random.choice(
+            ["equal", "not_equal", "less_than", "less_or_equal", "greater_than", "greater_or_equal", "contains_any", "contains_none"]
+        )
+
+        if mode == "equal":
+            target = random.choice(values)
+            return (
+                Filter.by_creation_time().equal(target.to_pydatetime()),
+                self._creation_time_cmp_mask("==", target),
+                f"creation_time == {target.isoformat()}",
+            )
+
+        if mode == "not_equal":
+            target = random.choice(values) if random.random() < 0.6 else fake_future
+            return (
+                Filter.by_creation_time().not_equal(target.to_pydatetime()),
+                self._creation_time_cmp_mask("!=", target),
+                f"creation_time != {target.isoformat()}",
+            )
+
+        if mode == "less_than":
+            target = random.choice(values + [fake_future])
+            return (
+                Filter.by_creation_time().less_than(target.to_pydatetime()),
+                self._creation_time_cmp_mask("<", target),
+                f"creation_time < {target.isoformat()}",
+            )
+
+        if mode == "less_or_equal":
+            target = random.choice(values + [fake_future])
+            return (
+                Filter.by_creation_time().less_or_equal(target.to_pydatetime()),
+                self._creation_time_cmp_mask("<=", target),
+                f"creation_time <= {target.isoformat()}",
+            )
+
+        if mode == "greater_than":
+            target = random.choice(values + [fake_old])
+            return (
+                Filter.by_creation_time().greater_than(target.to_pydatetime()),
+                self._creation_time_cmp_mask(">", target),
+                f"creation_time > {target.isoformat()}",
+            )
+
+        if mode == "greater_or_equal":
+            target = random.choice(values + [fake_old])
+            return (
+                Filter.by_creation_time().greater_or_equal(target.to_pydatetime()),
+                self._creation_time_cmp_mask(">=", target),
+                f"creation_time >= {target.isoformat()}",
+            )
+
+        if mode == "contains_any":
+            sample_size = min(len(values), random.randint(1, 3))
+            targets = random.sample(values, sample_size)
+            if random.random() < 0.5:
+                targets.append(fake_future)
+            uniq_targets = []
+            seen = set()
+            for target in targets:
+                key = target.isoformat()
+                if key not in seen:
+                    seen.add(key)
+                    uniq_targets.append(target)
+            return (
+                Filter.by_creation_time().contains_any([target.to_pydatetime() for target in uniq_targets]),
+                self.creation_time_series.isin(uniq_targets),
+                f"creation_time contains_any {[target.isoformat() for target in uniq_targets]}",
+            )
+
+        sample_size = min(len(values), random.randint(1, 3))
+        targets = random.sample(values, sample_size)
+        if random.random() < 0.5:
+            targets.append(fake_old)
+        uniq_targets = []
+        seen = set()
+        for target in targets:
+            key = target.isoformat()
+            if key not in seen:
+                seen.add(key)
+                uniq_targets.append(target)
+        return (
+            Filter.by_creation_time().contains_none([target.to_pydatetime() for target in uniq_targets]),
+            ~self.creation_time_series.isin(uniq_targets),
+            f"creation_time contains_none {[target.isoformat() for target in uniq_targets]}",
+        )
+
+    def _update_time_values(self):
+        if self.update_time_series is None:
+            return []
+        values = self.update_time_series.dropna().tolist()
+        uniq = []
+        seen = set()
+        for value in values:
+            ts = pd.Timestamp(value)
+            key = ts.isoformat()
+            if key not in seen:
+                seen.add(key)
+                uniq.append(ts)
+        return uniq
+
+    def _update_time_cmp_mask(self, op, target):
+        if self.update_time_series is None:
+            return pd.Series(False, index=self.df.index)
+        target_ts = pd.Timestamp(target)
+        if target_ts.tzinfo is None:
+            target_ts = target_ts.tz_localize("UTC")
+        else:
+            target_ts = target_ts.tz_convert("UTC")
+        series = self.update_time_series
+        if op == "==":
+            return series == target_ts
+        if op == "!=":
+            return series != target_ts
+        if op == "<":
+            return series < target_ts
+        if op == "<=":
+            return series <= target_ts
+        if op == ">":
+            return series > target_ts
+        return series >= target_ts
+
+    def gen_update_time_expr(self):
+        values = self._update_time_values()
+        if not values:
+            return None, None, None
+
+        fake_old = min(values) - pd.Timedelta(days=365)
+        fake_future = max(values) + pd.Timedelta(days=365)
+        mode = random.choice(
+            ["equal", "not_equal", "less_than", "less_or_equal", "greater_than", "greater_or_equal", "contains_any", "contains_none"]
+        )
+
+        if mode == "equal":
+            target = random.choice(values)
+            return (
+                Filter.by_update_time().equal(target.to_pydatetime()),
+                self._update_time_cmp_mask("==", target),
+                f"update_time == {target.isoformat()}",
+            )
+
+        if mode == "not_equal":
+            target = random.choice(values) if random.random() < 0.6 else fake_future
+            return (
+                Filter.by_update_time().not_equal(target.to_pydatetime()),
+                self._update_time_cmp_mask("!=", target),
+                f"update_time != {target.isoformat()}",
+            )
+
+        if mode == "less_than":
+            target = random.choice(values + [fake_future])
+            return (
+                Filter.by_update_time().less_than(target.to_pydatetime()),
+                self._update_time_cmp_mask("<", target),
+                f"update_time < {target.isoformat()}",
+            )
+
+        if mode == "less_or_equal":
+            target = random.choice(values + [fake_future])
+            return (
+                Filter.by_update_time().less_or_equal(target.to_pydatetime()),
+                self._update_time_cmp_mask("<=", target),
+                f"update_time <= {target.isoformat()}",
+            )
+
+        if mode == "greater_than":
+            target = random.choice(values + [fake_old])
+            return (
+                Filter.by_update_time().greater_than(target.to_pydatetime()),
+                self._update_time_cmp_mask(">", target),
+                f"update_time > {target.isoformat()}",
+            )
+
+        if mode == "greater_or_equal":
+            target = random.choice(values + [fake_old])
+            return (
+                Filter.by_update_time().greater_or_equal(target.to_pydatetime()),
+                self._update_time_cmp_mask(">=", target),
+                f"update_time >= {target.isoformat()}",
+            )
+
+        if mode == "contains_any":
+            sample_size = min(len(values), random.randint(1, 3))
+            targets = random.sample(values, sample_size)
+            if random.random() < 0.5:
+                targets.append(fake_future)
+            uniq_targets = []
+            seen = set()
+            for target in targets:
+                key = target.isoformat()
+                if key not in seen:
+                    seen.add(key)
+                    uniq_targets.append(target)
+            return (
+                Filter.by_update_time().contains_any([target.to_pydatetime() for target in uniq_targets]),
+                self.update_time_series.isin(uniq_targets),
+                f"update_time contains_any {[target.isoformat() for target in uniq_targets]}",
+            )
+
+        sample_size = min(len(values), random.randint(1, 3))
+        targets = random.sample(values, sample_size)
+        if random.random() < 0.5:
+            targets.append(fake_old)
+        uniq_targets = []
+        seen = set()
+        for target in targets:
+            key = target.isoformat()
+            if key not in seen:
+                seen.add(key)
+                uniq_targets.append(target)
+        return (
+            Filter.by_update_time().contains_none([target.to_pydatetime() for target in uniq_targets]),
+            ~self.update_time_series.isin(uniq_targets),
+            f"update_time contains_none {[target.isoformat() for target in uniq_targets]}",
+        )
+
     def gen_nested_object_expr(self):
         """Nested Object 查询 (对标 Milvus gen_json_advanced_expr)
         NOTE: Weaviate 当前版本对 OBJECT 类型仅可靠使用 is_none(True)
@@ -1142,7 +1986,7 @@ class OracleQueryGenerator:
         """NOT 表达式 — 使用 Filter.not_() 包装
         WORKAROUND: Weaviate NOT 包含 null 行 (与 SQL 三值逻辑不同)
         """
-        non_obj = [f for f in self.schema if f["type"] != FieldType.OBJECT]
+        non_obj = [f for f in self.schema if f["type"] not in (FieldType.OBJECT, FieldType.GEO)]
         obj_fields = [f for f in self.schema if f["type"] == FieldType.OBJECT]
         if ENABLE_NULL_FILTER and obj_fields and (not non_obj or random.random() < 0.12):
             f = random.choice(obj_fields)
@@ -1227,8 +2071,90 @@ class OracleQueryGenerator:
         return None, None, None
 
     def gen_atomic_expr(self):
+        if random.random() < 0.10:
+            res = self.gen_id_expr()
+            if res[0] is not None:
+                return res
+
+        if self.creation_time_series is not None and random.random() < 0.10:
+            res = self.gen_creation_time_expr()
+            if res[0] is not None:
+                return res
+
+        if self.update_time_series is not None and random.random() < 0.10:
+            res = self.gen_update_time_expr()
+            if res[0] is not None:
+                return res
+
+        if self.property_length_schema and random.random() < 0.12:
+            res = self.gen_property_length_expr()
+            if res[0] is not None:
+                return res
+
+        if self.like_text_schema and random.random() < 0.24:
+            f = random.choice(self.like_text_schema)
+            name = f["name"]
+            series = self.df[name]
+            sv = self.get_value_for_query(name, FieldType.TEXT)
+            if sv is not None:
+                sv = str(sv)
+                if random.random() < 0.40:
+                    mode = random.choice(["contains_any", "contains_all", "contains_none"])
+                    if mode == "contains_all":
+                        targets = [sv]
+                    else:
+                        targets = [sv]
+                        if random.random() < 0.55:
+                            targets.append(''.join(random.choices(string.ascii_letters, k=30)))
+                    target_set = set(targets)
+                    if mode == "contains_any":
+                        mask = series.apply(
+                            lambda x, vals=target_set: str(x) in vals
+                            if not self._is_effectively_null_value(x, FieldType.TEXT)
+                            else False
+                        )
+                        return Filter.by_property(name).contains_any(targets), mask, f"{name} contains_any {targets}"
+                    if mode == "contains_all":
+                        mask = series.apply(
+                            lambda x, vals=targets: all(str(x) == value for value in vals)
+                            if not self._is_effectively_null_value(x, FieldType.TEXT)
+                            else False
+                        )
+                        return Filter.by_property(name).contains_all(targets), mask, f"{name} contains_all {targets}"
+                    mask = series.apply(
+                        lambda x, vals=target_set: str(x) not in vals
+                        if not self._is_effectively_null_value(x, FieldType.TEXT)
+                        else True
+                    )
+                    return Filter.by_property(name).contains_none(targets), mask, f"{name} contains_none {targets}"
+                op = random.choice(["like_prefix", "like_suffix", "like_contains", "like_single"])
+                if op == "like_prefix":
+                    k = random.randint(1, min(4, max(1, len(sv))))
+                    prefix = ''.join(c for c in sv[:k] if c.isalnum()) or "a"
+                    return Filter.by_property(name).like(f"{prefix}*"), series.apply(lambda x, p=prefix: str(x).startswith(p) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False), f'{name} like "{prefix}*"'
+                elif op == "like_suffix" and len(sv) >= 2:
+                    k = random.randint(1, min(4, len(sv)))
+                    suffix = ''.join(c for c in sv[-k:] if c.isalnum()) or "z"
+                    return Filter.by_property(name).like(f"*{suffix}"), series.apply(lambda x, s=suffix: str(x).endswith(s) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False), f'{name} like "*{suffix}"'
+                elif op == "like_contains" and len(sv) >= 3:
+                    i_start = random.randint(0, len(sv) - 2)
+                    j_end = random.randint(i_start + 1, min(i_start + 5, len(sv)))
+                    sub = ''.join(c for c in sv[i_start:j_end] if c.isalnum()) or "a"
+                    return Filter.by_property(name).like(f"*{sub}*"), series.apply(lambda x, s=sub: s in str(x) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False), f'{name} like "*{sub}*"'
+                elif op == "like_single" and len(sv) >= 2:
+                    pos = random.randint(0, len(sv) - 1)
+                    pat = sv[:pos] + "?" + sv[pos+1:]
+                    import re as _re
+                    regex = _re.compile("^" + _re.escape(sv[:pos]) + "." + _re.escape(sv[pos+1:]) + "$")
+                    return Filter.by_property(name).like(pat), series.apply(lambda x, r=regex: bool(r.match(str(x))) if x is not None and not (isinstance(x, float) and np.isnan(x)) else False), f'{name} like "{pat}"'
+
+        if self.geo_schema and random.random() < 0.12:
+            res = self.gen_geo_expr()
+            if res[0] is not None:
+                return res
+
         # 标量优先，降低数组/OBJECT 语义噪声对 Oracle 的影响
-        non_obj = [f for f in self.schema if f["type"] != FieldType.OBJECT]
+        non_obj = [f for f in self.schema if f["type"] not in (FieldType.OBJECT, FieldType.GEO)]
         if self.scalar_schema and random.random() < SCALAR_QUERY_PRIORITY:
             filterable_schema = self.scalar_schema
         else:
@@ -1602,6 +2528,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
 class PQSQueryGenerator(OracleQueryGenerator):
     def __init__(self, dm):
         super().__init__(dm)
+        self.geo_schema = []
         self._tautology_field = self._find_tautology_field()
 
     def _find_tautology_field(self):
@@ -1781,6 +2708,8 @@ class PQSQueryGenerator(OracleQueryGenerator):
         filters, exprs = [], []
         for f in fields:
             fname, ftype = f["name"], f["type"]
+            if ftype == FieldType.GEO:
+                continue
             val = row.get(fname)
             is_null = val is None or (isinstance(val, float) and np.isnan(val))
             if is_null:
@@ -1816,8 +2745,162 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
     def gen_true_atomic(self, row):
         """Enhanced: multi-strategy boundary generation for PQS"""
+        row_id = row.get("id")
+        if row_id is not None and random.random() < 0.18:
+            row_id = str(row_id)
+            fake_id = self._random_absent_uuid()
+            id_strat = random.choice(
+                ["equal", "contains_any_self", "contains_any_noise", "not_equal_fake", "contains_none_fake"]
+            )
+            if id_strat == "equal":
+                return Filter.by_id().equal(row_id), f'id == "{row_id}"'
+            if id_strat == "contains_any_self":
+                return Filter.by_id().contains_any([row_id]), f'id contains_any ["{row_id}"]'
+            if id_strat == "contains_any_noise":
+                return Filter.by_id().contains_any([row_id, fake_id]), f'id contains_any ["{row_id}", "{fake_id}"]'
+            if id_strat == "not_equal_fake":
+                return Filter.by_id().not_equal(fake_id), f'id != "{fake_id}"'
+            return Filter.by_id().contains_none([fake_id]), f'id contains_none ["{fake_id}"]'
+
+        row_creation_time = row.get("_creation_time")
+        if row_creation_time is not None and random.random() < 0.16:
+            try:
+                creation_time = pd.Timestamp(row_creation_time)
+                if pd.isna(creation_time):
+                    creation_time = None
+            except Exception:
+                creation_time = None
+            if creation_time is not None:
+                if creation_time.tzinfo is None:
+                    creation_time = creation_time.tz_localize("UTC")
+                else:
+                    creation_time = creation_time.tz_convert("UTC")
+                before = creation_time - pd.Timedelta(seconds=1)
+                after = creation_time + pd.Timedelta(seconds=1)
+                fake_future = creation_time + pd.Timedelta(days=365)
+                strat = random.choice(
+                    ["equal", "contains_any_self", "contains_any_noise", "not_equal_fake", "contains_none_fake", "greater_than_before", "less_than_after", "greater_or_equal", "less_or_equal"]
+                )
+                if strat == "equal":
+                    return Filter.by_creation_time().equal(creation_time.to_pydatetime()), f"creation_time == {creation_time.isoformat()}"
+                if strat == "contains_any_self":
+                    return Filter.by_creation_time().contains_any([creation_time.to_pydatetime()]), f"creation_time contains_any [{creation_time.isoformat()}]"
+                if strat == "contains_any_noise":
+                    return Filter.by_creation_time().contains_any([creation_time.to_pydatetime(), fake_future.to_pydatetime()]), f"creation_time contains_any [{creation_time.isoformat()}, {fake_future.isoformat()}]"
+                if strat == "not_equal_fake":
+                    return Filter.by_creation_time().not_equal(fake_future.to_pydatetime()), f"creation_time != {fake_future.isoformat()}"
+                if strat == "contains_none_fake":
+                    return Filter.by_creation_time().contains_none([fake_future.to_pydatetime()]), f"creation_time contains_none [{fake_future.isoformat()}]"
+                if strat == "greater_than_before":
+                    return Filter.by_creation_time().greater_than(before.to_pydatetime()), f"creation_time > {before.isoformat()}"
+                if strat == "less_than_after":
+                    return Filter.by_creation_time().less_than(after.to_pydatetime()), f"creation_time < {after.isoformat()}"
+                if strat == "greater_or_equal":
+                    return Filter.by_creation_time().greater_or_equal(creation_time.to_pydatetime()), f"creation_time >= {creation_time.isoformat()}"
+                return Filter.by_creation_time().less_or_equal(creation_time.to_pydatetime()), f"creation_time <= {creation_time.isoformat()}"
+
+        row_update_time = row.get("_update_time")
+        if row_update_time is not None and random.random() < 0.16:
+            try:
+                update_time = pd.Timestamp(row_update_time)
+                if pd.isna(update_time):
+                    update_time = None
+            except Exception:
+                update_time = None
+            if update_time is not None:
+                if update_time.tzinfo is None:
+                    update_time = update_time.tz_localize("UTC")
+                else:
+                    update_time = update_time.tz_convert("UTC")
+                before = update_time - pd.Timedelta(seconds=1)
+                after = update_time + pd.Timedelta(seconds=1)
+                fake_future = update_time + pd.Timedelta(days=365)
+                strat = random.choice(
+                    ["equal", "contains_any_self", "contains_any_noise", "not_equal_fake", "contains_none_fake", "greater_than_before", "less_than_after", "greater_or_equal", "less_or_equal"]
+                )
+                if strat == "equal":
+                    return Filter.by_update_time().equal(update_time.to_pydatetime()), f"update_time == {update_time.isoformat()}"
+                if strat == "contains_any_self":
+                    return Filter.by_update_time().contains_any([update_time.to_pydatetime()]), f"update_time contains_any [{update_time.isoformat()}]"
+                if strat == "contains_any_noise":
+                    return Filter.by_update_time().contains_any([update_time.to_pydatetime(), fake_future.to_pydatetime()]), f"update_time contains_any [{update_time.isoformat()}, {fake_future.isoformat()}]"
+                if strat == "not_equal_fake":
+                    return Filter.by_update_time().not_equal(fake_future.to_pydatetime()), f"update_time != {fake_future.isoformat()}"
+                if strat == "contains_none_fake":
+                    return Filter.by_update_time().contains_none([fake_future.to_pydatetime()]), f"update_time contains_none [{fake_future.isoformat()}]"
+                if strat == "greater_than_before":
+                    return Filter.by_update_time().greater_than(before.to_pydatetime()), f"update_time > {before.isoformat()}"
+                if strat == "less_than_after":
+                    return Filter.by_update_time().less_than(after.to_pydatetime()), f"update_time < {after.isoformat()}"
+                if strat == "greater_or_equal":
+                    return Filter.by_update_time().greater_or_equal(update_time.to_pydatetime()), f"update_time >= {update_time.isoformat()}"
+                return Filter.by_update_time().less_or_equal(update_time.to_pydatetime()), f"update_time <= {update_time.isoformat()}"
+
+        pl_fields = self.property_length_schema[:]
+        random.shuffle(pl_fields)
+        for field in pl_fields:
+            fname, ftype = field["name"], field["type"]
+            value = row.get(fname)
+            if value is None:
+                length = 0
+            elif ftype == FieldType.TEXT:
+                length = len(str(value))
+            elif isinstance(value, list):
+                length = len(value)
+            else:
+                length = 0
+            base = Filter.by_property(fname, length=True)
+            strat = random.choice(["equal", "greater_or_equal", "less_or_equal", "not_equal_fake"])
+            if strat == "equal":
+                return base.equal(length), f"len({fname}) == {length}"
+            if strat == "greater_or_equal":
+                return base.greater_or_equal(length), f"len({fname}) >= {length}"
+            if strat == "less_or_equal":
+                return base.less_or_equal(length), f"len({fname}) <= {length}"
+            fake = length + random.choice([1, 2, 3])
+            return base.not_equal(fake), f"len({fname}) != {fake}"
+
+        text_fields = self.like_text_schema[:]
+        random.shuffle(text_fields)
+        for field in text_fields:
+            fname = field["name"]
+            val = row.get(fname)
+            if val is None or (isinstance(val, float) and np.isnan(val)):
+                continue
+            sv = str(val)
+            strat = random.choice(["contains_any_self", "contains_all_self", "contains_any_noise", "contains_none_noise", "like_prefix", "like_suffix", "like_contains", "like_single", "eq"])
+            if strat == "contains_any_self":
+                return Filter.by_property(fname).contains_any([sv]), f'{fname} contains_any ["{sv}"]'
+            elif strat == "contains_all_self":
+                return Filter.by_property(fname).contains_all([sv]), f'{fname} contains_all ["{sv}"]'
+            elif strat == "contains_any_noise":
+                fake = ''.join(random.choices(string.ascii_letters, k=30))
+                return Filter.by_property(fname).contains_any([sv, fake]), f'{fname} contains_any ["{sv}", "{fake}"]'
+            elif strat == "contains_none_noise":
+                fake = ''.join(random.choices(string.ascii_letters, k=30))
+                while fake == sv:
+                    fake = ''.join(random.choices(string.ascii_letters, k=30))
+                return Filter.by_property(fname).contains_none([fake]), f'{fname} contains_none ["{fake}"]'
+            if strat == "like_prefix" and len(sv) >= 1:
+                k = random.randint(1, min(4, len(sv)))
+                return Filter.by_property(fname).like(sv[:k] + "*"), f'{fname} like "{sv[:k]}*"'
+            elif strat == "like_suffix" and len(sv) >= 2:
+                k = random.randint(1, min(4, len(sv)))
+                return Filter.by_property(fname).like("*" + sv[-k:]), f'{fname} like "*{sv[-k:]}"'
+            elif strat == "like_contains" and len(sv) >= 3:
+                i = random.randint(0, len(sv) - 2)
+                j = random.randint(i + 1, min(i + 5, len(sv)))
+                return Filter.by_property(fname).like("*" + sv[i:j] + "*"), f'{fname} like "*{sv[i:j]}*"'
+            elif strat == "like_single" and len(sv) >= 2:
+                p = random.randint(0, len(sv) - 1)
+                pat = sv[:p] + "?" + sv[p+1:]
+                return Filter.by_property(fname).like(pat), f'{fname} like "{pat}"'
+            return Filter.by_property(fname).equal(sv), f'{fname} == "{sv}"'
+
         for field in random.sample(self.schema, len(self.schema)):
             fname, ftype = field["name"], field["type"]
+            if ftype == FieldType.GEO:
+                continue
             val = row.get(fname)
             is_null = val is None or (isinstance(val, float) and np.isnan(val))
             if is_null:
@@ -1832,11 +2915,13 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).not_equal(not bool(val)), f"{fname} != {not bool(val)}"
             elif ftype == FieldType.INT:
                 vi = int(val)
-                strat = random.choice(["eq", "ge_self", "lt_above", "range_tight", "range_pm1", "not_lt", "neq_fake"])
+                strat = random.choice(["eq", "ge_self", "le_self", "lt_above", "range_tight", "range_pm1", "not_lt", "neq_fake"])
                 if strat == "eq":
                     return Filter.by_property(fname).equal(vi), f"{fname} == {vi}"
                 elif strat == "ge_self":
                     return Filter.by_property(fname).greater_or_equal(vi), f"{fname} >= {vi}"
+                elif strat == "le_self":
+                    return Filter.by_property(fname).less_or_equal(vi), f"{fname} <= {vi}"
                 elif strat == "lt_above":
                     if vi < WEAVIATE_SAFE_INT_MAX:
                         upper = clamp_weaviate_int(vi + 1)
@@ -1853,14 +2938,18 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).not_equal(fake) & Filter.by_property(fname).equal(vi), f"{fname} != {fake} AND {fname} == {vi}"
             elif ftype == FieldType.NUMBER:
                 vf = float(val)
-                strat = random.choice(["ge_self", "lt_above", "range", "not_gt"])
+                strat = random.choice(["ge_self", "le_self", "lt_above", "gt_below", "range", "not_gt"])
                 lo, hi = float_window(vf)
                 if lo is None:
                     continue
                 if strat == "ge_self":
                     return Filter.by_property(fname).greater_or_equal(vf), f"{fname}>={vf}"
+                elif strat == "le_self":
+                    return Filter.by_property(fname).less_or_equal(vf), f"{fname}<={vf}"
                 elif strat == "lt_above":
                     return Filter.by_property(fname).less_than(hi), f"{fname}<{hi}"
+                elif strat == "gt_below":
+                    return Filter.by_property(fname).greater_than(lo), f"{fname}>{lo}"
                 elif strat == "range":
                     return Filter.by_property(fname).greater_or_equal(lo) & Filter.by_property(fname).less_or_equal(hi), f"{fname} ≈ {vf}"
                 else:
@@ -1890,27 +2979,56 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 else:
                     return Filter.by_property(fname).equal(sv), f'{fname} == "{sv}"'
             elif ftype == FieldType.DATE:
-                strat = random.choice(["eq", "ge_self", "lt_above"])
+                strat = random.choice(["eq", "ge_self", "le_self", "lt_above", "gt_below"])
                 if strat == "ge_self":
                     return Filter.by_property(fname).greater_or_equal(str(val)), f'{fname} >= "{val}"'
+                if strat == "le_self":
+                    return Filter.by_property(fname).less_or_equal(str(val)), f'{fname} <= "{val}"'
                 if strat == "lt_above":
                     ts = to_utc_timestamp(val)
                     if ts is not None:
-                        upper = (ts + pd.Timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+                        upper = format_rfc3339_timestamp(ts + pd.Timedelta(microseconds=1))
                         return Filter.by_property(fname).less_than(upper), f'{fname} < "{upper}"'
+                if strat == "gt_below":
+                    ts = to_utc_timestamp(val)
+                    if ts is not None:
+                        lower = format_rfc3339_timestamp(ts - pd.Timedelta(microseconds=1))
+                        return Filter.by_property(fname).greater_than(lower), f'{fname} > "{lower}"'
                 return Filter.by_property(fname).equal(str(val)), f'{fname} == "{val}"'
             elif ftype in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY]:
                 if not isinstance(val, list) or not val: continue
                 items = [x for x in val if x is not None]
                 # Tokenization.FIELD: 不需要停用词过滤
                 if items:
-                    strat = random.choice(["contains_any", "contains_all", "contains_any_noise"])
+                    strat = random.choice(["contains_any", "contains_all", "contains_any_noise", "contains_none_noise"])
                     if strat == "contains_any":
                         t = self._convert_to_native(random.choice(items))
                         return Filter.by_property(fname).contains_any([t]), f"{fname} contains {t}"
                     elif strat == "contains_all" and len(items) >= 2:
                         subset = [self._convert_to_native(x) for x in random.sample(items, min(2, len(items)))]
                         return Filter.by_property(fname).contains_all(subset), f"{fname} contains_all {subset}"
+                    elif strat == "contains_none_noise":
+                        item_set = set(items)
+                        if ftype == FieldType.INT_ARRAY:
+                            fake = -999999
+                            while fake in item_set:
+                                fake -= 1
+                        elif ftype == FieldType.NUMBER_ARRAY:
+                            fake = -999999.999
+                            while fake in item_set:
+                                fake -= 1.0
+                        elif ftype == FieldType.BOOL_ARRAY:
+                            remaining = [b for b in [True, False] if b not in item_set]
+                            if not remaining:
+                                t = self._convert_to_native(random.choice(items))
+                                return Filter.by_property(fname).contains_any([t]), f"{fname} contains {t}"
+                            fake = remaining[0]
+                        else:
+                            fake = "__fake__"
+                            while fake in item_set:
+                                fake += "_x"
+                        fake = self._convert_to_native(fake)
+                        return Filter.by_property(fname).contains_none([fake]), f"{fname} contains_none [{fake}]"
                     else:  # contains_any_noise
                         t = self._convert_to_native(random.choice(items))
                         # Use type-correct fake values to avoid pydantic validation errors
@@ -1961,7 +3079,10 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
     wm.connect()
     try:
         dm.filterable_fields = wm.reset_collection(dm.schema_config)
+        dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set())
         wm.insert(dm)
+        wm.sync_creation_times(dm)
+        wm.sync_update_times(dm)
         ts = int(time.time())
         logf = make_log_path(f"weaviate_fuzz_test_{ts}.log")
         repro_cmd = format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)
@@ -2043,9 +3164,11 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                             dm.vectors = np.vstack([dm.vectors, np.array(vecs)])
                             dm.normalize_dataframe_types()
                             dynamic_ids.update(r["id"] for r in rows)
-                            qg = OracleQueryGenerator(dm)
                             flog(f"[Dyn] Inserted {bc}")
                             time.sleep(SLEEP_INTERVAL * 2)  # Allow index to stabilize
+                            wm.sync_creation_times(dm, ids=[r["id"] for r in rows])
+                            wm.sync_update_times(dm, ids=[r["id"] for r in rows])
+                            qg = OracleQueryGenerator(dm)
                         except Exception as e:
                             flog(f"[Dyn] Insert fail: {e}")
                     elif op == "delete":
@@ -2119,9 +3242,10 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                         flog(f"[Dyn] Update verified {uid}")
                                 except Exception:
                                     pass
-                                qg = OracleQueryGenerator(dm)
                                 flog(f"[Dyn] Updated {uid}")
                                 time.sleep(SLEEP_INTERVAL * 2)
+                                wm.sync_update_times(dm, ids=[uid])
+                                qg = OracleQueryGenerator(dm)
                             except Exception as e:
                                 flog(f"[Dyn] Update fail: {e}")
                     elif op == "upsert":
@@ -2160,9 +3284,11 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                 dm.df = pd.concat([dm.df, dm.rows_to_dataframe(new_rows)], ignore_index=True)
                                 dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
                             dm.normalize_dataframe_types()
-                            qg = OracleQueryGenerator(dm)
                             flog(f"[Dyn] Upserted {len(upsert_rows)} (new:{len(new_rows)})")
                             time.sleep(SLEEP_INTERVAL * 2)  # Allow index to stabilize
+                            wm.sync_creation_times(dm, ids=[r["id"] for r in upsert_rows])
+                            wm.sync_update_times(dm, ids=[r["id"] for r in upsert_rows])
+                            qg = OracleQueryGenerator(dm)
                         except Exception as e:
                             flog(f"[Dyn] Upsert fail: {e}")
 
@@ -2393,7 +3519,7 @@ def run_equivalence_mode(rounds=100, seed=None):
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set()); wm.insert(dm); wm.sync_creation_times(dm); wm.sync_update_times(dm)
         qg = EquivalenceQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         fails = []
@@ -2450,7 +3576,7 @@ def run_pqs_mode(rounds=100, seed=None):
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set()); wm.insert(dm); wm.sync_creation_times(dm); wm.sync_update_times(dm)
         pqs = PQSQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         errs, ok, skip = [], 0, 0
@@ -2507,7 +3633,7 @@ def run_groupby_mode(rounds=100, seed=None):
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        dm.filterable_fields = wm.reset_collection(dm.schema_config); wm.insert(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set()); wm.insert(dm)
         col = wm.client.collections.get(CLASS_NAME)
         errs, ok = [], 0
         # Find groupable scalar fields (must be filterable/indexed)

@@ -1,0 +1,28 @@
+operator_id: within_geo_range
+family: geo_spatial
+syntax_examples:
+  - 'Filter.by_property("headquartersGeoLocation").within_geo_range(coordinate=GeoCoordinate(latitude=52.39, longitude=4.84), distance=1000)'
+  - 'Filter.by_property("location").within_geo_range(coordinate=GeoCoordinate(latitude=0.0, longitude=179.9995), distance=250)'
+  - 'where: { path: ["headquartersGeoLocation"], operator: WithinGeoRange, valueGeoRange: { geoCoordinates: { latitude: 52.3932696, longitude: 4.8374263 }, distance: { max: 1000 } } }'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/config-refs/datatypes"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - geo_coordinates
+doc_semantics: "WithinGeoRange is a documented geo-coordinate filter for `geoCoordinates` properties. It matches objects whose stored latitude/longitude falls within the requested maximum distance in meters from the supplied query coordinate."
+doc_notes:
+  - "The checked filters documentation gives Python, GraphQL, and client examples for `within_geo_range` / `WithinGeoRange` on a geo-coordinate property."
+  - "The checked datatype reference defines `geoCoordinates` as latitude/longitude decimal degrees and says the type can be used to find objects in a radius around a query location."
+  - "The checked docs say geo-coordinate filtering is currently limited to the nearest 800 results from the source location, before further reduction by additional filters or search parameters."
+  - "The checked docs do not provide an explicit null or missing-property truth table for geo filters."
+  - "The checked docs do not spell out boundary inclusion, zero-distance behavior, or anti-meridian wraparound semantics."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `within_geo_range_operator.py` validated the conservative positive-radius subset on dedicated collections: a 1000 m query around `(0.0, 0.0)` returned the center point, an inside point at about 500 m, and a boundary point at about 1000 m; a 600 m query excluded null, omitted, and farther geo rows; and a dateline-centered query around `179.9995` matched both `179.9990` and `-179.9990`. A second crowded collection confirmed the documented implementation limit: a wide-radius query over 805 monotonic-distance rows returned exactly the nearest 800 rows, and combining that geo filter with an additional text filter for rows `801..805` returned an empty result. Later focused `within_geo_range_zero_update_operator.py` checks showed that a 0 m query is not a sound exact-coordinate oracle: after repeated replace-style updates, and also when the same observed coordinate pairs were inserted statically, 0 m queries returned additional rows whose locally computed distances were about 0.001 m to 0.014 m from the query coordinate. This means the earlier single exact-center 0 m observation is too narrow for oracle use. Pre-refinement oracle runs exposed small-radius boundary sensitivity when radii landed on or very near stored-point distances; after the conservative 800-cap plus guarded-positive-radius refinement, the fuzzer excludes radius 0 and avoids generated geo predicates whose cutoff sits on or very near stored-point distances, with geo still disabled as a PQS pivot-true primitive."
+oracle_support:
+  - pandas
+case_refs:
+  - issue4728
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/within_geo_range_operator.py"
+oracle_mapping: "Current fuzzer models `within_geo_range` in pandas by normalizing stored geo values to latitude/longitude pairs and applying a great-circle distance helper. Null, missing, or invalid geo values are treated as non-matches. Oracle mode emits `within_geo_range` only on `GEO_COORDINATES` fields when the raw geo candidate set is between 1 and 800 rows, matching the documented nearest-800 implementation limit, and it chooses strictly positive guarded radii from safe gaps between sorted distances so the cutoff does not sit on or very near stored-point distances. Radius 0 is intentionally excluded because local evidence shows Weaviate can return centimeter-near coordinates for 0 m queries, so exact-coordinate semantics are not a sound oracle assumption. PQS does not claim support for `within_geo_range`, because geo remains disabled as a pivot-true primitive there. The guarded-radius rule and `distance <= radius + 1e-6` check are oracle workarounds, not official claims. This is our oracle assumption, not an official claim."

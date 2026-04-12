@@ -1,0 +1,31 @@
+operator_id: property_length
+family: metadata_filter
+syntax_examples:
+  - 'Filter.by_property("answer", length=True).greater_than(20)'
+  - 'Filter.by_property("labelsArray", length=True).equal(0)'
+  - 'where: { path: ["len(answer)"], operator: GreaterThan, valueInt: 20 }'
+doc_status: metadata_entry_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index"
+doc_supported_types:
+  - text
+  - int_array
+  - text_array
+  - number_array
+  - bool_array
+doc_semantics: "property_length is a documented metadata-filter entry point that filters on `len(property)` / `length=True` rather than on the raw property value. The checked docs show comparison filtering by property length and state that this capability requires `indexPropertyLength` to be enabled."
+doc_notes:
+  - "The checked filters guide places property length under metadata filters and shows Python, JavaScript, Java, C#, and GraphQL examples using `Filter.by_property(..., length=True)` / `len(answer)`."
+  - "The checked inverted-index reference says `indexPropertyLength=true` indexes the length of each property and enables filtering by property length."
+  - "The checked filters guide uses a text example (`answer`) but does not provide a per-datatype truth table beyond the generic property-length description."
+  - "The checked docs do not provide a null, missing-property, empty-string, or empty-array truth table for property-length filtering."
+  - "The checked docs do not specify how property-length filtering interacts with per-property `indexFilterable` or `indexSearchable` settings."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `property_length_operator.py` validated the conservative subset on a temporary collection. For TEXT, `len(textField)==3` and `len(textField)>0` behaved as expected, while `len(textField)==0` matched not only an explicit empty string but also explicit null and missing properties. For arrays, `len(textArray)==2` matched element count, `len(textArray)==0` matched explicit empty, explicit null, and missing arrays, and `len(intArray)<=1` followed the same zero-for-null/missing rule. Boolean composition with `AND` and `NOT` matched the corresponding complement/intersection sets. A locally queryable search-only TEXT field (`index_filterable=False`, `index_searchable=True`) also supported property-length filtering and followed the same length-zero behavior. In contrast, a non-filterable INT_ARRAY length query raised a server-side query error (`bucket for prop ..._propertyLength not found - is it indexed?`), so that broader array subset is not claimed. Focused oracle and PQS regressions exercised `len(...)` predicates in generated expressions; fully passing runs were obtained for the claimed subset, and later whole-oracle failures remained attributable to pre-existing `within_geo_range(... <= 0.0m)` mismatches rather than to property-length predicates."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/property_length_operator.py"
+oracle_mapping: "Current fuzzer models property length in pandas as Python string length for TEXT and list length for arrays, with explicit null, missing properties, and empty values normalized to length 0 based on local observation. Direct random generation covers TEXT fields that are locally queryable via either `index_filterable` or `index_searchable`, plus filterable array fields. PQS uses pivot-true `len(field) == n`, `>= n`, `<= n`, and `!= fake_n` patterns over the same subset. Non-filterable arrays, objects, geo values, invalid property names, cross-reference paths, and undocumented per-type/index interactions are not claimed. The length-zero treatment for null and missing properties is a local oracle rule, not an official statement. This is our oracle assumption, not an official claim."

@@ -1,0 +1,28 @@
+operator_id: like
+family: text_pattern
+syntax_examples:
+  - 'Filter.by_property("fieldText").like("Alpha*")'
+  - 'Filter.by_property("fieldText").like("*Beta")'
+  - 'where: { path: ["title"], operator: Like, valueText: "*bird*" }'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+  - "https://docs.weaviate.io/weaviate/config-refs/schema"
+doc_supported_types:
+  - text
+doc_semantics: "Like is a documented where-filter operator for text values that filters based on partial matches; the official docs say `?` matches exactly one character, `*` matches zero or more characters, and wildcard characters cannot be matched literally."
+doc_notes:
+  - "The checked Filters guide documents Python-client `like(...)` usage for partial text matches and explains the wildcard semantics of `?` and `*`."
+  - "The checked GraphQL filter reference lists `Like` as a where-filter operator and documents `valueText` for text inputs."
+  - "The checked docs explicitly say that wildcard characters cannot be escaped, so `*` and `?` cannot be matched as literal characters."
+  - "The checked schema reference says tokenization influences where filters; `field` keeps the entire value as one token, while `word` lowercases and splits on non-alphanumeric characters."
+  - "The checked docs do not provide a Like-specific null or missing truth table, empty-string rule, precise searchable-vs-filterable index requirement, or a token-by-token truth table for non-FIELD tokenizations."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `like_operator.py` passed the validated FIELD-tokenized subset: case-sensitive prefix, suffix, infix, and single-character wildcard matching on full stored strings all returned the expected tag sets; a non-empty prefix pattern excluded explicit-null, omitted, and empty-string rows; and the documented literal-wildcard limitation was reproduced (`car*` matched multiple `car...` values rather than only the literal string `car*`). Observation-only checks exposed three important boundaries. First, `like(...)` also worked on a FIELD-text property created with `index_filterable=False` and `index_searchable=True`, so local queryability is broader than the previous filterable-only fuzzer subset. Second, WORD-tokenized `like(\"alpha*\")` matched a broader lowercased/tokenized set (`Alpha Beta`, `alpha beta`, `Alpha-Beta`, `Alpha`) than the FIELD subset. Third, `like(\"*\")` on a nullable FIELD-text property matched present non-empty strings plus an explicit empty-string row, while still excluding explicit-null and omitted rows. These WORD-tokenization, searchable-only indexing, and empty-string observations are local behavior reports, not full official Like semantics."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/like_operator.py"
+oracle_mapping: "Current fuzzer models Like only for Tokenization.FIELD TEXT. pandas uses case-sensitive full-string wildcard matching over the generated FIELD subset, and the positive non-empty-pattern subset excludes null, missing, and empty text values. After the local refinement in this round, direct Like generation also covers FIELD text properties that are locally queryable via either `index_filterable` or `index_searchable`, and PQS contains pivot-true prefix, suffix, infix, and single-character Like generation for the same subset. Randomized Like generation remains a subset of the documented FIELD behavior rather than an exhaustive text-pattern corpus, and non-FIELD tokenizations, direct empty-string `like(\"*\")`, arrays, objects, metadata filters, reference filters, and undocumented null/index interactions are not claimed. This is our oracle assumption, not an official claim."

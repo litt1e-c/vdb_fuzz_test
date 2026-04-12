@@ -1,0 +1,32 @@
+operator_id: contains_any
+family: membership
+syntax_examples:
+  - 'Filter.by_property("languages_spoken").contains_any(["Chinese", "French", "English"])'
+  - 'Filter.by_property("labelsArray").contains_any(["Alpha", "alpha"])'
+  - 'where: { path: ["answer"], operator: ContainsAny, valueText: ["australia", "india"] }'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+  - "https://docs.weaviate.io/weaviate/config-refs/collections"
+doc_supported_types:
+  - text
+  - text_array
+  - int_array
+  - number_array
+  - boolean_array
+doc_semantics: "ContainsAny is a documented where-filter operator for array and text properties. It expects an array of input values and returns objects where at least one input value is present. For text properties, the docs say the text is treated as an array of tokens according to the property's tokenization scheme."
+doc_notes:
+  - "The checked Filters guide documents `contains_any(...)` on a text property and says it matches objects where the property contains one or more of the input values."
+  - "The checked GraphQL filter reference lists `ContainsAny` as valid only for array and text properties."
+  - "The checked GraphQL filter reference says text is treated as an array of tokens based on the chosen tokenization scheme when using `ContainsAny`, `ContainsAll`, and `ContainsNone`."
+  - "The checked collections reference says tokenization influences where filters; `field` treats the entire text value as one token, while `word` splits on non-alphanumeric characters and lowercases the resulting tokens."
+  - "The checked docs do not provide a ContainsAny-specific null or missing truth table, explicit empty-array truth table, or a precise statement about whether scalar-text ContainsAny requires `indexFilterable`, `indexSearchable`, or either in the current client/server combination."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `contains_any_operator.py` passed the validated subset for INT_ARRAY, NUMBER_ARRAY, BOOL_ARRAY, FIELD-tokenized TEXT_ARRAY exact element membership, and FIELD-tokenized scalar TEXT exact whole-value-token membership. For the validated subset, positive `contains_any` excluded explicit-null and omitted array rows. Observation-only checks exposed three important boundaries. First, scalar TEXT `contains_any(...)` also worked on a FIELD-tokenized property created with `index_filterable=False` and `index_searchable=True`, so local queryability is broader than the previous filterable-only fuzzer subset. Second, WORD-tokenized scalar TEXT `contains_any([\"alpha\"])` matched `Alpha Beta`, `alpha beta`, `Alpha-Beta`, and `Alpha`, consistent with lowercased tokenized matching but outside the current main oracle subset. Third, an explicit empty TEXT_ARRAY was successfully inserted and fetched back as `[]`, which means the engine can preserve empty arrays even though the current fuzzer still normalizes generated empty arrays to null/omitted rows. These searchable-only, WORD-tokenization, and explicit-empty-array results are treated as local observations rather than full official semantics."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/contains_any_operator.py"
+oracle_mapping: "Current fuzzer models contains_any with pandas membership on present array values for INT_ARRAY, NUMBER_ARRAY, BOOL_ARRAY, and FIELD-tokenized TEXT_ARRAY. After the local refinement in this round, scalar FIELD TEXT `contains_any` is also generated and modeled as exact whole-field token membership, and this scalar-text generation now covers locally queryable FIELD text properties reachable through either `index_filterable` or `index_searchable`. PQS contains direct pivot-true contains_any generation for arrays and scalar FIELD text. Null and omitted rows are treated as non-matches for positive contains_any. The main fuzzer still normalizes dynamically generated empty arrays to null/omitted rows, so explicit empty-array semantics are not part of the validated oracle subset even though the local engine can store `[]`. WORD or other non-FIELD tokenizations, metadata filters, reference filters, objects, and undocumented null/index interactions are not claimed. This is our oracle assumption, not an official claim."
