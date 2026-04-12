@@ -10,11 +10,14 @@ Features:
 7. Null Value Handling: Enabled by default with indexNullState
 8. NOT expressions: Filter.not_() with multiple strategies
 9. not_equal / contains_all / contains_none operators
-10. Randomized vector index (HNSW/FLAT/Dynamic) + distance metric
+10. Randomized vector index (HNSW/FLAT/Dynamic/HFresh) + distance metric
 11. Consistency level cycling (ONE/QUORUM/ALL)
 12. Dynamic ops: insert/delete/update mid-test
 13. Tokenization.FIELD for TEXT/TEXT_ARRAY: case-sensitive, no stopword filtering
 14. Dynamic row tracking: Weaviate inverted-index bug detection & classification
+15. Schema evolution: add property mid-test + full backfill before enabling queries
+16. Scalar index mutation: destructive property-index drop with query-space adaptation
+17. Engine-first shadow sync: fetch/retry/resync after dynamic writes before mutating oracle
 
 Notes:
   Historical bug status drifts across Weaviate/client versions, so this file keeps
@@ -62,6 +65,16 @@ BOUNDARY_INJECTION_RATE = None
 
 # 标量优先：过滤表达式更偏向标量字段，减少因数组/OBJECT 语义导致的噪声
 SCALAR_QUERY_PRIORITY = 0.85
+
+# Runtime maintenance knobs.  These intentionally default to conservative
+# intervals because schema/property index changes are heavier than row updates.
+ENABLE_SCHEMA_EVOLUTION = True
+SCHEMA_EVOLUTION_INTERVAL = 30
+MAX_EVOLVED_PROPERTIES = 4
+
+ENABLE_SCALAR_INDEX_MUTATION = True
+SCALAR_INDEX_MUTATION_INTERVAL = 45
+MAX_SCALAR_INDEX_DROPS = 4
 
 # Current Weaviate client/transport path may coerce large integers through
 # floating-point serialization. Keep fuzzed INT values within the IEEE-754
@@ -239,7 +252,7 @@ TEXT_STEMS = [
 ]
 
 # 向量索引类型和距离度量
-ALL_VECTOR_INDEX_TYPES = ["hnsw", "flat", "dynamic"]
+ALL_VECTOR_INDEX_TYPES = ["hnsw", "flat", "dynamic", "hfresh"]
 ALL_DISTANCE_METRICS = [VectorDistances.COSINE, VectorDistances.L2_SQUARED, VectorDistances.DOT]
 VECTOR_INDEX_TYPE = None
 DISTANCE_METRIC = None
@@ -511,6 +524,112 @@ def normalize_scalar_for_compare(ftype, value):
     return value
 
 
+def convert_numpy_types(obj):
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, np.floating):
+        return float(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    if isinstance(obj, np.ndarray):
+        return [convert_numpy_types(x) for x in obj.tolist()]
+    if isinstance(obj, dict):
+        return {k: convert_numpy_types(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [convert_numpy_types(x) for x in obj]
+    return obj
+
+
+def convert_value_for_weaviate(key, value, field_type_map):
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+
+    ftype = field_type_map.get(key)
+    if ftype == FieldType.INT:
+        return int(value)
+    if ftype == FieldType.BOOL:
+        return bool(value)
+    if ftype == FieldType.NUMBER:
+        return float(value)
+    if ftype in (FieldType.TEXT, FieldType.DATE):
+        return str(value)
+    if ftype == FieldType.GEO:
+        geo = normalize_geo_value(value)
+        if geo is None:
+            return None
+        return GeoCoordinate(latitude=geo["latitude"], longitude=geo["longitude"])
+    return convert_numpy_types(value)
+
+
+def build_field_type_map(schema_config):
+    field_type_map = {field["name"]: field["type"] for field in schema_config}
+    field_type_map["row_num"] = FieldType.INT
+    return field_type_map
+
+
+def build_weaviate_properties(row, field_type_map):
+    props = {}
+    for key, value in row.items():
+        if key == "id" or key.startswith("_"):
+            continue
+        converted = convert_value_for_weaviate(key, value, field_type_map)
+        if converted is None:
+            continue
+        if isinstance(converted, list) and len(converted) == 0:
+            continue
+        props[key] = converted
+    return props
+
+
+def normalize_weaviate_property_for_oracle(ftype, value):
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    if ftype == FieldType.INT:
+        return int(value)
+    if ftype == FieldType.NUMBER:
+        return float(value)
+    if ftype == FieldType.BOOL:
+        return bool(value)
+    if ftype == FieldType.TEXT:
+        return str(value)
+    if ftype == FieldType.DATE:
+        return canonicalize_date_string(value)
+    if ftype == FieldType.GEO:
+        return normalize_geo_value(value)
+    if ftype == FieldType.INT_ARRAY:
+        return [int(v) for v in value] if isinstance(value, list) else None
+    if ftype == FieldType.NUMBER_ARRAY:
+        return [float(v) for v in value] if isinstance(value, list) else None
+    if ftype == FieldType.BOOL_ARRAY:
+        return [bool(v) for v in value] if isinstance(value, list) else None
+    if ftype == FieldType.TEXT_ARRAY:
+        return [str(v) for v in value] if isinstance(value, list) else None
+    if ftype == FieldType.OBJECT:
+        return convert_numpy_types(value) if isinstance(value, dict) else None
+    return convert_numpy_types(value)
+
+
+def canonical_row_from_weaviate_props(dm, object_id, properties, fallback_row=None):
+    props = properties or {}
+    row = {"id": str(object_id)}
+
+    for field in dm.schema_config:
+        fname = field["name"]
+        ftype = field["type"]
+        row[fname] = normalize_weaviate_property_for_oracle(ftype, props.get(fname))
+
+    row["row_num"] = int(props.get("row_num", fallback_row.get("row_num", -1) if fallback_row else -1))
+    if fallback_row:
+        for meta_name in ("_creation_time", "_update_time"):
+            if meta_name in fallback_row:
+                row[meta_name] = fallback_row[meta_name]
+    return row
+
+
 def extract_expr_fields(expr, schema_config):
     if not expr:
         return []
@@ -528,6 +647,10 @@ class DataManager:
         self.vectors = None
         self.schema_config = []
         self.filterable_fields = set()  # Populated by reset_collection
+        self.searchable_text_fields = set()
+        self.field_index_state = {}
+        self.dropped_property_indexes = set()
+        self.evolved_field_names = set()
         self.py_rng = random.Random(self.seed ^ 0x5EEDFACE)
         self.value_rng = np.random.default_rng(self.seed ^ 0xA17E)
         self.vector_rng = np.random.default_rng(self.seed ^ 0xC0FFEE)
@@ -708,6 +831,67 @@ class DataManager:
             return self._random_geo(boundary=True)
         return None
 
+    def generate_non_null_scalar_value(self, ftype):
+        for _ in range(12):
+            value = self._generate_scalar_value(ftype)
+            if not is_null_like(value) and not (ftype == FieldType.TEXT and value == ""):
+                return value
+
+        if ftype == FieldType.INT:
+            return 0
+        if ftype == FieldType.NUMBER:
+            return 0.0
+        if ftype == FieldType.BOOL:
+            return False
+        if ftype == FieldType.TEXT:
+            return "evolved_fallback"
+        if ftype == FieldType.DATE:
+            return "2024-01-01T00:00:00Z"
+        return None
+
+    def plan_evolved_property(self):
+        evolved_count = sum(1 for field in self.schema_config if field["name"].startswith("evo_"))
+        if evolved_count >= MAX_EVOLVED_PROPERTIES:
+            return None
+
+        type_choices = [FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE]
+        weights = [0.28, 0.26, 0.14, 0.22, 0.10]
+        ftype = self.py_rng.choices(type_choices, weights=weights, k=1)[0]
+        field_name = f"evo_{evolved_count}_{ftype.lower()}"
+
+        return {
+            "name": field_name,
+            "type": ftype,
+            "evolved": True,
+            "index_filterable": True,
+            "index_searchable": self.py_rng.choice([True, False]) if ftype == FieldType.TEXT else False,
+            "index_range": self.py_rng.choice([True, False]) if ftype in (FieldType.INT, FieldType.NUMBER, FieldType.DATE) else False,
+        }
+
+    def register_evolved_property(self, field_config):
+        field_name = field_config["name"]
+        if any(field["name"] == field_name for field in self.schema_config):
+            return
+        self.schema_config.append(field_config)
+        self.evolved_field_names.add(field_name)
+        self.field_index_state[field_name] = {
+            "filterable": bool(field_config.get("index_filterable", True)),
+            "searchable": bool(field_config.get("index_searchable", False)),
+            "range": bool(field_config.get("index_range", False)),
+        }
+        if self.df is not None and field_name not in self.df.columns:
+            self.df[field_name] = None
+
+    def build_evolved_backfill_data(self, field_config):
+        if self.df is None or self.df.empty:
+            return []
+        field_name = field_config["name"]
+        ftype = field_config["type"]
+        return [
+            (int(idx), str(self.df.at[idx, "id"]), self.generate_non_null_scalar_value(ftype))
+            for idx in self.df.index
+        ]
+
     def normalize_dataframe_types(self):
         if self.df is None:
             return
@@ -826,6 +1010,10 @@ class DataManager:
 class WeaviateManager:
     def __init__(self):
         self.client = None
+        self.field_index_state = {}
+        self.searchable_text_fields = set()
+        self.actual_vector_index_type = None
+        self.actual_distance_metric = None
 
     def connect(self):
         print(f"🔌 Connecting to Weaviate at {HOST}:{PORT}...")
@@ -871,6 +1059,7 @@ class WeaviateManager:
         index_config_log = []
         filterable_fields = set()  # Track which fields have index_filterable=True
         searchable_text_fields = set()
+        field_index_state = {}
         for field in schema_config:
             if field["type"] == FieldType.OBJECT:
                 # Nested object property
@@ -886,6 +1075,7 @@ class WeaviateManager:
                         index_filterable=True,  # OBJECT must be filterable for is_none
                     ))
                     filterable_fields.add(field["name"])
+                    field_index_state[field["name"]] = {"filterable": True, "searchable": False, "range": False}
                 continue
             wv_type = get_weaviate_datatype(field["type"])
             if wv_type:
@@ -898,11 +1088,16 @@ class WeaviateManager:
                 p_kwargs = dict(name=field["name"], data_type=wv_type,
                                 index_filterable=idx_filterable,
                                 index_searchable=idx_searchable,
-                                index_range_filterable=idx_range)
+                                index_range_filters=idx_range)
                 if tok is not None:
                     p_kwargs["tokenization"] = tok
                 p = Property(**p_kwargs)
                 properties.append(p)
+                field_index_state[field["name"]] = {
+                    "filterable": bool(idx_filterable),
+                    "searchable": bool(idx_searchable),
+                    "range": bool(idx_range),
+                }
                 if idx_filterable:
                     filterable_fields.add(field["name"])
                 if field["type"] == FieldType.TEXT and idx_searchable:
@@ -914,8 +1109,13 @@ class WeaviateManager:
             for ic in index_config_log[:5]:
                 print(f"      {ic}")
 
-        vi_type = VECTOR_INDEX_TYPE or "hnsw"
+        requested_vi_type = VECTOR_INDEX_TYPE or "hnsw"
         dist = DISTANCE_METRIC or VectorDistances.COSINE
+        vi_type = requested_vi_type
+
+        if vi_type == "hfresh" and dist == VectorDistances.DOT:
+            dist = random.choice([VectorDistances.COSINE, VectorDistances.L2_SQUARED])
+            print(f"   -> Adjusted HFRESH distance to supported metric: {dist}")
 
         if vi_type == "hnsw":
             ef_c = random.choice([64, 128, 256])
@@ -923,8 +1123,18 @@ class WeaviateManager:
             vi_config = Configure.VectorIndex.hnsw(distance_metric=dist, ef_construction=ef_c, max_connections=max_conn)
             print(f"   -> VectorIndex: HNSW (ef_c={ef_c}, max_conn={max_conn})")
         elif vi_type == "flat":
-            vi_config = Configure.VectorIndex.flat(distance_metric=dist)
-            print(f"   -> VectorIndex: FLAT")
+            cache_sz = random.choice([100000, 200000, 400000])
+            vi_config = Configure.VectorIndex.flat(distance_metric=dist, vector_cache_max_objects=cache_sz)
+            print(f"   -> VectorIndex: FLAT (cache={cache_sz})")
+        elif vi_type == "hfresh":
+            posting_kb = random.choice([128, 256, 512])
+            probe = random.choice([4, 8, 16])
+            vi_config = Configure.VectorIndex.hfresh(
+                distance_metric=dist,
+                max_posting_size_kb=posting_kb,
+                search_probe=probe,
+            )
+            print(f"   -> VectorIndex: HFRESH (posting_kb={posting_kb}, probe={probe})")
         else:
             threshold = random.choice([5000, 10000, 20000])
             vi_config = Configure.VectorIndex.dynamic(distance_metric=dist, threshold=threshold)
@@ -952,9 +1162,14 @@ class WeaviateManager:
                     self.client.collections.delete(CLASS_NAME)
                 except Exception:
                     pass
-                if "async indexing" in err_msg or "dynamic" in err_msg.lower() or "422" in err_msg:
+                if "async indexing" in err_msg or ("dynamic" in err_msg.lower() and vi_type == "dynamic"):
                     vi_config = Configure.VectorIndex.hnsw(distance_metric=dist)
+                    vi_type = "hnsw"
                     print(f"   -> Falling back to HNSW (dynamic requires ASYNC_INDEXING=true in server env)")
+                elif vi_type == "hfresh" and ("422" in err_msg or "hfresh" in err_msg.lower() or "unsupported" in err_msg.lower()):
+                    vi_config = Configure.VectorIndex.hnsw(distance_metric=dist)
+                    vi_type = "hnsw"
+                    print("   -> Falling back to HNSW (HFRESH unsupported in current server config)")
                 elif attempt == 0:
                     # Try without inverted_index_config
                     try:
@@ -968,12 +1183,259 @@ class WeaviateManager:
                     except Exception as e2:
                         print(f"   -> Fallback also failed: {e2}")
                         vi_config = Configure.VectorIndex.hnsw(distance_metric=dist)
+                        vi_type = "hnsw"
                 else:
                     if attempt == 2:
                         raise
         print("🛠️ Collection Created.")
         self.searchable_text_fields = searchable_text_fields
+        self.field_index_state = field_index_state
+        self.actual_vector_index_type = vi_type
+        self.actual_distance_metric = dist
         return filterable_fields
+
+    def _build_property_from_field_config(self, field_config):
+        ftype = field_config["type"]
+        wv_type = get_weaviate_datatype(ftype)
+        if wv_type is None:
+            raise ValueError(f"Unsupported evolved field type: {ftype}")
+
+        p_kwargs = {
+            "name": field_config["name"],
+            "data_type": wv_type,
+            "index_filterable": bool(field_config.get("index_filterable", True)),
+            "index_searchable": bool(field_config.get("index_searchable", False)),
+            "index_range_filters": bool(field_config.get("index_range", False)),
+        }
+        if ftype == FieldType.TEXT:
+            p_kwargs["tokenization"] = Tokenization.FIELD
+        return Property(**p_kwargs)
+
+    def add_evolved_property(self, field_config):
+        collection = self.client.collections.get(CLASS_NAME)
+        collection.config.add_property(self._build_property_from_field_config(field_config))
+        self.field_index_state[field_config["name"]] = {
+            "filterable": bool(field_config.get("index_filterable", True)),
+            "searchable": bool(field_config.get("index_searchable", False)),
+            "range": bool(field_config.get("index_range", False)),
+        }
+        if field_config.get("index_searchable"):
+            self.searchable_text_fields.add(field_config["name"])
+
+    def fetch_objects_by_ids(self, ids, retries=4, wait_seconds=None):
+        if not ids:
+            return {}
+
+        collection = self.client.collections.get(CLASS_NAME)
+        targets = [str(object_id) for object_id in ids]
+        wait_seconds = SLEEP_INTERVAL * 2 if wait_seconds is None else wait_seconds
+        objects = {}
+
+        for attempt in range(max(1, retries)):
+            objects = {}
+            for object_id in targets:
+                try:
+                    obj = collection.query.fetch_object_by_id(object_id)
+                except Exception:
+                    obj = None
+                if obj is not None:
+                    objects[object_id] = obj
+            if len(objects) == len(targets):
+                break
+            if attempt + 1 < retries:
+                time.sleep(wait_seconds)
+        return objects
+
+    def apply_fetched_rows_to_shadow(self, dm, objects_by_id, vectors_by_id=None):
+        if not objects_by_id:
+            return [], []
+
+        vectors_by_id = vectors_by_id or {}
+        id_to_index = {str(value): idx for idx, value in enumerate(dm.df["id"].tolist())} if not dm.df.empty else {}
+        new_rows = []
+        new_vectors = []
+        synced_ids = []
+
+        for object_id, obj in objects_by_id.items():
+            row_idx = id_to_index.get(str(object_id))
+            fallback_row = dm.df.iloc[row_idx].to_dict() if row_idx is not None else None
+            canonical = canonical_row_from_weaviate_props(dm, object_id, getattr(obj, "properties", None), fallback_row=fallback_row)
+            if row_idx is not None:
+                for key, value in canonical.items():
+                    if key == "id":
+                        continue
+                    dm.df.at[row_idx, key] = value
+                if str(object_id) in vectors_by_id:
+                    dm.vectors[row_idx] = np.asarray(vectors_by_id[str(object_id)], dtype=np.float32)
+            else:
+                new_rows.append(canonical)
+                if str(object_id) in vectors_by_id:
+                    new_vectors.append(np.asarray(vectors_by_id[str(object_id)], dtype=np.float32))
+            synced_ids.append(str(object_id))
+
+        if new_rows:
+            dm.df = pd.concat([dm.df, dm.rows_to_dataframe(new_rows)], ignore_index=True)
+            if new_vectors:
+                new_arr = np.asarray(new_vectors, dtype=np.float32)
+                dm.vectors = new_arr if dm.vectors is None or len(dm.vectors) == 0 else np.vstack([dm.vectors, new_arr])
+
+        dm.normalize_dataframe_types()
+        return synced_ids, [row["id"] for row in new_rows]
+
+    def sync_rows_from_engine(self, dm, ids, vectors_by_id=None, retries=4):
+        objects_by_id = self.fetch_objects_by_ids(ids, retries=retries)
+        synced_ids, new_ids = self.apply_fetched_rows_to_shadow(dm, objects_by_id, vectors_by_id=vectors_by_id)
+        missing_ids = [str(object_id) for object_id in ids if str(object_id) not in objects_by_id]
+        return synced_ids, missing_ids, new_ids
+
+    def verify_deleted_ids(self, dm, ids, retries=4):
+        remaining = self.fetch_objects_by_ids(ids, retries=retries)
+        deleted_ids = [str(object_id) for object_id in ids if str(object_id) not in remaining]
+        still_present = [str(object_id) for object_id in ids if str(object_id) in remaining]
+
+        if deleted_ids and not dm.df.empty:
+            keep = ~dm.df["id"].isin(deleted_ids)
+            kept_index = dm.df[keep].index.to_numpy()
+            dm.df = dm.df[keep].reset_index(drop=True)
+            if dm.vectors is not None and len(dm.vectors) == len(keep):
+                dm.vectors = dm.vectors[kept_index]
+            dm.normalize_dataframe_types()
+        return deleted_ids, still_present
+
+    def backfill_evolved_property(self, dm, field_config, backfill_data, retries=3):
+        if not backfill_data:
+            return [], []
+
+        collection = self.client.collections.get(CLASS_NAME)
+        field_name = field_config["name"]
+        field_type_map = {field_name: field_config["type"]}
+        attempted_ids = []
+
+        for pandas_idx, row_id, value in backfill_data:
+            props = build_weaviate_properties({field_name: value}, field_type_map)
+            if not props:
+                continue
+            attempted_ids.append(str(row_id))
+            for attempt in range(max(1, retries)):
+                try:
+                    collection.data.update(uuid=str(row_id), properties=props)
+                    break
+                except Exception:
+                    if attempt + 1 >= retries:
+                        break
+                    time.sleep(SLEEP_INTERVAL * 2)
+
+        objects_by_id = self.fetch_objects_by_ids(attempted_ids, retries=retries)
+        success_ids = []
+        missing_ids = []
+        for pandas_idx, row_id, _ in backfill_data:
+            object_id = str(row_id)
+            obj = objects_by_id.get(object_id)
+            if obj is None:
+                missing_ids.append(object_id)
+                continue
+            value = getattr(obj, "properties", {}).get(field_name)
+            if value is None:
+                missing_ids.append(object_id)
+                continue
+            dm.df.at[pandas_idx, field_name] = normalize_weaviate_property_for_oracle(field_config["type"], value)
+            success_ids.append(object_id)
+
+        dm.normalize_dataframe_types()
+        return success_ids, missing_ids
+
+    def mutate_scalar_index(self, dm):
+        if len(dm.dropped_property_indexes) >= MAX_SCALAR_INDEX_DROPS:
+            return None
+
+        candidates = []
+        for field in dm.schema_config:
+            name = field["name"]
+            state = dm.field_index_state.get(name, {})
+            if state.get("filterable") and name in dm.filterable_fields:
+                candidates.append((name, "filterable"))
+            if field["type"] == FieldType.TEXT and state.get("searchable") and name in dm.searchable_text_fields:
+                candidates.append((name, "searchable"))
+            if state.get("range"):
+                candidates.append((name, "rangeFilters"))
+
+        candidates = [item for item in candidates if item not in dm.dropped_property_indexes]
+        if not candidates:
+            return None
+
+        property_name, index_name = random.choice(candidates)
+        collection = self.client.collections.get(CLASS_NAME)
+        dropped = collection.config.delete_property_index(property_name, index_name)
+        if not dropped:
+            return None
+
+        dm.dropped_property_indexes.add((property_name, index_name))
+        state = dm.field_index_state.setdefault(property_name, {"filterable": False, "searchable": False, "range": False})
+        if index_name == "filterable":
+            state["filterable"] = False
+            dm.filterable_fields.discard(property_name)
+        elif index_name == "searchable":
+            state["searchable"] = False
+            dm.searchable_text_fields.discard(property_name)
+        elif index_name == "rangeFilters":
+            state["range"] = False
+        return property_name, index_name
+
+    def reconfigure_vector_index(self):
+        collection = self.client.collections.get(CLASS_NAME)
+        vi_type = self.actual_vector_index_type or VECTOR_INDEX_TYPE or "hnsw"
+
+        if vi_type == "hnsw":
+            new_ef = random.choice([64, 128, 256, 512])
+            new_dyn = random.choice([4, 8, 12])
+            new_cutoff = random.choice([20000, 40000, 60000])
+            collection.config.update(
+                vector_config=Reconfigure.Vectors.update(
+                    vector_index_config=Reconfigure.VectorIndex.hnsw(
+                        ef=new_ef,
+                        dynamic_ef_factor=new_dyn,
+                        flat_search_cutoff=new_cutoff,
+                    )
+                )
+            )
+            return f"HNSW ef={new_ef} dyn_ef={new_dyn} cutoff={new_cutoff}"
+
+        if vi_type == "flat":
+            cache_sz = random.choice([100000, 200000, 400000, 800000])
+            collection.config.update(
+                vector_config=Reconfigure.Vectors.update(
+                    vector_index_config=Reconfigure.VectorIndex.flat(
+                        vector_cache_max_objects=cache_sz,
+                    )
+                )
+            )
+            return f"FLAT cache={cache_sz}"
+
+        if vi_type == "hfresh":
+            posting_kb = random.choice([128, 256, 512, 1024])
+            probe = random.choice([4, 8, 16, 32])
+            collection.config.update(
+                vector_config=Reconfigure.Vectors.update(
+                    vector_index_config=Reconfigure.VectorIndex.hfresh(
+                        max_posting_size_kb=posting_kb,
+                        search_probe=probe,
+                    )
+                )
+            )
+            return f"HFRESH posting_kb={posting_kb} probe={probe}"
+
+        if vi_type == "dynamic":
+            threshold = random.choice([5000, 10000, 20000, 40000])
+            collection.config.update(
+                vector_config=Reconfigure.Vectors.update(
+                    vector_index_config=Reconfigure.VectorIndex.dynamic(
+                        threshold=threshold,
+                    )
+                )
+            )
+            return f"DYNAMIC threshold={threshold}"
+
+        raise ValueError(f"Unsupported vector index type: {vi_type}")
 
     def sync_creation_times(self, dm, ids=None, retries=3):
         if self.client is None or dm.df.empty:
@@ -1068,46 +1530,14 @@ class WeaviateManager:
         collection = self.client.collections.get(CLASS_NAME)
         records = dm.df.to_dict(orient="records")
         total = len(records)
-        field_type_map = {f["name"]: f["type"] for f in dm.schema_config}
-        field_type_map["row_num"] = FieldType.INT
-
-        def convert_numpy_types(obj):
-            if isinstance(obj, np.integer): return int(obj)
-            elif isinstance(obj, np.floating): return float(obj)
-            elif isinstance(obj, np.bool_): return bool(obj)
-            elif isinstance(obj, np.ndarray): return [convert_numpy_types(x) for x in obj.tolist()]
-            elif isinstance(obj, dict): return {k: convert_numpy_types(v) for k, v in obj.items()}
-            elif isinstance(obj, list): return [convert_numpy_types(x) for x in obj]
-            return obj
-
-        def convert_value(k, v, ftmap):
-            if v is None: return None
-            if isinstance(v, float) and np.isnan(v): return None
-            ftype = ftmap.get(k)
-            if ftype == FieldType.INT: return int(v)
-            elif ftype == FieldType.BOOL: return bool(v)
-            elif ftype == FieldType.NUMBER: return float(v)
-            elif ftype in (FieldType.TEXT, FieldType.DATE): return str(v)
-            elif ftype == FieldType.GEO:
-                gv = normalize_geo_value(v)
-                if gv is None:
-                    return None
-                return GeoCoordinate(latitude=gv["latitude"], longitude=gv["longitude"])
-            else: return convert_numpy_types(v)
+        field_type_map = build_field_type_map(dm.schema_config)
 
         for start in range(0, total, BATCH_SIZE):
             end = min(start + BATCH_SIZE, total)
             batch = records[start:end]
             data_objects = []
             for i, row in enumerate(batch):
-                props = {}
-                for k, v in row.items():
-                    if k == "id": continue
-                    cv = convert_value(k, v, field_type_map)
-                    if cv is not None:
-                        if isinstance(cv, list) and len(cv) == 0:
-                            continue  # Skip empty arrays (Weaviate treats as null)
-                        props[k] = cv
+                props = build_weaviate_properties(row, field_type_map)
                 data_objects.append(DataObject(uuid=row["id"], properties=props, vector=dm.vectors[start + i].tolist()))
 
             for attempt in range(3):
@@ -3079,7 +3509,11 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
     wm.connect()
     try:
         dm.filterable_fields = wm.reset_collection(dm.schema_config)
-        dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set())
+        dm.searchable_text_fields = set(getattr(wm, "searchable_text_fields", set()) or set())
+        dm.field_index_state = dict(getattr(wm, "field_index_state", {}) or {})
+        active_vector_index_type = getattr(wm, "actual_vector_index_type", VECTOR_INDEX_TYPE)
+        active_distance_metric = getattr(wm, "actual_distance_metric", DISTANCE_METRIC)
+        print(f"   ActualVecIndex: {active_vector_index_type}, ActualDist: {active_distance_metric}")
         wm.insert(dm)
         wm.sync_creation_times(dm)
         wm.sync_update_times(dm)
@@ -3132,7 +3566,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
             flog(
                 f"Start: {rounds} rounds | Seed: {current_seed} | "
                 f"Consistency: {consistency_label(resolved_consistency, randomize=randomize_consistency)} | "
-                f"VecIdx: {VECTOR_INDEX_TYPE} | Dist: {DISTANCE_METRIC}"
+                f"VecIdx: {active_vector_index_type} | Dist: {active_distance_metric}"
             )
             flog("=" * 50)
 
@@ -3150,9 +3584,10 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                             for _ in range(bc):
                                 rows.append(dm.generate_single_row())
                                 vecs.append(dm.generate_single_vector())
+                            field_type_map = build_field_type_map(dm.schema_config)
                             objs = []
                             for r, v in zip(rows, vecs):
-                                p = {k: vv for k, vv in r.items() if k != "id" and vv is not None}
+                                p = build_weaviate_properties(r, field_type_map)
                                 objs.append(DataObject(uuid=r["id"], properties=p, vector=v.tolist()))
                             dyn_result = col.data.insert_many(objs)
                             dyn_errors = getattr(dyn_result, "errors", None)
@@ -3160,15 +3595,22 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                 dyn_errors = dyn_result.get("errors")
                             if dyn_errors:
                                 raise RuntimeError(f"dynamic batch insert partially failed: {dyn_errors}")
-                            dm.df = pd.concat([dm.df, dm.rows_to_dataframe(rows)], ignore_index=True)
-                            dm.vectors = np.vstack([dm.vectors, np.array(vecs)])
-                            dm.normalize_dataframe_types()
-                            dynamic_ids.update(r["id"] for r in rows)
-                            flog(f"[Dyn] Inserted {bc}")
-                            time.sleep(SLEEP_INTERVAL * 2)  # Allow index to stabilize
-                            wm.sync_creation_times(dm, ids=[r["id"] for r in rows])
-                            wm.sync_update_times(dm, ids=[r["id"] for r in rows])
-                            qg = OracleQueryGenerator(dm)
+                            vectors_by_id = {str(row["id"]): vec for row, vec in zip(rows, vecs)}
+                            synced_ids, missing_ids, new_ids = wm.sync_rows_from_engine(
+                                dm,
+                                [row["id"] for row in rows],
+                                vectors_by_id=vectors_by_id,
+                                retries=4,
+                            )
+                            dynamic_ids.update(synced_ids)
+                            flog(f"[Dyn] Inserted req={bc} visible={len(synced_ids)} new={len(new_ids)}")
+                            if missing_ids:
+                                flog(f"[Dyn] ❌ Insert visibility miss: {missing_ids}")
+                                fails.extend({"id": i, "detail": f"Insert not visible: {mid}"} for mid in missing_ids)
+                            if synced_ids:
+                                wm.sync_creation_times(dm, ids=synced_ids)
+                                wm.sync_update_times(dm, ids=synced_ids)
+                                qg = OracleQueryGenerator(dm)
                         except Exception as e:
                             flog(f"[Dyn] Insert fail: {e}")
                     elif op == "delete":
@@ -3178,23 +3620,15 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                 dids = [dm.df.iloc[x]["id"] for x in idxs]
                                 for d in dids:
                                     col.data.delete_by_id(d)
-                                # Post-delete verification
-                                for d in dids:
-                                    try:
-                                        obj = col.query.fetch_object_by_id(d)
-                                        if obj is not None:
-                                            flog(f"[Dyn] ❌ Deleted ID still exists: {d}")
-                                            fails.append({"id": i, "detail": f"Ghost after delete: {d}"})
-                                    except Exception:
-                                        pass  # expected: not found
-                                keep = ~dm.df["id"].isin(dids)
-                                ki = dm.df[keep].index.to_numpy()
-                                dm.df = dm.df[keep].reset_index(drop=True)
-                                dm.vectors = dm.vectors[ki]
-                                dm.normalize_dataframe_types()
-                                qg = OracleQueryGenerator(dm)
-                                flog(f"[Dyn] Deleted {len(dids)}")
-                                time.sleep(SLEEP_INTERVAL * 2)
+                                deleted_ids, still_present = wm.verify_deleted_ids(dm, dids, retries=4)
+                                dynamic_ids.difference_update(deleted_ids)
+                                flog(f"[Dyn] Deleted {len(deleted_ids)}/{len(dids)}")
+                                if still_present:
+                                    for object_id in still_present:
+                                        flog(f"[Dyn] ❌ Deleted ID still exists: {object_id}")
+                                        fails.append({"id": i, "detail": f"Ghost after delete: {object_id}"})
+                                if deleted_ids:
+                                    qg = OracleQueryGenerator(dm)
                             except Exception as e:
                                 flog(f"[Dyn] Delete fail: {e}")
                     elif op == "update":
@@ -3204,48 +3638,23 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                 uid = dm.df.iloc[ui]["id"]
                                 nr = dm.generate_single_row(id_override=uid)
                                 nv = dm.generate_single_vector()
-                                p = {k: v for k, v in nr.items() if k != "id" and v is not None}
+                                field_type_map = build_field_type_map(dm.schema_config)
+                                p = build_weaviate_properties(nr, field_type_map)
                                 col.data.replace(uuid=uid, properties=p, vector=nv.tolist())
-                                for k, v in nr.items():
-                                    dm.df.at[ui, k] = v
-                                dm.vectors[ui] = nv
-                                dm.normalize_dataframe_types()
-                                dynamic_ids.add(uid)
-                                # Post-update verification
-                                try:
-                                    obj = col.query.fetch_object_by_id(uid)
-                                    if obj is not None:
-                                        for pk, pv in p.items():
-                                            av = obj.properties.get(pk)
-                                            if av is not None and pv is not None:
-                                                if isinstance(pv, float):
-                                                    if abs(float(av) - pv) > 1e-3:
-                                                        flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
-                                                elif isinstance(pv, str) and to_utc_timestamp(pv) is not None:
-                                                    norm_pv = canonicalize_date_string(pv)
-                                                    norm_av = canonicalize_date_string(av)
-                                                    if norm_pv != norm_av:
-                                                        flog(f"[Dyn] ❌ Update mismatch: {pk} expected={norm_pv} actual={norm_av}")
-                                                elif isinstance(pv, list):
-                                                    # Array fields: compare sorted to avoid order issues
-                                                    if sorted(str(x) for x in av) != sorted(str(x) for x in pv) if isinstance(av, list) else True:
-                                                        pass  # Skip noisy array comparison
-                                                elif isinstance(pv, dict):
-                                                    # OBJECT fields: compare by sorted keys
-                                                    if isinstance(av, dict):
-                                                        if sorted(av.items()) != sorted(pv.items()):
-                                                            flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
-                                                    else:
-                                                        flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
-                                                elif str(av) != str(pv):
-                                                    flog(f"[Dyn] ❌ Update mismatch: {pk} expected={pv} actual={av}")
-                                        flog(f"[Dyn] Update verified {uid}")
-                                except Exception:
-                                    pass
-                                flog(f"[Dyn] Updated {uid}")
-                                time.sleep(SLEEP_INTERVAL * 2)
-                                wm.sync_update_times(dm, ids=[uid])
-                                qg = OracleQueryGenerator(dm)
+                                synced_ids, missing_ids, _ = wm.sync_rows_from_engine(
+                                    dm,
+                                    [uid],
+                                    vectors_by_id={str(uid): nv},
+                                    retries=4,
+                                )
+                                if synced_ids:
+                                    dynamic_ids.update(synced_ids)
+                                    wm.sync_update_times(dm, ids=synced_ids)
+                                    qg = OracleQueryGenerator(dm)
+                                    flog(f"[Dyn] Updated {uid}")
+                                if missing_ids:
+                                    flog(f"[Dyn] ❌ Update visibility miss: {missing_ids}")
+                                    fails.extend({"id": i, "detail": f"Update not visible: {mid}"} for mid in missing_ids)
                             except Exception as e:
                                 flog(f"[Dyn] Update fail: {e}")
                     elif op == "upsert":
@@ -3262,50 +3671,78 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                             upsert_rows.append(row)
                             upsert_vecs.append(vec)
                         try:
-                            new_rows, new_vecs = [], []
+                            field_type_map = build_field_type_map(dm.schema_config)
                             for row, vec in zip(upsert_rows, upsert_vecs):
                                 rid = row["id"]
-                                p = {k: v for k, v in row.items() if k != "id" and v is not None}
+                                p = build_weaviate_properties(row, field_type_map)
                                 match_idx = dm.df.index[dm.df["id"] == rid].tolist()
                                 if match_idx:
                                     # Update existing
                                     col.data.replace(uuid=rid, properties=p, vector=vec.tolist())
-                                    idx = match_idx[0]
-                                    for k, v in row.items():
-                                        dm.df.at[idx, k] = v
-                                    dm.vectors[idx] = vec
                                 else:
                                     # Insert new
                                     col.data.insert(properties=p, uuid=rid, vector=vec.tolist())
-                                    new_rows.append(row)
-                                    new_vecs.append(vec)
-                            dynamic_ids.update(r["id"] for r in upsert_rows)
-                            if new_rows:
-                                dm.df = pd.concat([dm.df, dm.rows_to_dataframe(new_rows)], ignore_index=True)
-                                dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
-                            dm.normalize_dataframe_types()
-                            flog(f"[Dyn] Upserted {len(upsert_rows)} (new:{len(new_rows)})")
-                            time.sleep(SLEEP_INTERVAL * 2)  # Allow index to stabilize
-                            wm.sync_creation_times(dm, ids=[r["id"] for r in upsert_rows])
-                            wm.sync_update_times(dm, ids=[r["id"] for r in upsert_rows])
-                            qg = OracleQueryGenerator(dm)
+                            vectors_by_id = {str(row["id"]): vec for row, vec in zip(upsert_rows, upsert_vecs)}
+                            synced_ids, missing_ids, new_ids = wm.sync_rows_from_engine(
+                                dm,
+                                [row["id"] for row in upsert_rows],
+                                vectors_by_id=vectors_by_id,
+                                retries=4,
+                            )
+                            dynamic_ids.update(synced_ids)
+                            flog(f"[Dyn] Upserted req={len(upsert_rows)} visible={len(synced_ids)} new={len(new_ids)}")
+                            if missing_ids:
+                                flog(f"[Dyn] ❌ Upsert visibility miss: {missing_ids}")
+                                fails.extend({"id": i, "detail": f"Upsert not visible: {mid}"} for mid in missing_ids)
+                            if synced_ids:
+                                wm.sync_creation_times(dm, ids=synced_ids)
+                                wm.sync_update_times(dm, ids=synced_ids)
+                                qg = OracleQueryGenerator(dm)
                         except Exception as e:
                             flog(f"[Dyn] Upsert fail: {e}")
 
-                # HNSW parameter reconfiguration + maintenance pressure every 40 rounds
-                if i > 0 and i % 40 == 0 and VECTOR_INDEX_TYPE == "hnsw":
+                if enable_dynamic_ops and ENABLE_SCHEMA_EVOLUTION and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                     try:
-                        new_ef = random.choice([64, 128, 256, 512])
-                        new_dyn = random.choice([4, 8, 12])
-                        new_cutoff = random.choice([20000, 40000, 60000])
-                        col.config.update(
-                            vector_index_config=Reconfigure.VectorIndex.hnsw(
-                                ef=new_ef,
-                                dynamic_ef_factor=new_dyn,
-                                flat_search_cutoff=new_cutoff,
+                        field_config = dm.plan_evolved_property()
+                        if field_config:
+                            field_name = field_config["name"]
+                            wm.add_evolved_property(field_config)
+                            dm.register_evolved_property(field_config)
+                            backfill_data = dm.build_evolved_backfill_data(field_config)
+                            success_ids, missing_ids = wm.backfill_evolved_property(dm, field_config, backfill_data, retries=4)
+                            flog(
+                                f"[Schema] Added property {field_name} type={field_config['type']} "
+                                f"backfill={len(success_ids)}/{len(backfill_data)}"
                             )
-                        )
-                        flog(f"[Reconfig] HNSW ef={new_ef} dyn_ef={new_dyn} cutoff={new_cutoff}")
+                            if missing_ids:
+                                flog(f"[Schema] ⚠️ Backfill incomplete for {field_name}: sample={missing_ids[:5]}")
+                            if len(success_ids) == len(backfill_data):
+                                if field_config.get("index_filterable", True):
+                                    dm.filterable_fields.add(field_name)
+                                if field_config.get("index_searchable", False):
+                                    dm.searchable_text_fields.add(field_name)
+                                wm.sync_update_times(dm, ids=success_ids)
+                                qg = OracleQueryGenerator(dm)
+                            else:
+                                fails.append({"id": i, "detail": f"Schema evolution partial backfill: {field_name}"})
+                    except Exception as e:
+                        flog(f"[Schema] Failed: {e}")
+
+                if ENABLE_SCALAR_INDEX_MUTATION and i > 0 and i % SCALAR_INDEX_MUTATION_INTERVAL == 0:
+                    try:
+                        mutated = wm.mutate_scalar_index(dm)
+                        if mutated:
+                            property_name, index_name = mutated
+                            flog(f"[IndexMut] Dropped {index_name} index on {property_name}")
+                            qg = OracleQueryGenerator(dm)
+                    except Exception as e:
+                        flog(f"[IndexMut] Failed: {e}")
+
+                # Vector index maintenance pressure every 40 rounds
+                if i > 0 and i % 40 == 0 and active_vector_index_type in {"hnsw", "flat", "hfresh", "dynamic"}:
+                    try:
+                        desc = wm.reconfigure_vector_index()
+                        flog(f"[Reconfig] {desc}")
                         # Post-reconfig maintenance pressure: verify a known-good object
                         try:
                             verify_id = dm.df.iloc[0]["id"]
@@ -3519,7 +3956,7 @@ def run_equivalence_mode(rounds=100, seed=None):
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set()); wm.insert(dm); wm.sync_creation_times(dm); wm.sync_update_times(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = set(getattr(wm, "searchable_text_fields", set()) or set()); dm.field_index_state = dict(getattr(wm, "field_index_state", {}) or {}); wm.insert(dm); wm.sync_creation_times(dm); wm.sync_update_times(dm)
         qg = EquivalenceQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         fails = []
@@ -3576,7 +4013,7 @@ def run_pqs_mode(rounds=100, seed=None):
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set()); wm.insert(dm); wm.sync_creation_times(dm); wm.sync_update_times(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = set(getattr(wm, "searchable_text_fields", set()) or set()); dm.field_index_state = dict(getattr(wm, "field_index_state", {}) or {}); wm.insert(dm); wm.sync_creation_times(dm); wm.sync_update_times(dm)
         pqs = PQSQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         errs, ok, skip = [], 0, 0
@@ -3633,7 +4070,7 @@ def run_groupby_mode(rounds=100, seed=None):
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
     wm = WeaviateManager(); wm.connect()
     try:
-        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = getattr(wm, "searchable_text_fields", set()); wm.insert(dm)
+        dm.filterable_fields = wm.reset_collection(dm.schema_config); dm.searchable_text_fields = set(getattr(wm, "searchable_text_fields", set()) or set()); dm.field_index_state = dict(getattr(wm, "field_index_state", {}) or {}); wm.insert(dm)
         col = wm.client.collections.get(CLASS_NAME)
         errs, ok = [], 0
         # Find groupable scalar fields (must be filterable/indexed)
