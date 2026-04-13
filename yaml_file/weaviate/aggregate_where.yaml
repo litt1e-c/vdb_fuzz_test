@@ -1,0 +1,27 @@
+operator_id: aggregate_where
+family: aggregate_composition
+syntax_examples:
+  - 'collection.aggregate.over_all(filters=Filter.by_property("bucket").equal(0), total_count=True, return_metrics=[...])'
+  - 'collection.aggregate.over_all(filters=Filter.by_property("intArr").contains_any([7]), return_metrics=[...])'
+  - 'collection.aggregate.over_all(filters=(Filter.by_property("bucket").greater_or_equal(1) & Filter.by_property("textVal").equal("gamma")), return_metrics=[...])'
+doc_status: aggregate_filtering_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/aggregate"
+  - "https://docs.weaviate.io/weaviate/search/filters"
+doc_supported_types:
+  - aggregate_over_all
+  - scalar_filters
+  - array_filters
+  - null_filters
+doc_semantics: "Aggregate queries can be filtered with where-style filters before metrics are computed. Local validation shows the aggregate result is computed over the filtered subset only, with `total_count` counting matched objects and per-property metrics using the filtered property values / flattened array elements."
+doc_notes:
+  - "The checked docs document filtering separately and aggregate-over-all separately; the local client supports combining them through `aggregate.over_all(filters=...)`."
+  - "The checked aggregate docs note that aggregate queries do not expose the same consistency-level surface as ordinary object queries, so the current aggregate fuzzer uses the server/default aggregate behavior."
+verify_status: edge_validated
+observed_summary: "The local aggregate probe validated filtered aggregates on scalar equality filters, array `contains_any`, null-state filters, and empty-result filters. The aggregate fuzzer extends this with randomized conjunctions / disjunctions over dedicated probe fields."
+oracle_support:
+  - pandas
+  - aggregate
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
+oracle_mapping: "The aggregate oracle first computes the filtered DataFrame subset, then applies per-property aggregate semantics on that subset only. This includes flattened array aggregation and locally observed empty-result defaults. This is our oracle assumption for the validated local subset, not an official claim."

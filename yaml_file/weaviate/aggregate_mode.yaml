@@ -1,0 +1,29 @@
+operator_id: aggregate_mode
+family: aggregate
+syntax_examples:
+  - 'collection.aggregate.over_all(return_metrics=Metrics("intVal").integer(mode=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("dateVal").date_(mode=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("numArr").number(mode=True))'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/aggregate"
+doc_supported_types:
+  - int
+  - number
+  - date
+  - date_array
+  - int_array
+  - number_array
+doc_semantics: "Mode is a documented aggregate metric. Local validation and source inspection show numeric mode uses the most frequent value with a lower-value tie-break, while date mode is stable when a unique most-frequent instant exists."
+doc_notes:
+  - "The checked docs document mode but do not define tie-breaking."
+  - "Source inspection of the local backend shows numeric mode prefers the lower numeric value when counts tie."
+  - "Date-mode tie-breaking is not clearly documented, so the oracle only claims strict equality for unique-mode date subsets and otherwise accepts any tied mode candidate."
+verify_status: edge_validated
+observed_summary: "The local aggregate probe validated numeric mode on scalar and array metrics and unique-mode DATE aggregates. The main aggregate fuzzer treats DATE mode ties conservatively to avoid false positives from undocumented tie-breaking."
+oracle_support:
+  - pandas
+  - aggregate
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
+oracle_mapping: "For numeric properties, the oracle computes mode over scalar values or flattened array elements and applies the observed lower-value tie-break. For DATE, the oracle compares exactly when the filtered subset has a unique mode and otherwise accepts any tied mode candidate. This is our validated local oracle subset, not an official claim."

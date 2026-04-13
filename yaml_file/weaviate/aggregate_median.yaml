@@ -1,0 +1,27 @@
+operator_id: aggregate_median
+family: aggregate
+syntax_examples:
+  - 'collection.aggregate.over_all(return_metrics=Metrics("intVal").integer(median=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("numArr").number(median=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("dateVal").date_(median=True))'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/aggregate"
+doc_supported_types:
+  - int
+  - number
+  - date
+  - date_array
+  - int_array
+  - number_array
+doc_semantics: "Median is a documented aggregate metric for numeric and date properties. Local validation matches the backend implementation: odd-cardinality uses the middle ordered value; even-cardinality numeric medians average the two middle values, and even-cardinality date medians average the two middle instants."
+doc_notes:
+  - "The checked docs document median but do not provide the detailed even-cardinality rule; the local oracle follows the implementation-validated rule."
+verify_status: edge_validated
+observed_summary: "The local aggregate probe validated median over scalar numerics, flattened numeric arrays, and dates, including even-cardinality cases where the median is not necessarily an existing stored value."
+oracle_support:
+  - pandas
+  - aggregate
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
+oracle_mapping: "The oracle computes median over the sorted scalar values or flattened array elements. DATE median is computed in UTC nanosecond time and formatted as RFC3339. Empty-result aggregates follow the locally observed client defaults."

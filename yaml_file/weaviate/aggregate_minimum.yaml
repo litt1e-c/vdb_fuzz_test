@@ -1,0 +1,28 @@
+operator_id: aggregate_minimum
+family: aggregate
+syntax_examples:
+  - 'collection.aggregate.over_all(return_metrics=Metrics("intVal").integer(minimum=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("numArr").number(minimum=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("dateVal").date_(minimum=True))'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/aggregate"
+doc_supported_types:
+  - int
+  - number
+  - date
+  - date_array
+  - int_array
+  - number_array
+doc_semantics: "Minimum is a documented aggregate metric for numeric and date properties. Local validation shows numeric-array minimum is taken over flattened elements and date minimum is reported as a UTC RFC3339 timestamp string."
+doc_notes:
+  - "The checked aggregate guide lists minimum / maximum style aggregate metrics for numeric and date properties."
+  - "The checked docs do not spell out whether arrays aggregate per object or per element; local validation indicates per-element flattening for numeric arrays."
+verify_status: edge_validated
+observed_summary: "The local aggregate probe validated scalar INT / NUMBER minimum, flattened INT_ARRAY / NUMBER_ARRAY minimum, and DATE minimum on both filtered and unfiltered aggregates."
+oracle_support:
+  - pandas
+  - aggregate
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
+oracle_mapping: "The oracle computes minimum over present scalar values or flattened numeric-array elements. DATE minimum is computed by UTC-normalized instant ordering and rendered in canonical RFC3339 form. Empty-result aggregates are modeled with the client-observed zero / empty-string defaults."

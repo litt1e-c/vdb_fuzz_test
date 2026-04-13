@@ -1,0 +1,27 @@
+operator_id: aggregate_maximum
+family: aggregate
+syntax_examples:
+  - 'collection.aggregate.over_all(return_metrics=Metrics("intVal").integer(maximum=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("numArr").number(maximum=True))'
+  - 'collection.aggregate.over_all(return_metrics=Metrics("dateVal").date_(maximum=True))'
+doc_status: operator_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/aggregate"
+doc_supported_types:
+  - int
+  - number
+  - date
+  - date_array
+  - int_array
+  - number_array
+doc_semantics: "Maximum is a documented aggregate metric for numeric and date properties. Local validation shows numeric arrays use flattened elements and date maximum is returned as a UTC RFC3339 timestamp string."
+doc_notes:
+  - "The checked docs document aggregate maximum but do not provide an array-specific flattening truth table."
+verify_status: edge_validated
+observed_summary: "The local aggregate probe validated scalar and flattened-array maximum behavior for numeric properties plus DATE maximum on filtered and unfiltered aggregates."
+oracle_support:
+  - pandas
+  - aggregate
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
+oracle_mapping: "The oracle computes maximum over present scalar values or flattened numeric-array elements. DATE maximum is computed by UTC instant ordering. Empty-result aggregates follow the locally observed client defaults."

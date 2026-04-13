@@ -18,6 +18,7 @@ Features:
 15. Schema evolution: add property mid-test + full backfill before enabling queries
 16. Scalar index mutation: destructive property-index drop with query-space adaptation
 17. Engine-first shadow sync: fetch/retry/resync after dynamic writes before mutating oracle
+18. Aggregate oracle mode: count/min/max/sum/mean/median/mode/top-occurrences over scalar and array probe fields
 
 Notes:
   Historical bug status drifts across Weaviate/client versions, so this file keeps
@@ -36,6 +37,7 @@ import sys
 import uuid
 import argparse
 import re
+from dataclasses import dataclass
 from datetime import timedelta, timezone
 import weaviate
 from weaviate.classes.config import (
@@ -45,6 +47,7 @@ from weaviate.classes.config import (
 from weaviate.classes.query import Filter, GeoCoordinate, GroupBy, Sort, MetadataQuery
 from weaviate.classes.data import DataObject
 from weaviate.classes.config import ConsistencyLevel
+from weaviate.collections.classes.aggregate import Metrics
 
 # --- Null 过滤默认启用 ---
 ENABLE_NULL_FILTER = True
@@ -53,10 +56,37 @@ ENABLE_NULL_FILTER = True
 HOST = "127.0.0.1"
 PORT = 8080
 CLASS_NAME = "FuzzOracleV2"
-N = 3000
+N = 10000
 DIM = 128
 BATCH_SIZE = 200
 SLEEP_INTERVAL = 0.02
+DEFAULT_QUERY_MAXIMUM_RESULTS = 10000
+
+
+def _env_positive_int(name, default):
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+QUERY_MAXIMUM_RESULTS = _env_positive_int(
+    "WEAVIATE_FUZZ_QUERY_MAXIMUM_RESULTS",
+    _env_positive_int("QUERY_MAXIMUM_RESULTS", DEFAULT_QUERY_MAXIMUM_RESULTS),
+)
+QUERY_PAGE_SIZE = _env_positive_int("WEAVIATE_FUZZ_QUERY_PAGE_SIZE", 1000)
+FILTER_PARTITION_SIZE = _env_positive_int("WEAVIATE_FUZZ_FILTER_PARTITION_SIZE", DEFAULT_QUERY_MAXIMUM_RESULTS)
+FILTER_ID_BATCH_SIZE = _env_positive_int("WEAVIATE_FUZZ_FILTER_ID_BATCH_SIZE", 512)
+AGGREGATE_FILTER_MIN_DEPTH = _env_positive_int("WEAVIATE_FUZZ_AGGREGATE_FILTER_MIN_DEPTH", 2)
+AGGREGATE_FILTER_MAX_DEPTH = max(
+    AGGREGATE_FILTER_MIN_DEPTH,
+    _env_positive_int("WEAVIATE_FUZZ_AGGREGATE_FILTER_MAX_DEPTH", 4),
+)
+QUERY_MAXIMUM_RESULTS_RE = re.compile(r"QUERY_MAXIMUM_RESULTS '(\d+)'")
 
 # --- 延迟初始化的随机变量 (在 run() 中种子设置后初始化) ---
 VECTOR_CHECK_RATIO = None
@@ -148,6 +178,265 @@ def format_rfc3339_timestamp(ts, offset_minutes=0):
     timespec = "microseconds" if dt.microsecond else "seconds"
     out = dt.isoformat(timespec=timespec)
     return out.replace("+00:00", "Z")
+
+
+@dataclass
+class PagedFetchResult:
+    objects: list
+    exhausted: bool
+
+
+def get_query_maximum_results():
+    return max(1, int(QUERY_MAXIMUM_RESULTS or DEFAULT_QUERY_MAXIMUM_RESULTS))
+
+
+def get_query_page_size():
+    return max(1, min(int(QUERY_PAGE_SIZE or 1), get_query_maximum_results()))
+
+
+def get_filter_partition_size():
+    return max(1, min(int(FILTER_PARTITION_SIZE or get_query_maximum_results()), get_query_maximum_results()))
+
+
+def get_filter_id_batch_size():
+    return max(1, min(int(FILTER_ID_BATCH_SIZE or 1), get_query_maximum_results()))
+
+
+def update_query_limits_from_error(error):
+    global QUERY_MAXIMUM_RESULTS, QUERY_PAGE_SIZE
+    match = QUERY_MAXIMUM_RESULTS_RE.search(str(error))
+    if not match:
+        return None
+    detected_limit = max(1, int(match.group(1)))
+    QUERY_MAXIMUM_RESULTS = detected_limit
+    QUERY_PAGE_SIZE = max(1, min(int(QUERY_PAGE_SIZE or detected_limit), detected_limit))
+    return detected_limit
+
+
+def is_query_maximum_results_error(error):
+    err = str(error)
+    return ("QUERY_MAXIMUM_RESULTS" in err) or ("query maximum results exceeded" in err.lower())
+
+
+def capped_result_count(count, exhausted):
+    return str(count) if exhausted else f"{count}+"
+
+
+def combine_filters(*filters):
+    active = [flt for flt in filters if flt is not None]
+    if not active:
+        return None
+    combined = active[0]
+    for flt in active[1:]:
+        combined = combined & flt
+    return combined
+
+
+def build_id_subset_filter(ids):
+    ids = [str(object_id) for object_id in ids]
+    if not ids:
+        return None
+    if len(ids) == 1:
+        return Filter.by_id().equal(ids[0])
+    return Filter.by_id().contains_any(ids)
+
+
+def _fetch_objects_single_page(collection, *, limit, **query_kwargs):
+    response = collection.query.fetch_objects(limit=limit, **query_kwargs)
+    objects = list(getattr(response, "objects", None) or [])
+    return PagedFetchResult(objects, len(objects) < limit)
+
+
+def fetch_objects_cursor(collection, *, max_objects=None, page_size=None, **query_kwargs):
+    query_kwargs = dict(query_kwargs)
+    explicit_limit = query_kwargs.pop("limit", None)
+    query_kwargs.pop("offset", None)
+    query_kwargs.pop("after", None)
+    if query_kwargs.get("filters") is not None:
+        raise ValueError("Cursor pagination does not support filtered fetches; use partitioned fetching instead")
+
+    if explicit_limit is not None:
+        max_objects = explicit_limit if max_objects is None else min(max_objects, explicit_limit)
+    if max_objects is not None and max_objects <= 0:
+        return PagedFetchResult([], True)
+
+    page_size = max(1, int(page_size or get_query_page_size()))
+    objects = []
+    after = None
+    seen_after = set()
+
+    while True:
+        remaining = None if max_objects is None else max_objects - len(objects)
+        if remaining is not None and remaining <= 0:
+            return PagedFetchResult(objects, False)
+
+        page_limit = page_size if remaining is None else min(page_size, remaining)
+        if page_limit <= 0:
+            return PagedFetchResult(objects, False)
+
+        call_kwargs = dict(query_kwargs)
+        call_kwargs["limit"] = page_limit
+        if after is not None:
+            call_kwargs["after"] = after
+
+        try:
+            response = collection.query.fetch_objects(**call_kwargs)
+        except Exception as exc:
+            detected_limit = update_query_limits_from_error(exc)
+            if detected_limit is not None and page_limit > detected_limit:
+                page_size = max(1, min(page_size, detected_limit))
+                continue
+            raise
+
+        page_objects = list(getattr(response, "objects", None) or [])
+        if not page_objects:
+            return PagedFetchResult(objects, True)
+
+        objects.extend(page_objects)
+        if len(page_objects) < page_limit:
+            return PagedFetchResult(objects, True)
+
+        next_after = str(page_objects[-1].uuid)
+        if next_after == after or next_after in seen_after:
+            raise RuntimeError("Cursor pagination stalled while fetching Weaviate objects")
+        seen_after.add(next_after)
+        after = next_after
+
+
+def fetch_objects_by_row_num_partitions(collection, dm, *, filters=None, partition_size=None, max_objects=None, **query_kwargs):
+    query_kwargs = dict(query_kwargs)
+    query_kwargs.pop("limit", None)
+    query_kwargs.pop("offset", None)
+    query_kwargs.pop("after", None)
+
+    if dm is None or dm.df is None or dm.df.empty or "row_num" not in dm.df.columns:
+        return PagedFetchResult([], True)
+
+    partition_size = max(1, min(int(partition_size or get_filter_partition_size()), get_query_maximum_results()))
+    row_nums = pd.to_numeric(dm.df["row_num"], errors="coerce").dropna()
+    if row_nums.empty:
+        return PagedFetchResult([], True)
+
+    floor = int(row_nums.min())
+    ceiling = int(row_nums.max())
+    start = (floor // partition_size) * partition_size
+
+    while True:
+        objects = []
+        seen_ids = set()
+        try:
+            for lower in range(start, ceiling + 1, partition_size):
+                upper = lower + partition_size
+                range_filter = (
+                    Filter.by_property("row_num").greater_or_equal(int(lower))
+                    & Filter.by_property("row_num").less_than(int(upper))
+                )
+                batch_filter = combine_filters(filters, range_filter)
+                response = _fetch_objects_single_page(
+                    collection,
+                    filters=batch_filter,
+                    limit=partition_size,
+                    **query_kwargs,
+                )
+                for obj in response.objects:
+                    object_id = str(obj.uuid)
+                    if object_id in seen_ids:
+                        continue
+                    seen_ids.add(object_id)
+                    objects.append(obj)
+                if max_objects is not None and len(objects) >= max_objects:
+                    return PagedFetchResult(objects[:max_objects], False)
+            return PagedFetchResult(objects, True)
+        except Exception as exc:
+            detected_limit = update_query_limits_from_error(exc)
+            if detected_limit is not None and partition_size > detected_limit:
+                partition_size = detected_limit
+                start = (floor // partition_size) * partition_size
+                continue
+            raise
+
+
+def fetch_objects_by_id_batches(collection, dm, *, filters=None, batch_size=None, max_objects=None, **query_kwargs):
+    query_kwargs = dict(query_kwargs)
+    query_kwargs.pop("limit", None)
+    query_kwargs.pop("offset", None)
+    query_kwargs.pop("after", None)
+
+    if dm is None or dm.df is None or dm.df.empty:
+        return PagedFetchResult([], True)
+
+    batch_size = max(1, min(int(batch_size or get_filter_id_batch_size()), get_query_maximum_results()))
+    all_ids = [str(object_id) for object_id in dm.df["id"].tolist()]
+    objects = []
+    seen_ids = set()
+
+    for start in range(0, len(all_ids), batch_size):
+        id_batch = all_ids[start:start + batch_size]
+        id_filter = build_id_subset_filter(id_batch)
+        batch_filter = combine_filters(filters, id_filter)
+        response = _fetch_objects_single_page(
+            collection,
+            filters=batch_filter,
+            limit=len(id_batch),
+            **query_kwargs,
+        )
+        for obj in response.objects:
+            object_id = str(obj.uuid)
+            if object_id in seen_ids:
+                continue
+            seen_ids.add(object_id)
+            objects.append(obj)
+        if max_objects is not None and len(objects) >= max_objects:
+            return PagedFetchResult(objects[:max_objects], False)
+    return PagedFetchResult(objects, True)
+
+
+def fetch_objects_resilient(collection, *, dm=None, filters=None, max_objects=None, page_size=None, **query_kwargs):
+    query_kwargs = dict(query_kwargs)
+    if filters is None:
+        return fetch_objects_cursor(
+            collection,
+            max_objects=max_objects,
+            page_size=page_size,
+            **query_kwargs,
+        )
+
+    if max_objects is None:
+        max_objects = len(dm.df) + 1 if dm is not None and getattr(dm, "df", None) is not None else get_query_maximum_results()
+    if max_objects <= 0:
+        return PagedFetchResult([], True)
+
+    single_limit = max(1, min(int(max_objects), get_query_maximum_results()))
+    try:
+        result = _fetch_objects_single_page(
+            collection,
+            filters=filters,
+            limit=single_limit,
+            **query_kwargs,
+        )
+        if result.exhausted or max_objects <= get_query_maximum_results():
+            return result
+    except Exception as exc:
+        if not is_query_maximum_results_error(exc):
+            raise
+        update_query_limits_from_error(exc)
+
+    try:
+        return fetch_objects_by_row_num_partitions(
+            collection,
+            dm,
+            filters=filters,
+            max_objects=max_objects,
+            **query_kwargs,
+        )
+    except Exception:
+        return fetch_objects_by_id_batches(
+            collection,
+            dm,
+            filters=filters,
+            max_objects=max_objects,
+            **query_kwargs,
+        )
 
 
 def build_number_boundary_values():
@@ -318,7 +607,8 @@ class FieldType:
     NUMBER_ARRAY = "NUMBER_ARRAY"
     BOOL_ARRAY = "BOOL_ARRAY"
     DATE = "DATE"
-    OBJECT = "OBJECT"  # Nested object (对标 Milvus JSON)
+    DATE_ARRAY = "DATE_ARRAY"
+    OBJECT = "OBJECT"  # Nested object 
 
 def get_weaviate_datatype(ftype):
     mapping = {
@@ -332,6 +622,7 @@ def get_weaviate_datatype(ftype):
         FieldType.NUMBER_ARRAY: DataType.NUMBER_ARRAY,
         FieldType.BOOL_ARRAY: DataType.BOOL_ARRAY,
         FieldType.DATE: DataType.DATE,
+        FieldType.DATE_ARRAY: DataType.DATE_ARRAY,
         # OBJECT handled specially in reset_collection
     }
     return mapping.get(ftype)
@@ -339,7 +630,7 @@ def get_weaviate_datatype(ftype):
 
 # --- FuzzStats: 统计/度量收集 ---
 class FuzzStats:
-    """查询延迟、错误分类、通过率等统计信息收集 (对标 Milvus 日志汇总)"""
+    """查询延迟、错误分类、通过率等统计信息收集 (日志汇总)"""
     def __init__(self):
         self.total = 0
         self.passed = 0
@@ -521,6 +812,8 @@ def normalize_scalar_for_compare(ftype, value):
         return canonicalize_date_string(value)
     if ftype == FieldType.GEO:
         return normalize_geo_value(value)
+    if ftype == FieldType.DATE_ARRAY:
+        return [canonicalize_date_string(v) for v in value] if isinstance(value, list) else None
     return value
 
 
@@ -608,6 +901,8 @@ def normalize_weaviate_property_for_oracle(ftype, value):
         return [bool(v) for v in value] if isinstance(value, list) else None
     if ftype == FieldType.TEXT_ARRAY:
         return [str(v) for v in value] if isinstance(value, list) else None
+    if ftype == FieldType.DATE_ARRAY:
+        return [canonicalize_date_string(v) for v in value] if isinstance(value, list) else None
     if ftype == FieldType.OBJECT:
         return convert_numpy_types(value) if isinstance(value, dict) else None
     return convert_numpy_types(value)
@@ -655,6 +950,7 @@ class DataManager:
         self.value_rng = np.random.default_rng(self.seed ^ 0xA17E)
         self.vector_rng = np.random.default_rng(self.seed ^ 0xC0FFEE)
         self.id_counter = 0
+        self.row_num_counter = 0
         self.null_ratio = self.py_rng.uniform(0.05, 0.15)
         self.array_capacity = self.py_rng.randint(5, 20)
         self.int_range = self.py_rng.randint(5000, 100000)
@@ -663,6 +959,21 @@ class DataManager:
     def _next_uuid(self):
         self.id_counter += 1
         return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"weaviate-fuzz-{self.seed}-{self.id_counter}"))
+
+    def _next_row_num(self):
+        current = int(self.row_num_counter)
+        self.row_num_counter += 1
+        return current
+
+    def allocate_row_num(self, existing_id=None):
+        if existing_id is not None and self.df is not None and not self.df.empty:
+            matches = self.df.loc[self.df["id"] == str(existing_id), "row_num"]
+            if not matches.empty:
+                try:
+                    return int(matches.iloc[0])
+                except Exception:
+                    pass
+        return self._next_row_num()
 
     def _random_string(self, min_len=1, max_len=10, boundary=False):
         if boundary and BOUNDARY_INJECTION_RATE and self.py_rng.random() < BOUNDARY_INJECTION_RATE:
@@ -948,7 +1259,9 @@ class DataManager:
         for f in self.schema_config:
             print(f"      - {f['name']:<20} : {f['type']}")
 
-    def generate_single_row(self, id_override=None, row_num=-1):
+    def generate_single_row(self, id_override=None, row_num=None):
+        if row_num is None:
+            row_num = self.allocate_row_num(existing_id=id_override)
         row = {
             "id": str(id_override) if id_override is not None else self._next_uuid(),
             "row_num": int(row_num),
@@ -990,7 +1303,7 @@ class DataManager:
         norms[norms == 0] = 1.0
         self.vectors = (self.vectors / norms[:, np.newaxis]).astype(np.float32)
 
-        rows = [self.generate_single_row(row_num=i) for i in range(N)]
+        rows = [self.generate_single_row(row_num=self._next_row_num()) for _ in range(N)]
         self.df = self.rows_to_dataframe(rows)
 
         for field in self.schema_config:
@@ -1005,7 +1318,796 @@ class DataManager:
         print(f"   -> Null counts (sample): {dict(list(null_counts.items())[:5])}")
 
 
+AGGREGATE_PROBE_FIELDS = [
+    {"name": "agg_filter_bucket", "type": FieldType.INT, "index_filterable": True, "index_range": True},
+    {"name": "agg_int_metric", "type": FieldType.INT, "index_filterable": True, "index_range": True},
+    {"name": "agg_num_metric", "type": FieldType.NUMBER, "index_filterable": True, "index_range": True},
+    {"name": "agg_bool_metric", "type": FieldType.BOOL, "index_filterable": True},
+    {"name": "agg_text_metric", "type": FieldType.TEXT, "index_filterable": True, "index_searchable": True},
+    {"name": "agg_date_metric", "type": FieldType.DATE, "index_filterable": True, "index_range": True},
+    {"name": "agg_date_array_metric", "type": FieldType.DATE_ARRAY, "index_filterable": True},
+    {"name": "agg_int_array_metric", "type": FieldType.INT_ARRAY, "index_filterable": True},
+    {"name": "agg_num_array_metric", "type": FieldType.NUMBER_ARRAY, "index_filterable": True},
+    {"name": "agg_bool_array_metric", "type": FieldType.BOOL_ARRAY, "index_filterable": True},
+    {"name": "agg_text_array_metric", "type": FieldType.TEXT_ARRAY, "index_filterable": True},
+]
+
+
+def _copy_probe_value(value):
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
+def _aggregate_probe_value(field_name, row_num):
+    row_num = int(row_num)
+
+    if field_name == "agg_filter_bucket":
+        return int(row_num % 7)
+
+    if field_name == "agg_int_metric":
+        if row_num % 17 == 0:
+            return None
+        if row_num % 101 == 0:
+            boundary_values = [-1_000_000_000, -1024, 0, 1024, 1_000_000_000]
+            return int(boundary_values[(row_num // 101) % len(boundary_values)])
+        values = [-1024, -1, 0, 3, 3, 7, 7, 7, 1024]
+        return int(values[row_num % len(values)])
+
+    if field_name == "agg_num_metric":
+        if row_num % 19 == 0:
+            return None
+        if row_num % 103 == 0:
+            boundary_values = [
+                -1e12,
+                float(next_float(0.0, -np.inf) or -1e-12),
+                0.0,
+                float(next_float(0.0, np.inf) or 1e-12),
+                1e12,
+            ]
+            return float(boundary_values[(row_num // 103) % len(boundary_values)])
+        values = [-2.5, -0.5, 0.0, 1.25, 1.25, 4.75, 4.75, 4.75, 1e6]
+        return float(values[row_num % len(values)])
+
+    if field_name == "agg_bool_metric":
+        if row_num % 13 == 0:
+            return None
+        values = [True, True, False, True, False, True]
+        return bool(values[row_num % len(values)])
+
+    if field_name == "agg_text_metric":
+        if row_num % 23 == 0:
+            return None
+        values = ["alpha", "alpha", "beta", "gamma", "gamma", "gamma", "delta", "epsilon"]
+        return str(values[row_num % len(values)])
+
+    if field_name == "agg_date_metric":
+        if row_num % 29 == 0:
+            return None
+        values = [
+            "1969-12-31T23:59:59Z",
+            "2024-01-01T00:00:00Z",
+            "2024-01-02T00:00:00Z",
+            "2024-01-02T12:00:00Z",
+            "2024-01-05T00:00:00.25Z",
+            "2024-01-05T00:00:00.25Z",
+            "2024-01-05T00:00:00.25Z",
+            "2024-02-29T12:34:56.123456Z",
+            "2024-03-01T00:00:00Z",
+            "2026-12-31T23:59:59.999999Z",
+        ]
+        return str(values[row_num % len(values)])
+
+    if field_name == "agg_int_array_metric":
+        if row_num % 11 == 0:
+            return None
+        values = [
+            [1, 2],
+            [2],
+            [3, 3, 3],
+            [],
+            [7, -1, 7],
+            [0],
+            [-1024, 1024],
+        ]
+        return _copy_probe_value(values[row_num % len(values)])
+
+    if field_name == "agg_date_array_metric":
+        if row_num % 15 == 0:
+            return None
+        values = [
+            ["1969-12-31T23:59:59Z", "2024-01-01T00:00:00Z"],
+            ["2024-01-05T00:00:00.25Z"],
+            [],
+            ["2024-01-05T00:00:00.25Z", "2026-12-31T23:59:59.999999Z"],
+            ["2024-02-29T12:34:56.123456Z"],
+        ]
+        return _copy_probe_value(values[row_num % len(values)])
+
+    if field_name == "agg_num_array_metric":
+        if row_num % 12 == 0:
+            return None
+        values = [
+            [1.5, 2.5],
+            [2.5],
+            [4.75, 4.75],
+            [],
+            [-1.25, 9.5],
+            [0.0],
+            [float(next_float(0.0, -np.inf) or -1e-12), float(next_float(0.0, np.inf) or 1e-12)],
+        ]
+        return _copy_probe_value(values[row_num % len(values)])
+
+    if field_name == "agg_bool_array_metric":
+        if row_num % 14 == 0:
+            return None
+        values = [
+            [True, False],
+            [True],
+            [],
+            [False, False],
+            [True, True, False],
+        ]
+        return _copy_probe_value(values[row_num % len(values)])
+
+    if field_name == "agg_text_array_metric":
+        if row_num % 16 == 0:
+            return None
+        values = [
+            ["alpha", "beta"],
+            ["gamma"],
+            [],
+            ["gamma", "gamma"],
+            ["delta", "alpha"],
+            ["epsilon"],
+        ]
+        return _copy_probe_value(values[row_num % len(values)])
+
+    raise KeyError(f"Unknown aggregate probe field: {field_name}")
+
+
+def inject_aggregate_probe_fields(dm):
+    if dm.df is None or dm.df.empty:
+        return
+
+    existing = {field["name"] for field in dm.schema_config}
+    for spec in AGGREGATE_PROBE_FIELDS:
+        if spec["name"] not in existing:
+            dm.schema_config.append(dict(spec))
+            existing.add(spec["name"])
+
+    row_nums = pd.to_numeric(dm.df["row_num"], errors="coerce").fillna(-1).astype(int).tolist()
+    for spec, row_num_values in [(spec, row_nums) for spec in AGGREGATE_PROBE_FIELDS]:
+        dm.df[spec["name"]] = [
+            _aggregate_probe_value(spec["name"], row_num)
+            for row_num in row_num_values
+        ]
+
+    dm.normalize_dataframe_types()
+
+
 # --- 2. Weaviate Manager ---
+
+def select_rows_by_mask(df, mask):
+    if df is None:
+        return pd.DataFrame()
+    if mask is None:
+        return df.iloc[0:0].copy()
+
+    if isinstance(mask, pd.Series):
+        series = mask.copy()
+    elif np.isscalar(mask):
+        series = pd.Series([bool(mask)] * len(df), index=df.index)
+    else:
+        try:
+            series = pd.Series(list(mask), index=df.index)
+        except Exception:
+            series = pd.Series([False] * len(df), index=df.index)
+
+    if not series.index.equals(df.index):
+        series = series.reindex(df.index)
+
+    bool_indexer = series.fillna(False).astype(bool).to_numpy()
+    return df.loc[bool_indexer].copy()
+
+
+def format_rfc3339_nano(ts):
+    value = to_utc_timestamp(ts)
+    if value is None:
+        return ""
+
+    epoch_ns = int(value.value)
+    sec, nanos = divmod(epoch_ns, 1_000_000_000)
+    dt = pd.Timestamp(sec, unit="s", tz="UTC").to_pydatetime()
+    out = dt.strftime("%Y-%m-%dT%H:%M:%S")
+    if nanos:
+        out += f".{nanos:09d}".rstrip("0")
+    return out + "Z"
+
+
+def aggregate_family_for_type(ftype):
+    if ftype in (FieldType.INT, FieldType.INT_ARRAY):
+        return "integer"
+    if ftype in (FieldType.NUMBER, FieldType.NUMBER_ARRAY):
+        return "number"
+    if ftype in (FieldType.BOOL, FieldType.BOOL_ARRAY):
+        return "boolean"
+    if ftype in (FieldType.TEXT, FieldType.TEXT_ARRAY):
+        return "text"
+    if ftype in (FieldType.DATE, FieldType.DATE_ARRAY):
+        return "date"
+    raise ValueError(f"Unsupported aggregate type: {ftype}")
+
+
+def flatten_values_for_aggregate(frame, field_config):
+    if frame is None or frame.empty:
+        return []
+
+    name = field_config["name"]
+    ftype = field_config["type"]
+    if name not in frame.columns:
+        return []
+
+    values = []
+    for raw in frame[name].tolist():
+        if ftype == FieldType.INT:
+            if not is_null_like(raw):
+                values.append(int(raw))
+        elif ftype == FieldType.NUMBER:
+            if not is_null_like(raw):
+                values.append(float(raw))
+        elif ftype == FieldType.BOOL:
+            if not is_null_like(raw):
+                values.append(bool(raw))
+        elif ftype == FieldType.TEXT:
+            if raw is not None and not (isinstance(raw, float) and np.isnan(raw)):
+                values.append(str(raw))
+        elif ftype == FieldType.DATE:
+            parsed = to_utc_timestamp(raw)
+            if parsed is not None:
+                values.append(parsed)
+        elif ftype == FieldType.DATE_ARRAY:
+            if isinstance(raw, list):
+                for item in raw:
+                    parsed = to_utc_timestamp(item)
+                    if parsed is not None:
+                        values.append(parsed)
+        elif ftype == FieldType.INT_ARRAY:
+            if isinstance(raw, list):
+                values.extend(int(item) for item in raw if not is_null_like(item))
+        elif ftype == FieldType.NUMBER_ARRAY:
+            if isinstance(raw, list):
+                values.extend(float(item) for item in raw if not is_null_like(item))
+        elif ftype == FieldType.BOOL_ARRAY:
+            if isinstance(raw, list):
+                values.extend(bool(item) for item in raw if not is_null_like(item))
+        elif ftype == FieldType.TEXT_ARRAY:
+            if isinstance(raw, list):
+                values.extend(str(item) for item in raw if item is not None)
+    return values
+
+
+def numeric_mode_with_tiebreak(values):
+    if not values:
+        return 0
+    counter = {}
+    for value in values:
+        counter[value] = counter.get(value, 0) + 1
+    max_count = max(counter.values())
+    return min(value for value, count in counter.items() if count == max_count)
+
+
+def numeric_median(values):
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2 == 1:
+        return float(ordered[mid])
+    return float(ordered[mid - 1] + ordered[mid]) / 2.0
+
+
+def expected_numeric_aggregate(values, integer=False):
+    if not values:
+        return {
+            "count": 0,
+            "maximum": 0,
+            "mean": 0.0,
+            "median": 0.0,
+            "minimum": 0,
+            "mode": 0,
+            "sum_": 0,
+        }
+
+    total = sum(values)
+    mode_value = numeric_mode_with_tiebreak(values)
+    result = {
+        "count": int(len(values)),
+        "maximum": max(values),
+        "mean": float(total) / float(len(values)),
+        "median": numeric_median(values),
+        "minimum": min(values),
+        "mode": mode_value,
+        "sum_": total,
+    }
+    if integer:
+        result["maximum"] = int(result["maximum"])
+        result["minimum"] = int(result["minimum"])
+        result["mode"] = int(result["mode"])
+        result["sum_"] = int(result["sum_"])
+    else:
+        result["maximum"] = float(result["maximum"])
+        result["minimum"] = float(result["minimum"])
+        result["mode"] = float(result["mode"])
+        result["sum_"] = float(result["sum_"])
+    return result
+
+
+def expected_boolean_aggregate(values):
+    if not values:
+        return {
+            "count": 0,
+            "percentage_false": float("nan"),
+            "percentage_true": float("nan"),
+            "total_false": 0,
+            "total_true": 0,
+        }
+
+    total_true = int(sum(1 for value in values if bool(value)))
+    total_false = int(len(values) - total_true)
+    count = int(len(values))
+    return {
+        "count": count,
+        "percentage_false": float(total_false) / float(count),
+        "percentage_true": float(total_true) / float(count),
+        "total_false": total_false,
+        "total_true": total_true,
+    }
+
+
+def expected_date_aggregate(values):
+    if not values:
+        return {
+            "count": 0,
+            "maximum": "",
+            "median": "",
+            "minimum": "",
+            "mode": "",
+            "_mode_candidates": set(),
+        }
+
+    ordered = sorted(int(value.value) for value in values)
+    count = len(ordered)
+    mid = count // 2
+    if count % 2 == 1:
+        median_ns = ordered[mid]
+    else:
+        median_ns = ordered[mid - 1] + (ordered[mid] - ordered[mid - 1]) // 2
+
+    counter = {}
+    for epoch_ns in ordered:
+        counter[epoch_ns] = counter.get(epoch_ns, 0) + 1
+    max_count = max(counter.values())
+    mode_candidates = {format_rfc3339_nano(pd.Timestamp(epoch_ns, unit="ns", tz="UTC")) for epoch_ns, freq in counter.items() if freq == max_count}
+    canonical_sorted = [format_rfc3339_nano(pd.Timestamp(epoch_ns, unit="ns", tz="UTC")) for epoch_ns in ordered]
+
+    return {
+        "count": int(count),
+        "maximum": canonical_sorted[-1],
+        "median": format_rfc3339_nano(pd.Timestamp(median_ns, unit="ns", tz="UTC")),
+        "minimum": canonical_sorted[0],
+        "mode": sorted(mode_candidates)[0],
+        "_mode_candidates": set(mode_candidates),
+    }
+
+
+def expected_text_aggregate(values, limit=5):
+    if not values:
+        return {
+            "count": 0,
+            "top_occurrences": [],
+            "_top_occurrences_stable": True,
+        }
+
+    counter = {}
+    for value in values:
+        counter[value] = counter.get(value, 0) + 1
+
+    ordered = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    stable = True
+    if limit is not None and len(ordered) > limit:
+        cutoff = ordered[limit - 1][1]
+        included = sum(1 for _, freq in ordered[:limit] if freq == cutoff)
+        total_at_cutoff = sum(1 for _, freq in ordered if freq == cutoff)
+        stable = included == total_at_cutoff
+
+    top = ordered if limit is None else ordered[:limit]
+    return {
+        "count": int(len(values)),
+        "top_occurrences": [{"value": value, "count": int(freq)} for value, freq in top],
+        "_top_occurrences_stable": stable,
+    }
+
+
+def build_expected_aggregate(field_config, frame, *, text_limit=5):
+    values = flatten_values_for_aggregate(frame, field_config)
+    family = aggregate_family_for_type(field_config["type"])
+    if family == "integer":
+        return expected_numeric_aggregate(values, integer=True)
+    if family == "number":
+        return expected_numeric_aggregate(values, integer=False)
+    if family == "boolean":
+        return expected_boolean_aggregate(values)
+    if family == "date":
+        return expected_date_aggregate(values)
+    if family == "text":
+        return expected_text_aggregate(values, limit=text_limit)
+    raise ValueError(f"Unsupported aggregate family: {family}")
+
+
+def build_aggregate_metrics(field_config, *, text_limit=5):
+    name = field_config["name"]
+    family = aggregate_family_for_type(field_config["type"])
+    if family == "integer":
+        return Metrics(name).integer(count=True, maximum=True, mean=True, median=True, minimum=True, mode=True, sum_=True)
+    if family == "number":
+        return Metrics(name).number(count=True, maximum=True, mean=True, median=True, minimum=True, mode=True, sum_=True)
+    if family == "boolean":
+        return Metrics(name).boolean(
+            count=True,
+            percentage_false=True,
+            percentage_true=True,
+            total_false=True,
+            total_true=True,
+        )
+    if family == "date":
+        return Metrics(name).date_(count=True, maximum=True, median=True, minimum=True, mode=True)
+    if family == "text":
+        return Metrics(name).text(
+            count=True,
+            top_occurrences_count=True,
+            top_occurrences_value=True,
+            limit=text_limit,
+        )
+    raise ValueError(f"Unsupported aggregate family: {family}")
+
+
+def _floats_match(actual, expected, tol=1e-9):
+    try:
+        actual_f = float(actual)
+        expected_f = float(expected)
+    except Exception:
+        return False
+    if np.isnan(actual_f) and np.isnan(expected_f):
+        return True
+    return bool(np.isclose(actual_f, expected_f, rtol=tol, atol=tol, equal_nan=True))
+
+
+def compare_aggregate_property(actual_prop, expected, field_config):
+    family = aggregate_family_for_type(field_config["type"])
+    mismatches = []
+
+    if family in {"integer", "number"}:
+        for key in ["count", "maximum", "mean", "median", "minimum", "mode", "sum_"]:
+            actual = getattr(actual_prop, key)
+            target = expected[key]
+            if key in {"count", "maximum", "minimum", "mode", "sum_"} and family == "integer":
+                if int(actual) != int(target):
+                    mismatches.append(f"{key}: expected {target}, got {actual}")
+            else:
+                if not _floats_match(actual, target):
+                    mismatches.append(f"{key}: expected {target}, got {actual}")
+        return mismatches
+
+    if family == "boolean":
+        for key in ["count", "total_false", "total_true"]:
+            actual = getattr(actual_prop, key)
+            target = expected[key]
+            if int(actual) != int(target):
+                mismatches.append(f"{key}: expected {target}, got {actual}")
+        for key in ["percentage_false", "percentage_true"]:
+            actual = getattr(actual_prop, key)
+            target = expected[key]
+            if not _floats_match(actual, target):
+                mismatches.append(f"{key}: expected {target}, got {actual}")
+        return mismatches
+
+    if family == "date":
+        for key in ["count", "maximum", "median", "minimum"]:
+            actual = getattr(actual_prop, key)
+            target = expected[key]
+            if key == "count":
+                if int(actual) != int(target):
+                    mismatches.append(f"{key}: expected {target}, got {actual}")
+            elif str(actual) != str(target):
+                mismatches.append(f"{key}: expected {target}, got {actual}")
+
+        actual_mode = str(getattr(actual_prop, "mode"))
+        mode_candidates = expected.get("_mode_candidates") or {expected["mode"]}
+        if actual_mode not in mode_candidates:
+            mismatches.append(f"mode: expected one of {sorted(mode_candidates)}, got {actual_mode}")
+        return mismatches
+
+    if family == "text":
+        if int(getattr(actual_prop, "count")) != int(expected["count"]):
+            mismatches.append(f"count: expected {expected['count']}, got {getattr(actual_prop, 'count')}")
+        if expected.get("_top_occurrences_stable", True):
+            actual_pairs = sorted(
+                [{"value": occ.value, "count": int(occ.count)} for occ in getattr(actual_prop, "top_occurrences", [])],
+                key=lambda item: (-item["count"], item["value"]),
+            )
+            expected_pairs = sorted(expected["top_occurrences"], key=lambda item: (-item["count"], item["value"]))
+            if actual_pairs != expected_pairs:
+                mismatches.append(f"top_occurrences: expected {expected_pairs}, got {actual_pairs}")
+        return mismatches
+
+    mismatches.append(f"Unsupported aggregate family: {family}")
+    return mismatches
+
+
+def aggregate_probe_field_map(dm):
+    wanted = {spec["name"] for spec in AGGREGATE_PROBE_FIELDS if spec["name"] != "agg_filter_bucket"}
+    return {field["name"]: field for field in dm.schema_config if field["name"] in wanted}
+
+
+def aggregate_null_mask(series, ftype):
+    if ftype == FieldType.TEXT:
+        return series.apply(lambda value: value is None or (isinstance(value, float) and np.isnan(value)) or value == "")
+    if ftype in (FieldType.INT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY, FieldType.TEXT_ARRAY, FieldType.DATE_ARRAY):
+        return series.apply(
+            lambda value: value is None
+            or (isinstance(value, float) and np.isnan(value))
+            or (isinstance(value, list) and len(value) == 0)
+        )
+    if ftype == FieldType.DATE:
+        return series.apply(lambda value: to_utc_timestamp(value) is None)
+    return series.apply(is_null_like)
+
+
+def _normalize_bool_mask(mask, index):
+    if isinstance(mask, pd.Series):
+        series = mask.copy()
+    else:
+        series = pd.Series(mask, index=index)
+    if not series.index.equals(index):
+        series = series.reindex(index)
+    return series.fillna(False).astype(bool)
+
+
+def _choose_present_scalar_value(series, caster=None):
+    present = [value for value in series.tolist() if value is not None and not (isinstance(value, float) and np.isnan(value))]
+    if not present:
+        return None
+    value = random.choice(present)
+    return caster(value) if caster is not None else value
+
+
+def _choose_array_targets(series, *, count=1):
+    items = []
+    for value in series.tolist():
+        if isinstance(value, list):
+            items.extend(value)
+    unique = list(dict.fromkeys(items))
+    if not unique:
+        return None
+    target_count = max(1, min(int(count), len(unique)))
+    return random.sample(unique, target_count)
+
+
+def generate_simple_aggregate_filter(dm):
+    df = dm.df
+    index = df.index
+    choices = [
+        "bucket_eq",
+        "bucket_range",
+        "int_equal",
+        "num_range",
+        "bool_equal",
+        "text_equal",
+        "date_range",
+        "null_check",
+        "date_array_contains",
+        "int_array_contains",
+        "text_array_contains",
+        "bool_array_contains",
+    ]
+    choice = random.choice(choices)
+
+    if choice == "bucket_eq":
+        series = df["agg_filter_bucket"]
+        value = int(random.choice(sorted(int(v) for v in series.dropna().unique().tolist())))
+        mask = series.apply(lambda item, target=value: int(item) == target if not is_null_like(item) else False)
+        return Filter.by_property("agg_filter_bucket").equal(value), mask, f"agg_filter_bucket == {value}"
+
+    if choice == "bucket_range":
+        lo = random.randint(0, 4)
+        hi = random.randint(lo, 6)
+        series = df["agg_filter_bucket"]
+        mask = series.apply(lambda item, left=lo, right=hi: left <= int(item) <= right if not is_null_like(item) else False)
+        flt = Filter.by_property("agg_filter_bucket").greater_or_equal(int(lo)) & Filter.by_property("agg_filter_bucket").less_or_equal(int(hi))
+        return flt, mask, f"agg_filter_bucket in [{lo},{hi}]"
+
+    if choice == "int_equal":
+        series = df["agg_int_metric"]
+        value = _choose_present_scalar_value(series, int)
+        if value is None:
+            return None, None, None
+        mask = series.apply(lambda item, target=value: int(item) == target if not is_null_like(item) else False)
+        return Filter.by_property("agg_int_metric").equal(int(value)), mask, f"agg_int_metric == {value}"
+
+    if choice == "num_range":
+        series = df["agg_num_metric"]
+        values = sorted(float(item) for item in series.dropna().tolist())
+        if not values:
+            return None, None, None
+        anchor = float(random.choice(values))
+        lo = next_float(anchor, -np.inf)
+        hi = next_float(anchor, np.inf)
+        if lo is None or hi is None:
+            lo = anchor - 1e-9
+            hi = anchor + 1e-9
+        mask = series.apply(lambda item, left=lo, right=hi: left <= float(item) <= right if not is_null_like(item) else False)
+        flt = Filter.by_property("agg_num_metric").greater_or_equal(float(lo)) & Filter.by_property("agg_num_metric").less_or_equal(float(hi))
+        return flt, mask, f"agg_num_metric in [{lo},{hi}]"
+
+    if choice == "bool_equal":
+        series = df["agg_bool_metric"]
+        value = bool(random.choice([True, False]))
+        mask = series.apply(lambda item, target=value: bool(item) == target if not is_null_like(item) else False)
+        return Filter.by_property("agg_bool_metric").equal(value), mask, f"agg_bool_metric == {value}"
+
+    if choice == "text_equal":
+        series = df["agg_text_metric"]
+        value = _choose_present_scalar_value(series, str)
+        if value is None:
+            return None, None, None
+        mask = series.apply(lambda item, target=value: str(item) == target if item is not None and not (isinstance(item, float) and np.isnan(item)) else False)
+        return Filter.by_property("agg_text_metric").equal(value), mask, f'agg_text_metric == "{value}"'
+
+    if choice == "date_range":
+        series = df["agg_date_metric"]
+        present = [to_utc_timestamp(item) for item in series.tolist()]
+        present = [item for item in present if item is not None]
+        if not present:
+            return None, None, None
+        anchor = random.choice(present)
+        delta = random.choice([pd.Timedelta(microseconds=0), pd.Timedelta(microseconds=1), pd.Timedelta(seconds=1)])
+        lo = format_rfc3339_nano(anchor - delta)
+        hi = format_rfc3339_nano(anchor + delta)
+        mask = series.apply(
+            lambda item, left=to_utc_timestamp(lo), right=to_utc_timestamp(hi): left <= to_utc_timestamp(item) <= right
+            if to_utc_timestamp(item) is not None
+            else False
+        )
+        flt = Filter.by_property("agg_date_metric").greater_or_equal(lo) & Filter.by_property("agg_date_metric").less_or_equal(hi)
+        return flt, mask, f"agg_date_metric in [{lo},{hi}]"
+
+    if choice == "null_check":
+        field_name, ftype = random.choice(
+            [
+                ("agg_int_metric", FieldType.INT),
+                ("agg_bool_metric", FieldType.BOOL),
+                ("agg_text_metric", FieldType.TEXT),
+                ("agg_date_metric", FieldType.DATE),
+                ("agg_date_array_metric", FieldType.DATE_ARRAY),
+                ("agg_int_array_metric", FieldType.INT_ARRAY),
+                ("agg_text_array_metric", FieldType.TEXT_ARRAY),
+            ]
+        )
+        series = df[field_name]
+        null_mask = aggregate_null_mask(series, ftype)
+        if random.random() < 0.5:
+            return Filter.by_property(field_name).is_none(True), null_mask, f"{field_name} is null"
+        return Filter.by_property(field_name).is_none(False), ~null_mask, f"{field_name} is not null"
+
+    if choice == "date_array_contains":
+        series = df["agg_date_array_metric"]
+        targets = _choose_array_targets(series, count=1)
+        if not targets:
+            return None, None, None
+        target = str(targets[0])
+        mask = series.apply(lambda item, value=target: value in item if isinstance(item, list) else False)
+        return Filter.by_property("agg_date_array_metric").contains_any([target]), mask, f"agg_date_array_metric contains_any [{target}]"
+
+    if choice == "int_array_contains":
+        series = df["agg_int_array_metric"]
+        targets = _choose_array_targets(series, count=random.choice([1, 2]))
+        if not targets:
+            return None, None, None
+        mode = random.choice(["contains_any", "contains_all", "contains_none"])
+        if mode == "contains_any":
+            mask = series.apply(lambda item, vals=targets: any(val in item for val in vals) if isinstance(item, list) else False)
+            return Filter.by_property("agg_int_array_metric").contains_any([int(value) for value in targets]), mask, f"agg_int_array_metric contains_any {targets}"
+        if mode == "contains_all":
+            mask = series.apply(lambda item, vals=targets: all(val in item for val in vals) if isinstance(item, list) else False)
+            return Filter.by_property("agg_int_array_metric").contains_all([int(value) for value in targets]), mask, f"agg_int_array_metric contains_all {targets}"
+        mask = series.apply(lambda item, vals=targets: not any(val in item for val in vals) if isinstance(item, list) else True)
+        return Filter.by_property("agg_int_array_metric").contains_none([int(value) for value in targets]), mask, f"agg_int_array_metric contains_none {targets}"
+
+    if choice == "text_array_contains":
+        series = df["agg_text_array_metric"]
+        targets = _choose_array_targets(series, count=random.choice([1, 2]))
+        if not targets:
+            return None, None, None
+        mode = random.choice(["contains_any", "contains_all", "contains_none"])
+        if mode == "contains_any":
+            mask = series.apply(lambda item, vals=targets: any(val in item for val in vals) if isinstance(item, list) else False)
+            return Filter.by_property("agg_text_array_metric").contains_any([str(value) for value in targets]), mask, f"agg_text_array_metric contains_any {targets}"
+        if mode == "contains_all":
+            mask = series.apply(lambda item, vals=targets: all(val in item for val in vals) if isinstance(item, list) else False)
+            return Filter.by_property("agg_text_array_metric").contains_all([str(value) for value in targets]), mask, f"agg_text_array_metric contains_all {targets}"
+        mask = series.apply(lambda item, vals=targets: not any(val in item for val in vals) if isinstance(item, list) else True)
+        return Filter.by_property("agg_text_array_metric").contains_none([str(value) for value in targets]), mask, f"agg_text_array_metric contains_none {targets}"
+
+    if choice == "bool_array_contains":
+        series = df["agg_bool_array_metric"]
+        targets = _choose_array_targets(series, count=random.choice([1, 2]))
+        if not targets:
+            return None, None, None
+        mask = series.apply(lambda item, vals=targets: any(val in item for val in vals) if isinstance(item, list) else False)
+        return Filter.by_property("agg_bool_array_metric").contains_any([bool(value) for value in targets]), mask, f"agg_bool_array_metric contains_any {targets}"
+
+    return None, None, None
+
+
+def generate_aggregate_filter(dm):
+    base_index = dm.df.index
+    if random.random() < 0.15:
+        return None, pd.Series(True, index=base_index, dtype=bool), "ALL", {"depth": 0, "atoms": 0, "target_depth": 0}
+
+    def leaf():
+        flt, mask, expr = generate_simple_aggregate_filter(dm)
+        if flt is None:
+            return None, None, None, None
+        return flt, _normalize_bool_mask(mask, base_index), expr, {"depth": 0, "atoms": 1}
+
+    def rec(depth):
+        if depth <= 0:
+            return leaf()
+
+        op = random.choices(["and", "or", "not"], weights=[0.45, 0.40, 0.15], k=1)[0]
+        if op == "not":
+            inner_filter, inner_mask, inner_expr, inner_meta = rec(depth - 1)
+            if inner_filter is None:
+                return leaf()
+            return (
+                Filter.not_(inner_filter),
+                ~inner_mask,
+                f"NOT({inner_expr})",
+                {"depth": 1 + int(inner_meta["depth"]), "atoms": int(inner_meta["atoms"])},
+            )
+
+        left_filter, left_mask, left_expr, left_meta = rec(depth - 1)
+        right_filter, right_mask, right_expr, right_meta = rec(depth - 1)
+        if left_filter is None:
+            return right_filter, right_mask, right_expr, right_meta
+        if right_filter is None:
+            return left_filter, left_mask, left_expr, left_meta
+
+        if op == "and":
+            return (
+                left_filter & right_filter,
+                left_mask & right_mask,
+                f"({left_expr} AND {right_expr})",
+                {"depth": 1 + max(int(left_meta["depth"]), int(right_meta["depth"])), "atoms": int(left_meta["atoms"]) + int(right_meta["atoms"])},
+            )
+        return (
+            left_filter | right_filter,
+            left_mask | right_mask,
+            f"({left_expr} OR {right_expr})",
+            {"depth": 1 + max(int(left_meta["depth"]), int(right_meta["depth"])), "atoms": int(left_meta["atoms"]) + int(right_meta["atoms"])},
+        )
+
+    depth = random.randint(AGGREGATE_FILTER_MIN_DEPTH, AGGREGATE_FILTER_MAX_DEPTH)
+    flt, mask, expr, meta = rec(depth)
+    if flt is None:
+        return None, pd.Series(True, index=base_index, dtype=bool), "ALL", {"depth": 0, "atoms": 0, "target_depth": depth}
+    meta = dict(meta or {})
+    meta["target_depth"] = depth
+    return flt, _normalize_bool_mask(mask, base_index), expr, meta
 
 class WeaviateManager:
     def __init__(self):
@@ -1079,10 +2181,16 @@ class WeaviateManager:
                 continue
             wv_type = get_weaviate_datatype(field["type"])
             if wv_type:
-                # Scalar index config fuzzing (对标 Milvus 标量索引随机创建)
-                idx_filterable = True if field["type"] == FieldType.GEO else random.choice([True, True, True, False])  # 75% on
-                idx_searchable = random.choice([True, False]) if field["type"] == FieldType.TEXT else False
-                idx_range = random.choice([True, False]) if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.DATE) else False
+                # Scalar index config fuzzing (标量索引随机创建)
+                idx_filterable = field.get("index_filterable")
+                if idx_filterable is None:
+                    idx_filterable = True if field["type"] == FieldType.GEO else random.choice([True, True, True, False])  # 75% on
+                idx_searchable = field.get("index_searchable")
+                if idx_searchable is None:
+                    idx_searchable = random.choice([True, False]) if field["type"] == FieldType.TEXT else False
+                idx_range = field.get("index_range")
+                if idx_range is None:
+                    idx_range = random.choice([True, False]) if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.DATE) else False
                 # TEXT/TEXT_ARRAY 使用 Tokenization.FIELD: 精确匹配, 区分大小写, 无停用词过滤
                 tok = Tokenization.FIELD if field["type"] in (FieldType.TEXT, FieldType.TEXT_ARRAY) else None
                 p_kwargs = dict(name=field["name"], data_type=wv_type,
@@ -1103,7 +2211,14 @@ class WeaviateManager:
                 if field["type"] == FieldType.TEXT and idx_searchable:
                     searchable_text_fields.add(field["name"])
                 index_config_log.append(f"{field['name']}: filt={idx_filterable} search={idx_searchable} range={idx_range}")
-        properties.append(Property(name="row_num", data_type=DataType.INT))
+        properties.append(
+            Property(
+                name="row_num",
+                data_type=DataType.INT,
+                index_filterable=True,
+                index_range_filters=True,
+            )
+        )
         if index_config_log:
             print(f"   -> Scalar index config: {len(index_config_log)} fields randomized")
             for ic in index_config_log[:5]:
@@ -1437,93 +2552,78 @@ class WeaviateManager:
 
         raise ValueError(f"Unsupported vector index type: {vi_type}")
 
-    def sync_creation_times(self, dm, ids=None, retries=3):
+    def _sync_metadata_column(self, dm, ids, retries, column_name, metadata_query, metadata_attr):
         if self.client is None or dm.df.empty:
             return
 
         collection = self.client.collections.get(CLASS_NAME)
-        target_ids = None if ids is None else [str(x) for x in ids]
+        target_ids = None if ids is None else list(dict.fromkeys(str(x) for x in ids))
+        if target_ids is not None and not target_ids:
+            return
+
+        target_set = set(target_ids or [])
+        use_id_filter = bool(target_ids) and len(target_ids) <= get_query_page_size()
+        fetch_cap = len(target_ids) if use_id_filter else len(dm.df) + 1
         mapping = {}
 
         for attempt in range(retries):
             kwargs = {
-                "limit": max(1, len(target_ids) if target_ids is not None else len(dm.df) + 10),
-                "return_metadata": MetadataQuery(creation_time=True),
+                "return_metadata": metadata_query,
                 "return_properties": False,
             }
-            if target_ids:
+            if use_id_filter:
                 if len(target_ids) == 1:
                     kwargs["filters"] = Filter.by_id().equal(target_ids[0])
                 else:
                     kwargs["filters"] = Filter.by_id().contains_any(target_ids)
 
-            response = collection.query.fetch_objects(**kwargs)
+            if use_id_filter:
+                response = fetch_objects_resilient(collection, dm=dm, max_objects=fetch_cap, **kwargs)
+            else:
+                response = fetch_objects_cursor(collection, max_objects=fetch_cap, **kwargs)
             mapping = {
                 str(obj.uuid): self._normalize_metadata_time(
-                    getattr(getattr(obj, "metadata", None), "creation_time", None)
+                    getattr(getattr(obj, "metadata", None), metadata_attr, None)
                 )
                 for obj in response.objects
+                if target_ids is None or str(obj.uuid) in target_set
             }
 
             if target_ids is None or all(target in mapping for target in target_ids):
                 break
             time.sleep(SLEEP_INTERVAL * 2)
 
-        if "_creation_time" not in dm.df.columns:
-            dm.df["_creation_time"] = pd.NaT
+        if column_name not in dm.df.columns:
+            dm.df[column_name] = pd.NaT
 
         if target_ids is None:
-            dm.df["_creation_time"] = pd.to_datetime(
+            dm.df[column_name] = pd.to_datetime(
                 dm.df["id"].map(mapping), utc=True, errors="coerce"
             )
         else:
             mask = dm.df["id"].isin(target_ids)
-            dm.df.loc[mask, "_creation_time"] = dm.df.loc[mask, "id"].map(mapping)
-            dm.df["_creation_time"] = pd.to_datetime(dm.df["_creation_time"], utc=True, errors="coerce")
+            dm.df.loc[mask, column_name] = dm.df.loc[mask, "id"].map(mapping)
+            dm.df[column_name] = pd.to_datetime(dm.df[column_name], utc=True, errors="coerce")
+
+    def sync_creation_times(self, dm, ids=None, retries=3):
+        self._sync_metadata_column(
+            dm,
+            ids,
+            retries,
+            "_creation_time",
+            MetadataQuery(creation_time=True),
+            "creation_time",
+        )
 
     def sync_update_times(self, dm, ids=None, retries=3):
-        if self.client is None or dm.df.empty:
-            return
-
-        collection = self.client.collections.get(CLASS_NAME)
-        target_ids = None if ids is None else [str(x) for x in ids]
-        mapping = {}
-
-        for attempt in range(retries):
-            kwargs = {
-                "limit": max(1, len(target_ids) if target_ids is not None else len(dm.df) + 10),
-                "return_metadata": MetadataQuery(last_update_time=True),
-                "return_properties": False,
-            }
-            if target_ids:
-                if len(target_ids) == 1:
-                    kwargs["filters"] = Filter.by_id().equal(target_ids[0])
-                else:
-                    kwargs["filters"] = Filter.by_id().contains_any(target_ids)
-
-            response = collection.query.fetch_objects(**kwargs)
-            mapping = {
-                str(obj.uuid): self._normalize_metadata_time(
-                    getattr(getattr(obj, "metadata", None), "last_update_time", None)
-                )
-                for obj in response.objects
-            }
-
-            if target_ids is None or all(target in mapping for target in target_ids):
-                break
-            time.sleep(SLEEP_INTERVAL * 2)
-
-        if "_update_time" not in dm.df.columns:
-            dm.df["_update_time"] = pd.NaT
-
-        if target_ids is None:
-            dm.df["_update_time"] = pd.to_datetime(
-                dm.df["id"].map(mapping), utc=True, errors="coerce"
-            )
-        else:
-            mask = dm.df["id"].isin(target_ids)
-            dm.df.loc[mask, "_update_time"] = dm.df.loc[mask, "id"].map(mapping)
-            dm.df["_update_time"] = pd.to_datetime(dm.df["_update_time"], utc=True, errors="coerce")
+        self._sync_metadata_column(
+            dm,
+            ids,
+            retries,
+            "_update_time",
+            MetadataQuery(last_update_time=True),
+            "last_update_time",
+        )
 
     def insert(self, dm):
         print(f"⚡ 3. Inserting Data (Batch={BATCH_SIZE})...")
@@ -1638,6 +2738,49 @@ class OracleQueryGenerator:
         elif isinstance(val, np.ndarray): return [OracleQueryGenerator._convert_to_native(x) for x in val.tolist()]
         elif isinstance(val, list): return [OracleQueryGenerator._convert_to_native(x) for x in val]
         return val
+
+    def _current_df(self):
+        current_df = getattr(self.dm, "df", None)
+        if current_df is not None:
+            return current_df
+        return self.df
+
+    def _normalize_mask(self, mask):
+        current_df = self._current_df()
+        current_index = current_df.index if current_df is not None else pd.RangeIndex(0)
+
+        if mask is None:
+            return pd.Series(False, index=current_index, dtype="boolean")
+
+        if isinstance(mask, pd.Series):
+            series = mask.copy()
+        elif np.isscalar(mask):
+            series = pd.Series([mask] * len(current_index), index=current_index)
+        else:
+            try:
+                if len(mask) == len(current_index):
+                    series = pd.Series(list(mask), index=current_index)
+                else:
+                    series = pd.Series(list(mask))
+            except Exception:
+                series = pd.Series([bool(mask)] * len(current_index), index=current_index)
+
+        if not series.index.is_unique:
+            series = series.groupby(level=0).last()
+        if not series.index.equals(current_index):
+            series = series.reindex(current_index)
+
+        def to_nullable_bool(value):
+            if pd.isna(value):
+                return pd.NA
+            return bool(value)
+
+        return series.map(to_nullable_bool).astype("boolean")
+
+    def _finalize_expr(self, fc, mask, expr):
+        if fc is None:
+            return None, None, expr
+        return fc, self._normalize_mask(mask), expr
 
     def _is_effectively_null_value(self, value, ftype):
         if is_null_like(value):
@@ -2393,7 +3536,7 @@ class OracleQueryGenerator:
         )
 
     def gen_nested_object_expr(self):
-        """Nested Object 查询 (对标 Milvus gen_json_advanced_expr)
+        """Nested Object 查询 (gen_json_advanced_expr)
         NOTE: Weaviate 当前版本对 OBJECT 类型仅可靠使用 is_none(True)
         以及 NOT(is_none(True)) 过滤；direct is_none(False) 属于未实现/不支持边界。
         不支持嵌套属性路径过滤 (metaObj.price > X)。
@@ -2782,32 +3925,41 @@ class OracleQueryGenerator:
         For a compound expression mask, we invert True→False, False→True.
         Null rows (NaN in mask) become True (included in NOT result).
         """
-        return mask.apply(lambda x: True if pd.isna(x) else not x)
+        normalized = self._normalize_mask(mask)
+        return self._normalize_mask(
+            normalized.apply(lambda x: True if pd.isna(x) else not bool(x))
+        )
 
     def gen_complex_expr(self, depth):
         if depth == 0 or random.random() < 0.2:
             r = random.random()
             if r < 0.04:
                 res = self.gen_constant_expr()
-                if res[0]: return res
+                if res[0]:
+                    return self._finalize_expr(*res)
             elif r < 0.22:
                 res = self.gen_boundary_expr()
-                if res[0] is not None: return res
+                if res[0] is not None:
+                    return self._finalize_expr(*res)
             elif r < 0.28 and self.array_schema:
                 res = self.gen_multi_array_expr()
-                if res[0] is not None: return res
+                if res[0] is not None:
+                    return self._finalize_expr(*res)
             elif r < 0.42:
                 res = self.gen_not_expr()
-                if res[0] is not None: return res
+                if res[0] is not None:
+                    return self._finalize_expr(*res)
             elif r < 0.45:
                 res = self.gen_nested_object_expr()
-                if res[0] is not None: return res
+                if res[0] is not None:
+                    return self._finalize_expr(*res)
             fc, m, e = self.gen_atomic_expr()
-            if fc: return fc, m, e
+            if fc:
+                return self._finalize_expr(fc, m, e)
             return self.gen_complex_expr(depth)
 
         # Recursive branch: AND (40%), OR (40%), NOT (20%)
-        # Matches Milvus gen_complex_expr: random.choices(["and","or","not"], weights=[0.4,0.4,0.2])
+        # gen_complex_expr: random.choices(["and","or","not"], weights=[0.4,0.4,0.2])
         op = random.choices(["and", "or", "not"], weights=[0.4, 0.4, 0.2], k=1)[0]
 
         if op == "not":
@@ -2816,7 +3968,7 @@ class OracleQueryGenerator:
             if random.random() < 0.3:
                 not_res = self.gen_not_expr()
                 if not_res[0] is not None:
-                    return not_res
+                    return self._finalize_expr(*not_res)
 
             # Otherwise: recursively generate and negate
             fl, ml, el = self.gen_complex_expr(depth - 1)
@@ -2824,15 +3976,19 @@ class OracleQueryGenerator:
                 return self.gen_complex_expr(depth)
             fc_not = Filter.not_(fl)
             mask_not = self._apply_not_mask(ml)
-            return fc_not, mask_not, f"NOT({el})"
+            return self._finalize_expr(fc_not, mask_not, f"NOT({el})")
         else:
             fl, ml, el = self.gen_complex_expr(depth - 1)
             fr, mr, er = self.gen_complex_expr(depth - 1)
-            if not fl: return fr, mr, er
-            if not fr: return fl, ml, el
+            if not fl:
+                return self._finalize_expr(fr, mr, er)
+            if not fr:
+                return self._finalize_expr(fl, ml, el)
+            ml = self._normalize_mask(ml)
+            mr = self._normalize_mask(mr)
             if op == "and":
-                return fl & fr, ml & mr, f"({el} AND {er})"
-            return fl | fr, ml | mr, f"({el} OR {er})"
+                return self._finalize_expr(fl & fr, ml & mr, f"({el} AND {er})")
+            return self._finalize_expr(fl | fr, ml | mr, f"({el} OR {er})")
 
 
 # --- 4. Equivalence ---
@@ -3004,7 +4160,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
     def gen_pqs_filter(self, pivot_row, depth):
         """生成必真的复合表达式 (PQS: Pivot Query Synthesis)
-        参照 Milvus gen_pqs_expr:
+        gen_pqs_expr:
          - AND: 两个子表达式都是必真的 → 结果必真
          - OR: 左侧必真, 右侧可以是任意噪声 → 结果必真
          - NOT(NOT(...)): 双重否定 ≡ 原表达式 → 保持必真
@@ -3087,7 +4243,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
     def gen_complex_noise(self, depth=3):
         """生成复杂但不保证语义的噪声表达式 (用于 PQS OR 分支)
         注意: 不要求必假, 只要求复杂——增加查询引擎的执行路径覆盖
-        对标 Milvus gen_complex_noise: 包含多层 AND/OR/NOT 嵌套
+        gen_complex_noise: 包含多层 AND/OR/NOT 嵌套
         """
         if depth <= 0:
             # 叶子节点: 50% 假表达式, 50% 随机原子表达式
@@ -3501,6 +4657,10 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
     _cl_rng = random.Random(current_seed + 7)
     print(f"   Consistency: {consistency_label(resolved_consistency, randomize=randomize_consistency)}")
     print(f"   VecIndex: {VECTOR_INDEX_TYPE}, Dist: {DISTANCE_METRIC}, VecRatio: {VECTOR_CHECK_RATIO:.2f}, TopK: {VECTOR_TOPK}, BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(
+        f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
+        f"Partition={get_filter_partition_size()}, IdBatch={get_filter_id_batch_size()})"
+    )
 
     dm = DataManager(current_seed)
     dm.generate_schema()
@@ -3521,8 +4681,8 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
         logf = make_log_path(f"weaviate_fuzz_test_{ts}.log")
         repro_cmd = format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)
         print(f"\n📝 Log: {display_path(logf)}")
-        print(f"   🔑 Reproduce: {repro_cmd}")
-        print("🚀 Testing...")
+        print(f"    Reproduce: {repro_cmd}")
+        print(" Testing...")
 
         qg = OracleQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
@@ -3768,28 +4928,49 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
 
                 flog(f"\n[T{i}] {es}")
                 flog(f"  CL={cl}")
-                exp = set(dm.df[pm.fillna(False)]["id"].tolist())
+                pm = qg._normalize_mask(pm)
+                exp = set(dm.df.loc[pm.fillna(False), "id"].tolist())
 
                 try:
                     t0 = time.time()
                     col_cl = col.with_consistency_level(cl)
-                    res = col_cl.query.fetch_objects(filters=fo, limit=max(N, len(dm.df) + 100))
+                    query_cap = max(1, min(len(dm.df) + 1, len(exp) + 1))
+                    res = fetch_objects_resilient(
+                        col_cl,
+                        dm=dm,
+                        filters=fo,
+                        max_objects=query_cap,
+                        return_properties=False,
+                    )
                     act = set(str(o.uuid) for o in res.objects)
+                    act_exhausted = res.exhausted
+                    if not act_exhausted and query_cap < len(dm.df) + 1:
+                        res = fetch_objects_resilient(
+                            col_cl,
+                            dm=dm,
+                            filters=fo,
+                            max_objects=len(dm.df) + 1,
+                            return_properties=False,
+                        )
+                        act = set(str(o.uuid) for o in res.objects)
+                        act_exhausted = res.exhausted
                     ms = (time.time() - t0) * 1000
-                    flog(f"  Pandas:{len(exp)} | Weaviate:{len(act)} | {ms:.1f}ms")
+                    flog(f"  Pandas:{len(exp)} | Weaviate:{capped_result_count(len(act), act_exhausted)} | {ms:.1f}ms")
 
-                    if exp == act:
+                    if act_exhausted and exp == act:
                         flog("  -> MATCH")
                         stats.record(True, ms, depth)
                     else:
                         mi, ex = exp - act, act - exp
                         dm_ = f"Missing:{len(mi)} Extra:{len(ex)}"
+                        if not act_exhausted:
+                            dm_ += f" TruncatedAt:{len(act)}"
                         # Check if mismatch involves ONLY dynamically modified rows
                         # Weaviate has a known bug: replace() corrupts inverted index
                         # for BOOL/BOOL_ARRAY/INT_ARRAY fields on modified rows.
                         mi_dyn = mi & dynamic_ids
                         ex_dyn = ex & dynamic_ids
-                        is_weaviate_bug = (mi == mi_dyn) and (ex == ex_dyn) and dynamic_ids
+                        is_weaviate_bug = act_exhausted and (mi == mi_dyn) and (ex == ex_dyn) and dynamic_ids
                         if cl != ConsistencyLevel.ALL:
                             flog(f"  -> WARN (CL={cl}): {dm_}")
                         elif is_weaviate_bug:
@@ -3851,6 +5032,13 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                             and (not dm.filterable_fields or f["name"] in dm.filterable_fields)]
                             ps = random.randint(5, 15)
                             max_pages = max(len(exp) // ps + 2, 10)
+                            offset_window_pages = max(1, get_query_maximum_results() // ps)
+                            if max_pages > offset_window_pages:
+                                flog(
+                                    f"  Page: capped offset scan {max_pages}->{offset_window_pages} pages "
+                                    f"(QUERY_MAXIMUM_RESULTS={get_query_maximum_results()})"
+                                )
+                                max_pages = offset_window_pages
 
                             # --- Test A: WITH sort (deterministic — dups = real bug) ---
                             if _sort_fields:
@@ -3907,7 +5095,11 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                 else:
                                     flog(f"  Page(nosort): PASS ({len(seen_nosort)})")
                         except Exception as e:
-                            flog(f"  Page: ERR {e}")
+                            if is_query_maximum_results_error(e):
+                                update_query_limits_from_error(e)
+                                flog(f"  Page: SKIP offset window cap ({get_query_maximum_results()}): {e}")
+                            else:
+                                flog(f"  Page: ERR {e}")
                 except Exception as e:
                     print(f"\n⚠️ [T{i}] CRASH: {e}")
                     flog(f"  -> ERR: {e}")
@@ -3941,7 +5133,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
             for c in fails[:10]:
                 print(f"  🔴 T{c['id']}: {c.get('detail','')[:100]}")
         print(f"📄 Log: {display_path(logf)}")
-        print(f"🔑 Reproduce: {format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)}")
+        print(f" Reproduce: {format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)}")
     finally:
         wm.close()
 
@@ -3950,7 +5142,12 @@ def run_equivalence_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
     logf = make_log_path(f"weaviate_equiv_test_{int(time.time())}.log")
-    print(f"\n👯 Equivalence Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(f"\n Equivalence Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(
+        f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
+        f"Partition={get_filter_partition_size()}, IdBatch={get_filter_id_batch_size()})"
+    )
+    print(f"   AggregateFilterDepth: {AGGREGATE_FILTER_MIN_DEPTH}..{AGGREGATE_FILTER_MAX_DEPTH}")
     print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
@@ -3960,7 +5157,7 @@ def run_equivalence_mode(rounds=100, seed=None):
         qg = EquivalenceQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         fails = []
-        lim = max(N, len(dm.df) + 100)
+        fetch_cap = len(dm.df) + 1
         with open(logf, "w", encoding="utf-8") as f:
             def flog(m): f.write(m + "\n"); f.flush()
             flog(f"Equiv | Seed:{seed}")
@@ -3971,19 +5168,20 @@ def run_equivalence_mode(rounds=100, seed=None):
                 if not bf: continue
                 flog(f"\n[T{i}] {be[:200]}")
                 try:
-                    br = col.query.fetch_objects(filters=bf, limit=lim)
+                    br = fetch_objects_resilient(col, dm=dm, filters=bf, max_objects=fetch_cap, return_properties=False)
                     bi = set(str(o.uuid) for o in br.objects)
-                    flog(f"  Base: {len(bi)}")
+                    flog(f"  Base: {capped_result_count(len(bi), br.exhausted)}")
                     for mut in qg.mutate_filter(bf, be):
                         try:
-                            mr = col.query.fetch_objects(filters=mut["filter"], limit=lim)
+                            mr = fetch_objects_resilient(col, dm=dm, filters=mut["filter"], max_objects=fetch_cap, return_properties=False)
                             mi = set(str(o.uuid) for o in mr.objects)
-                            if bi == mi:
+                            if br.exhausted and mr.exhausted and bi == mi:
                                 flog(f"  {mut['type']}: PASS")
                             else:
                                 diff = bi.symmetric_difference(mi)
-                                flog(f"  {mut['type']}: FAIL (diff:{len(diff)})")
-                                print(f"\n❌ [T{i}] {mut['type']} FAIL (diff:{len(diff)})")
+                                detail = f"diff:{len(diff)} base={capped_result_count(len(bi), br.exhausted)} mut={capped_result_count(len(mi), mr.exhausted)}"
+                                flog(f"  {mut['type']}: FAIL ({detail})")
+                                print(f"\n❌ [T{i}] {mut['type']} FAIL ({detail})")
                                 # Deep evidence: print details of diff IDs
                                 for did in list(diff)[:3]:
                                     row = dm.df[dm.df['id'] == did]
@@ -3993,7 +5191,7 @@ def run_equivalence_mode(rounds=100, seed=None):
                                         for ff in dm.schema_config[:5]:
                                             v = row.iloc[0].get(ff['name'])
                                             flog(f"      {ff['name']}={v}")
-                                fails.append({"id": i, "type": mut["type"]})
+                                fails.append({"id": i, "type": mut["type"], "detail": detail})
                         except Exception as e:
                             flog(f"  {mut['type']}: ERR {e}")
                 except Exception as e:
@@ -4007,7 +5205,11 @@ def run_pqs_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
     logf = make_log_path(f"weaviate_pqs_test_{int(time.time())}.log")
-    print(f"\n🚀 PQS Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(f"\n PQS Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(
+        f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
+        f"Partition={get_filter_partition_size()}, IdBatch={get_filter_id_batch_size()})"
+    )
     print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
@@ -4017,7 +5219,7 @@ def run_pqs_mode(rounds=100, seed=None):
         pqs = PQSQueryGenerator(dm)
         col = wm.client.collections.get(CLASS_NAME)
         errs, ok, skip = [], 0, 0
-        lim = max(N, len(dm.df) + 100)
+        fetch_cap = len(dm.df) + 1
         with open(logf, "w", encoding="utf-8") as f:
             def flog(m): f.write(m + "\n"); f.flush()
             flog(f"PQS | Seed:{seed}")
@@ -4043,12 +5245,12 @@ def run_pqs_mode(rounds=100, seed=None):
                 flog(f"\n[T{i}] Pivot:{pid}")
                 flog(f"  Expr: {pe}")
                 try:
-                    res = col.query.fetch_objects(filters=pf, limit=lim)
+                    res = fetch_objects_resilient(col, dm=dm, filters=pf, max_objects=fetch_cap, return_properties=False)
                     ri = set(str(o.uuid) for o in res.objects)
                     if pid in ri:
-                        flog(f"  PASS ({len(ri)})"); ok += 1
+                        flog(f"  PASS ({capped_result_count(len(ri), res.exhausted)})"); ok += 1
                     else:
-                        flog(f"  FAIL! Missing pivot ({len(ri)})")
+                        flog(f"  FAIL! Missing pivot ({capped_result_count(len(ri), res.exhausted)})")
                         print(f"\n❌ [T{i}] PQS FAIL")
                         errs.append({"id": i, "pivot": pid})
                 except Exception as e:
@@ -4064,7 +5266,11 @@ def run_groupby_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
     logf = make_log_path(f"weaviate_groupby_test_{int(time.time())}.log")
-    print(f"\n📦 GroupBy Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(f"\n GroupBy Mode | Seed: {seed} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
+    print(
+        f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
+        f"Partition={get_filter_partition_size()}, IdBatch={get_filter_id_batch_size()})"
+    )
     print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
@@ -4141,11 +5347,171 @@ def run_groupby_mode(rounds=100, seed=None):
         wm.close()
 
 
+def run_aggregate_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_LEVEL, randomize_consistency=False):
+    current_seed = initialize_seeded_run(seed)
+    resolved_consistency = consistency or DEFAULT_CONSISTENCY_LEVEL
+
+    logf = make_log_path(f"weaviate_aggregate_test_{int(time.time())}.log")
+    print(
+        f"\n Aggregate Mode | Seed: {current_seed} | VecIdx: {VECTOR_INDEX_TYPE} | "
+        f"Consistency: aggregate-default"
+    )
+    print(
+        f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
+        f"Partition={get_filter_partition_size()}, IdBatch={get_filter_id_batch_size()})"
+    )
+    print(f"📄 Log: {display_path(logf)}")
+
+    dm = DataManager(current_seed)
+    dm.generate_schema()
+    dm.generate_data()
+    inject_aggregate_probe_fields(dm)
+
+    wm = WeaviateManager()
+    wm.connect()
+    try:
+        dm.filterable_fields = wm.reset_collection(dm.schema_config)
+        dm.searchable_text_fields = set(getattr(wm, "searchable_text_fields", set()) or set())
+        dm.field_index_state = dict(getattr(wm, "field_index_state", {}) or {})
+        print(f"   ActualVecIndex: {getattr(wm, 'actual_vector_index_type', VECTOR_INDEX_TYPE)}, ActualDist: {getattr(wm, 'actual_distance_metric', DISTANCE_METRIC)}")
+        wm.insert(dm)
+
+        col = wm.client.collections.get(CLASS_NAME)
+        probe_fields = aggregate_probe_field_map(dm)
+        all_probe_fields = [probe_fields[name] for name in sorted(probe_fields)]
+        if not all_probe_fields:
+            print("  No aggregate probe fields available, skip.")
+            return
+
+        stats = FuzzStats()
+        failures = []
+        semantic_skips = 0
+
+        with open(logf, "w", encoding="utf-8") as f:
+            def flog(msg):
+                f.write(msg + "\n")
+                f.flush()
+
+            flog(
+                f"Aggregate | Seed:{current_seed} | Consistency:{consistency_label(resolved_consistency, randomize=randomize_consistency)}"
+            )
+
+            for i in range(rounds):
+                print(f"\r⏳ Aggregate {i+1}/{rounds}", end="", flush=True)
+                cl = "aggregate-default"
+                text_limit = random.choice([3, 5, 8])
+                filters, filter_mask, filter_expr, filter_meta = generate_aggregate_filter(dm)
+                filter_mask = _normalize_bool_mask(filter_mask, dm.df.index)
+                subset = select_rows_by_mask(dm.df, filter_mask)
+                expr_depth = int((filter_meta or {}).get("depth", 0))
+                expr_atoms = int((filter_meta or {}).get("atoms", 0))
+                target_depth = int((filter_meta or {}).get("target_depth", 0))
+
+                if i % 6 == 0:
+                    target_fields = list(all_probe_fields)
+                    case_label = "all-probes"
+                else:
+                    primary = random.choice(all_probe_fields)
+                    target_fields = [primary]
+                    if random.random() < 0.30:
+                        siblings = [
+                            candidate
+                            for candidate in all_probe_fields
+                            if candidate["name"] != primary["name"]
+                            and aggregate_family_for_type(candidate["type"]) == aggregate_family_for_type(primary["type"])
+                        ]
+                        if siblings:
+                            target_fields.append(random.choice(siblings))
+                    case_label = ",".join(field["name"] for field in target_fields)
+
+                expected = {
+                    field["name"]: build_expected_aggregate(field, subset, text_limit=text_limit)
+                    for field in target_fields
+                }
+                metrics = [
+                    build_aggregate_metrics(field, text_limit=text_limit)
+                    for field in target_fields
+                ]
+
+                flog(f"\n[T{i}] {case_label}")
+                flog(f"  CL={cl}")
+                flog(f"  Filter: {filter_expr}")
+                flog(f"  FilterMeta: depth={expr_depth} target={target_depth} atoms={expr_atoms}")
+                flog(f"  MatchedRows: {len(subset)}")
+                try:
+                    t0 = time.time()
+                    result = col.aggregate.over_all(
+                        filters=filters,
+                        total_count=True,
+                        return_metrics=metrics,
+                    )
+                    latency_ms = (time.time() - t0) * 1000.0
+                    mismatches = []
+
+                    actual_total_count = int(getattr(result, "total_count", 0) or 0)
+                    expected_total_count = int(len(subset))
+                    if actual_total_count != expected_total_count:
+                        mismatches.append(
+                            f"total_count: expected {expected_total_count}, got {actual_total_count}"
+                        )
+
+                    actual_properties = dict(getattr(result, "properties", {}) or {})
+                    for field in target_fields:
+                        field_name = field["name"]
+                        if field_name not in actual_properties:
+                            mismatches.append(f"{field_name}: missing in aggregate response")
+                            continue
+
+                        expected_prop = expected[field_name]
+                        prop_mismatches = compare_aggregate_property(
+                            actual_properties[field_name],
+                            expected_prop,
+                            field,
+                        )
+                        if not expected_prop.get("_top_occurrences_stable", True):
+                            semantic_skips += 1
+                            flog(f"  Note: skipped strict top_occurrences ordering for {field_name} due to cutoff tie")
+                        if prop_mismatches:
+                            mismatches.extend([f"{field_name}.{entry}" for entry in prop_mismatches])
+
+                    if mismatches:
+                        stats.record(False, latency_ms=latency_ms, depth=expr_depth)
+                        failures.append(
+                            {
+                                "id": i,
+                                "filter": filter_expr,
+                                "fields": [field["name"] for field in target_fields],
+                                "detail": "; ".join(mismatches),
+                            }
+                        )
+                        flog(f"  FAIL: {' | '.join(mismatches)}")
+                    else:
+                        stats.record(True, latency_ms=latency_ms, depth=expr_depth)
+                        flog(f"  PASS {latency_ms:.1f}ms")
+                except Exception as exc:
+                    stats.record(False, depth=expr_depth, error_cat="query_error")
+                    failures.append(
+                        {
+                            "id": i,
+                            "filter": filter_expr,
+                            "fields": [field["name"] for field in target_fields],
+                            "detail": str(exc),
+                        }
+                    )
+                    flog(f"  ERR: {exc}")
+
+        print()
+        print(f"📊 Aggregate: {stats.summary()} | SemanticSkips:{semantic_skips}")
+        print(f"{'✅ All passed' if not failures else f'🚫 {len(failures)} failures'}. Log: {display_path(logf)}")
+    finally:
+        wm.close()
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Weaviate Fuzz Oracle V2")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--rounds", type=int, default=500, help="Test rounds (default: 500)")
-    parser.add_argument("--mode", choices=["oracle", "equiv", "pqs", "groupby"], default="oracle", help="Test mode")
+    parser.add_argument("--mode", choices=["oracle", "equiv", "pqs", "groupby", "aggregate"], default="oracle", help="Test mode")
     parser.add_argument("--no-dynamic", action="store_true", help="Disable dynamic ops")
     parser.add_argument(
         "--consistency",
@@ -4161,17 +5527,25 @@ if __name__ == "__main__":
     parser.add_argument("--host", type=str, default=None, help="Weaviate host")
     parser.add_argument("--port", type=int, default=None, help="Weaviate port")
     parser.add_argument("-N", type=int, default=None, help="Data rows")
+    parser.add_argument("--query-page-size", type=int, default=None, help="Cursor fetch page size for large-result queries")
+    parser.add_argument("--aggregate-filter-min-depth", type=int, default=None, help="Minimum recursive depth for aggregate-mode filters")
+    parser.add_argument("--aggregate-filter-max-depth", type=int, default=None, help="Maximum recursive depth for aggregate-mode filters")
     args = parser.parse_args()
 
     if args.host: HOST = args.host
     if args.port: PORT = args.port
     if args.N: N = args.N
+    if args.query_page_size: QUERY_PAGE_SIZE = max(1, args.query_page_size)
+    if args.aggregate_filter_min_depth:
+        AGGREGATE_FILTER_MIN_DEPTH = max(1, int(args.aggregate_filter_min_depth))
+    if args.aggregate_filter_max_depth:
+        AGGREGATE_FILTER_MAX_DEPTH = max(AGGREGATE_FILTER_MIN_DEPTH, int(args.aggregate_filter_max_depth))
 
     resolved_consistency = parse_consistency_arg(args.consistency)
 
     print("=" * 80)
     print(
-        f"🚀 Weaviate Fuzz Oracle V2 | Mode: {args.mode} | Rounds: {args.rounds} | "
+        f" Weaviate Fuzz Oracle V2 | Mode: {args.mode} | Rounds: {args.rounds} | "
         f"Seed: {args.seed or '(random)'} | Dynamic: {'OFF' if args.no_dynamic else 'ON'} | "
         f"Consistency: {consistency_label(resolved_consistency, randomize=args.random_consistency)}"
     )
@@ -4183,6 +5557,13 @@ if __name__ == "__main__":
         run_pqs_mode(rounds=args.rounds, seed=args.seed)
     elif args.mode == "groupby":
         run_groupby_mode(rounds=args.rounds, seed=args.seed)
+    elif args.mode == "aggregate":
+        run_aggregate_mode(
+            rounds=args.rounds,
+            seed=args.seed,
+            consistency=resolved_consistency,
+            randomize_consistency=args.random_consistency,
+        )
     else:
         run(
             rounds=args.rounds,
