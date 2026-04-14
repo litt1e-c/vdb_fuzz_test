@@ -78,31 +78,108 @@ class CaseResult:
 SCALAR_SMOKE_TEMPLATES = [
     CaseTemplate("oracle-nodyn-smoke", "oracle", 12, [1238], 1200, ["--no-dynamic"]),
     CaseTemplate("oracle-dyn-smoke", "oracle", 18, [2238], 1200, []),
+    CaseTemplate("oracle-inverted-smoke", "oracle", 16, [1838], 1400, ["--no-dynamic", "--profile", "inverted"]),
     CaseTemplate("equiv-smoke", "equiv", 10, [3238], 1000, []),
     CaseTemplate("pqs-smoke", "pqs", 12, [4238], 1000, []),
     CaseTemplate("aggregate-smoke", "aggregate", 12, [5238], 1200, []),
+    CaseTemplate("aggregate-inverted-smoke", "aggregate", 14, [5838], 1400, ["--profile", "inverted"]),
+    CaseTemplate(
+        "rest-filter-smoke",
+        "rest-filter",
+        12,
+        [6238],
+        1200,
+        ["--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+    ),
+    CaseTemplate(
+        "rest-filter-inverted-smoke",
+        "rest-filter",
+        14,
+        [6838],
+        1400,
+        ["--profile", "inverted", "--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+    ),
+    CaseTemplate(
+        "oracle-rest-xcheck-smoke",
+        "oracle",
+        12,
+        [7238],
+        1200,
+        [
+            "--no-dynamic",
+            "--oracle-rest-crosscheck-rate",
+            "0.70",
+            "--rest-filter-min-depth",
+            "3",
+            "--rest-filter-max-depth",
+            "6",
+        ],
+    ),
 ]
 
 SCALAR_TEMPLATES = [
     CaseTemplate("oracle-scalar-nodyn-a", "oracle", 35, [1238, 2027], 2500, ["--no-dynamic"]),
     CaseTemplate("oracle-scalar-nodyn-b", "oracle", 35, [3137, 4488], 2500, ["--no-dynamic"]),
+    CaseTemplate("oracle-inverted-a", "oracle", 36, [18381, 18382], 2600, ["--no-dynamic", "--profile", "inverted"]),
     CaseTemplate("oracle-scalar-dyn-a", "oracle", 45, [5501, 6602], 2500, []),
     CaseTemplate("oracle-scalar-dyn-b", "oracle", 45, [7703], 4000, []),
     CaseTemplate("oracle-scalar-randcl", "oracle", 35, [8804], 2500, ["--random-consistency"]),
     CaseTemplate("equiv-scalar-a", "equiv", 20, [9101, 9102], 1800, []),
     CaseTemplate("pqs-scalar-a", "pqs", 25, [9201, 9202], 1800, []),
     CaseTemplate("aggregate-scalar-a", "aggregate", 30, [9301, 9302], 2200, []),
+    CaseTemplate("aggregate-inverted-a", "aggregate", 28, [9331, 9332], 2400, ["--profile", "inverted"]),
+    CaseTemplate(
+        "oracle-rest-xcheck-a",
+        "oracle",
+        28,
+        [9401, 9402],
+        2200,
+        [
+            "--no-dynamic",
+            "--oracle-rest-crosscheck-rate",
+            "0.70",
+            "--rest-filter-min-depth",
+            "3",
+            "--rest-filter-max-depth",
+            "6",
+        ],
+    ),
+    CaseTemplate(
+        "rest-filter-scalar-a",
+        "rest-filter",
+        24,
+        [9501, 9502],
+        2200,
+        ["--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+    ),
+    CaseTemplate(
+        "rest-filter-inverted-a",
+        "rest-filter",
+        26,
+        [9551, 9552],
+        2400,
+        ["--profile", "inverted", "--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+    ),
 ]
 
 FULL_TEMPLATES = SCALAR_TEMPLATES + [
     CaseTemplate("oracle-large-dyn", "oracle", 25, [10001], 12000, []),
     CaseTemplate("groupby-broad", "groupby", 18, [11001], 2000, []),
     CaseTemplate("aggregate-broad", "aggregate", 28, [12001], 5000, []),
+    CaseTemplate(
+        "rest-filter-broad",
+        "rest-filter",
+        24,
+        [13001],
+        4500,
+        ["--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+    ),
 ]
 
 SUITES = {
     "scalar-smoke": SCALAR_SMOKE_TEMPLATES,
     "scalar": SCALAR_TEMPLATES,
+    "inverted": [case for case in [*SCALAR_SMOKE_TEMPLATES, *SCALAR_TEMPLATES] if "inverted" in case.name],
     "aggregate": [*SCALAR_SMOKE_TEMPLATES[-1:], *SCALAR_TEMPLATES[-1:], FULL_TEMPLATES[-1]],
     "full": FULL_TEMPLATES,
 }

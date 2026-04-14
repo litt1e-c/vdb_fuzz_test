@@ -22,6 +22,7 @@ import random
 import argparse
 import uuid
 import sys
+import os
 import numpy as np
 import weaviate
 from weaviate.classes.config import (
@@ -71,8 +72,11 @@ CLASS_NAME = "VecFuzzTest"
 N = 2000
 DIM = 128
 BATCH_SIZE = 500
+LOG_DIR = "weaviate_log"
+SELF_RETRIEVAL_TIMEOUT_SEC = 4.0
+SELF_RETRIEVAL_POLL_SEC = 0.2
 
-ALL_VECTOR_INDEX_TYPES = ["hnsw", "flat"]
+ALL_VECTOR_INDEX_TYPES = ["hnsw", "flat", "hfresh", "dynamic"]
 ALL_DISTANCE_METRICS = [VectorDistances.COSINE, VectorDistances.L2_SQUARED, VectorDistances.DOT]
 
 # L2_SQUARED ascending (smaller = closer);  DOT/COSINE: Weaviate returns
@@ -88,10 +92,23 @@ def _norm(v):
     return (v / n if n > 0 else v)
 
 
+def ensure_log_dir():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    return LOG_DIR
+
+
+def make_log_path(prefix):
+    return os.path.join(ensure_log_dir(), prefix)
+
+
+def display_path(path):
+    return path
+
+
 # ── core class ──────────────────────────────────────────────────────────────
 
 class WeaviateVectorFuzzTest:
-    def __init__(self, host, port, grpc_port, dim, n, seed, enable_dynamic):
+    def __init__(self, host, port, grpc_port, dim, n, seed, enable_dynamic, requested_vi_type="random"):
         self.host = host
         self.port = port
         self.grpc_port = grpc_port
@@ -99,9 +116,11 @@ class WeaviateVectorFuzzTest:
         self.n = n
         self.seed = seed
         self.enable_dynamic = enable_dynamic
+        self.requested_vi_type = requested_vi_type
         self.client = None
         self.distance_metric = None
         self.vi_type = None
+        self.actual_vi_type = None
         self.vectors = None   # (N, DIM) float32
         self.ids = []         # list[str] (UUID)
 
@@ -131,9 +150,14 @@ class WeaviateVectorFuzzTest:
     # ── collection setup ────────────────────────────────────────────────────
 
     def setup_collection(self):
-        self.vi_type = random.choice(ALL_VECTOR_INDEX_TYPES)
+        self.vi_type = random.choice(ALL_VECTOR_INDEX_TYPES) if self.requested_vi_type == "random" else self.requested_vi_type
         self.distance_metric = random.choice(ALL_DISTANCE_METRICS)
-        print(f"   VectorIndex: {self.vi_type}  Distance: {self.distance_metric}")
+
+        if self.vi_type == "hfresh" and self.distance_metric == VectorDistances.DOT:
+            self.distance_metric = random.choice([VectorDistances.COSINE, VectorDistances.L2_SQUARED])
+            print(f"   -> Adjusted HFRESH distance to supported metric: {self.distance_metric}")
+
+        print(f"   RequestedVectorIndex: {self.vi_type}  Distance: {self.distance_metric}")
 
         try:
             self.client.collections.delete(CLASS_NAME)
@@ -150,21 +174,76 @@ class WeaviateVectorFuzzTest:
                 distance_metric=self.distance_metric,
                 ef_construction=128, max_connections=32
             )
+            print("   -> VectorIndex: HNSW (ef_c=128, max_conn=32)")
         elif self.vi_type == "flat":
             vi_config = Configure.VectorIndex.flat(
-                distance_metric=self.distance_metric
+                distance_metric=self.distance_metric,
+                vector_cache_max_objects=100000,
             )
+            print("   -> VectorIndex: FLAT (cache=100000)")
+        elif self.vi_type == "hfresh":
+            vi_config = Configure.VectorIndex.hfresh(
+                distance_metric=self.distance_metric,
+                max_posting_size_kb=256,
+                search_probe=8,
+            )
+            print("   -> VectorIndex: HFRESH (posting_kb=256, probe=8)")
         else:
             vi_config = Configure.VectorIndex.dynamic(
                 distance_metric=self.distance_metric, threshold=10000
             )
+            print("   -> VectorIndex: DYNAMIC (threshold=10000)")
 
-        self.client.collections.create(
-            name=CLASS_NAME,
-            properties=properties,
-            vector_config=Configure.Vectors.self_provided(vector_index_config=vi_config),
-        )
-        print(f"✅ Collection '{CLASS_NAME}' created.")
+        active_vi_type = self.vi_type
+        for attempt in range(3):
+            try:
+                self.client.collections.create(
+                    name=CLASS_NAME,
+                    properties=properties,
+                    vector_config=Configure.Vectors.self_provided(vector_index_config=vi_config),
+                    inverted_index_config=Configure.inverted_index(
+                        index_null_state=True,
+                        index_property_length=True,
+                        index_timestamps=True,
+                    ),
+                )
+                break
+            except Exception as exc:
+                err_msg = str(exc)
+                print(f"   -> Create attempt {attempt + 1} failed: {err_msg[:160]}")
+                try:
+                    self.client.collections.delete(CLASS_NAME)
+                except Exception:
+                    pass
+
+                if active_vi_type == "dynamic" and ("async indexing" in err_msg.lower() or "dynamic" in err_msg.lower()):
+                    vi_config = Configure.VectorIndex.hnsw(distance_metric=self.distance_metric)
+                    active_vi_type = "hnsw"
+                    print("   -> Falling back to HNSW (dynamic requires ASYNC_INDEXING=true in server env)")
+                    continue
+                if active_vi_type == "hfresh" and ("422" in err_msg or "hfresh" in err_msg.lower() or "unsupported" in err_msg.lower()):
+                    vi_config = Configure.VectorIndex.hnsw(distance_metric=self.distance_metric)
+                    active_vi_type = "hnsw"
+                    print("   -> Falling back to HNSW (HFRESH unsupported in current server config)")
+                    continue
+                if attempt == 0:
+                    try:
+                        self.client.collections.create(
+                            name=CLASS_NAME,
+                            properties=properties,
+                            vector_config=Configure.Vectors.self_provided(vector_index_config=vi_config),
+                        )
+                        break
+                    except Exception as fallback_exc:
+                        print(f"   -> Fallback without inverted index config failed: {fallback_exc}")
+                        vi_config = Configure.VectorIndex.hnsw(distance_metric=self.distance_metric)
+                        active_vi_type = "hnsw"
+                        continue
+                if attempt == 2:
+                    raise
+
+        self.actual_vi_type = active_vi_type
+        print(f"✅ Collection '{CLASS_NAME}' created. ActualVecIndex: {self.actual_vi_type}  Distance: {self.distance_metric}")
 
     # ── data generation & insert ────────────────────────────────────────────
 
@@ -207,6 +286,26 @@ class WeaviateVectorFuzzTest:
             dist = o.metadata.distance if o.metadata else None
             hits.append((uid, float(dist) if dist is not None else 0.0))
         return hits
+
+    def _safe_delete_by_id(self, uid):
+        try:
+            self.client.collections.get(CLASS_NAME).data.delete_by_id(uid)
+        except Exception:
+            pass
+
+    def _wait_for_self_hit(self, query_vec, expected_uid, *, top_k=5, timeout_s=SELF_RETRIEVAL_TIMEOUT_SEC):
+        deadline = time.time() + timeout_s
+        attempts = 0
+        last_hits = []
+        while True:
+            attempts += 1
+            last_hits = self._search(query_vec, top_k)
+            found_ids = [uid for uid, _ in last_hits]
+            if expected_uid in found_ids:
+                return last_hits, attempts, True
+            if time.time() >= deadline:
+                return last_hits, attempts, False
+            time.sleep(SELF_RETRIEVAL_POLL_SEC)
 
     # ── dynamic ops ─────────────────────────────────────────────────────────
 
@@ -285,34 +384,41 @@ class WeaviateVectorFuzzTest:
     # ── Test 3: self-retrieval ──────────────────────────────────────────────
 
     def test_self_retrieval(self):
-        col = self.client.collections.get(CLASS_NAME)
         uid = str(uuid.uuid4())
         vec = self._random_vector()
         vec_list = vec.tolist()
+        col = self.client.collections.get(CLASS_NAME)
+        try:
+            col.data.insert(properties={"row_num": -1, "tag": 0}, uuid=uid, vector=vec_list)
+            hits, attempts, found = self._wait_for_self_hit(vec_list, uid, top_k=5)
 
-        col.data.insert(properties={"row_num": -1, "tag": 0}, uuid=uid, vector=vec_list)
-        time.sleep(0.3)
+            if not found:
+                if not hits:
+                    return False, (
+                        f"self-retrieval timeout: inserted uuid={uid[:8]} remained invisible "
+                        f"for {SELF_RETRIEVAL_TIMEOUT_SEC:.1f}s ({attempts} polls, no hits)"
+                    )
+                return False, (
+                    f"self-retrieval timeout: inserted uuid={uid[:8]} not found within "
+                    f"{SELF_RETRIEVAL_TIMEOUT_SEC:.1f}s ({attempts} polls), "
+                    f"top1={hits[0][0][:8]} dist={hits[0][1]:.6f}"
+                )
 
-        hits = self._search(vec_list, top_k=1)
+            best_uid, best_dist = hits[0]
 
-        if not hits:
-            col.data.delete_by_id(uid)
-            return False, f"self-retrieval EMPTY: inserted uuid={uid[:8]} but got no hits"
+            if best_uid == uid and best_dist < 0.01:
+                return True, f"ok (uuid={uid[:8]}, dist={best_dist:.6f}, polls={attempts})"
+            if best_uid == uid:
+                return True, f"soft-ok (uuid match, dist={best_dist:.6f}, polls={attempts})"
 
-        best_uid, best_dist = hits[0]
-
-        # Weaviate distance for identical vector should be ~0
-        if best_uid == uid and best_dist < 0.01:
-            col.data.delete_by_id(uid)
-            return True, f"ok (uuid={uid[:8]}, dist={best_dist:.6f})"
-        elif best_uid == uid:
-            col.data.delete_by_id(uid)
-            return True, f"soft-ok (uuid match, dist={best_dist:.6f})"
-        else:
-            detail = (f"self-retrieval FAIL: inserted uuid={uid[:8]}, but top1 is "
-                      f"uuid={best_uid[:8]} dist={best_dist:.6f}")
-            col.data.delete_by_id(uid)
-            return False, detail
+            rank = next((idx for idx, (hit_uid, _) in enumerate(hits) if hit_uid == uid), None)
+            rank_msg = f"rank={rank + 1}" if rank is not None else "rank=absent"
+            return False, (
+                f"self-retrieval FAIL: inserted uuid={uid[:8]}, but top1 is "
+                f"uuid={best_uid[:8]} dist={best_dist:.6f} ({rank_msg}, polls={attempts})"
+            )
+        finally:
+            self._safe_delete_by_id(uid)
 
     # ── Test 3b: self-retrieval after dynamic ops ───────────────────────────
 
@@ -358,16 +464,20 @@ class WeaviateVectorFuzzTest:
                     self.vectors[upidx] = uv
                     ops_done.append(f"upd({upd[:8]})")
 
-        time.sleep(0.5)
-
-        hits = self._search(vec_list, top_k=5)
-        found_ids = [h[0] for h in hits]
-
-        if uid in found_ids:
-            return True, f"ok after {len(ops_done)} ops"
-        else:
-            return False, (f"self-retrieval lost after dynamic ops: uuid={uid[:8]} "
-                           f"not in top5, ops={ops_done}")
+        try:
+            hits, attempts, found = self._wait_for_self_hit(vec_list, uid, top_k=5)
+            if found:
+                return True, f"ok after {len(ops_done)} ops (polls={attempts})"
+            return False, (
+                f"self-retrieval lost after dynamic ops: uuid={uid[:8]} not in top5 within "
+                f"{SELF_RETRIEVAL_TIMEOUT_SEC:.1f}s (polls={attempts}), ops={ops_done}"
+            )
+        finally:
+            if uid in self.ids:
+                idx = self.ids.index(uid)
+                self.ids.pop(idx)
+                self.vectors = np.delete(self.vectors, idx, axis=0)
+            self._safe_delete_by_id(uid)
 
 
 # ── main runner ─────────────────────────────────────────────────────────────
@@ -380,10 +490,11 @@ def run(args):
     print("=" * 80)
     print(f"🚀 Weaviate Vector Fuzz Test | Seed: {current_seed} | Rounds: {args.rounds}")
     print(f"   N={args.N} DIM={args.dim} Dynamic={'ON' if args.dynamic else 'OFF'}")
+    print(f"   RequestedVecIndex={args.vector_index}")
     print("=" * 80)
 
     t = WeaviateVectorFuzzTest(args.host, args.port, args.grpc_port,
-                                args.dim, args.N, current_seed, args.dynamic)
+                                args.dim, args.N, current_seed, args.dynamic, args.vector_index)
     t.connect()
 
     try:
@@ -391,16 +502,23 @@ def run(args):
         t.generate_and_insert()
 
         ts = int(time.time())
-        logfile = f"weaviate_vector_fuzz_{ts}.log"
-        print(f"📝 Log: {logfile}")
+        logfile = make_log_path(f"weaviate_vector_fuzz_{ts}.log")
+        print(f"📝 Log: {display_path(logfile)}")
 
         fuzz_stats = {k: FuzzStats() for k in ["ordering", "monotonicity", "self_ret", "self_ret_dyn"]}
         failures = []
 
         with open(logfile, "w", encoding="utf-8") as flog:
             flog.write(f"Weaviate Vector Fuzz Test | Seed: {current_seed}\n")
-            flog.write(f"VecIndex: {t.vi_type}  Distance: {t.distance_metric}  N={args.N}  DIM={args.dim}\n")
+            flog.write(
+                f"RequestedVecIndex: {t.vi_type}  ActualVecIndex: {t.actual_vi_type}  "
+                f"Distance: {t.distance_metric}  N={args.N}  DIM={args.dim}\n"
+            )
             flog.write(f"Dynamic: {args.dynamic}\n")
+            flog.write(f"Reproduce: python weaviate_vector_fuzz_test.py --seed {current_seed} --vector-index {t.vi_type}")
+            if args.dynamic:
+                flog.write(" --dynamic")
+            flog.write("\n")
             flog.write("=" * 80 + "\n\n")
 
             for i in range(args.rounds):
@@ -417,9 +535,13 @@ def run(args):
                 # Test 1
                 top_k = random.choice([5, 10, 20, 50, 100])
                 t0 = time.time()
-                ok, detail = t.test_distance_ordering(qv, top_k)
+                try:
+                    ok, detail = t.test_distance_ordering(qv, top_k)
+                    error_cat = None if ok else "ordering"
+                except Exception as exc:
+                    ok, detail, error_cat = False, f"CRASH: {exc}", "ordering_crash"
                 lat_ms = (time.time() - t0) * 1000
-                fuzz_stats["ordering"].record(ok, lat_ms, error_cat=None if ok else "ordering")
+                fuzz_stats["ordering"].record(ok, lat_ms, error_cat=error_cat)
                 flog.write(f"[R{i:04d}] ORDERING top_k={top_k}: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
                 if not ok:
                     failures.append(("ordering", i, detail))
@@ -429,9 +551,13 @@ def run(args):
                 k_small = random.choice([5, 10, 15])
                 k_large = k_small * random.choice([2, 3, 4])
                 t0 = time.time()
-                ok, detail = t.test_topk_monotonicity(qv, k_small, k_large)
+                try:
+                    ok, detail = t.test_topk_monotonicity(qv, k_small, k_large)
+                    error_cat = None if ok else "monotonicity"
+                except Exception as exc:
+                    ok, detail, error_cat = False, f"CRASH: {exc}", "monotonicity_crash"
                 lat_ms = (time.time() - t0) * 1000
-                fuzz_stats["monotonicity"].record(ok, lat_ms, error_cat=None if ok else "monotonicity")
+                fuzz_stats["monotonicity"].record(ok, lat_ms, error_cat=error_cat)
                 flog.write(f"[R{i:04d}] MONOTONICITY k={k_small}->{k_large}: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
                 if not ok:
                     failures.append(("monotonicity", i, detail))
@@ -440,9 +566,13 @@ def run(args):
                 # Test 3
                 if i % 10 == 0:
                     t0 = time.time()
-                    ok, detail = t.test_self_retrieval()
+                    try:
+                        ok, detail = t.test_self_retrieval()
+                        error_cat = None if ok else "self_ret"
+                    except Exception as exc:
+                        ok, detail, error_cat = False, f"CRASH: {exc}", "self_ret_crash"
                     lat_ms = (time.time() - t0) * 1000
-                    fuzz_stats["self_ret"].record(ok, lat_ms, error_cat=None if ok else "self_ret")
+                    fuzz_stats["self_ret"].record(ok, lat_ms, error_cat=error_cat)
                     flog.write(f"[R{i:04d}] SELF_RETRIEVAL: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
                     if not ok:
                         failures.append(("self_retrieval", i, detail))
@@ -451,9 +581,13 @@ def run(args):
                 # Test 3b
                 if args.dynamic and i % 30 == 0 and i > 0:
                     t0 = time.time()
-                    ok, detail = t.test_self_retrieval_after_ops(n_ops=random.randint(3, 8))
+                    try:
+                        ok, detail = t.test_self_retrieval_after_ops(n_ops=random.randint(3, 8))
+                        error_cat = None if ok else "self_ret_dyn"
+                    except Exception as exc:
+                        ok, detail, error_cat = False, f"CRASH: {exc}", "self_ret_dyn_crash"
                     lat_ms = (time.time() - t0) * 1000
-                    fuzz_stats["self_ret_dyn"].record(ok, lat_ms, error_cat=None if ok else "self_ret_dyn")
+                    fuzz_stats["self_ret_dyn"].record(ok, lat_ms, error_cat=error_cat)
                     flog.write(f"[R{i:04d}] SELF_RET_DYN: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
                     if not ok:
                         failures.append(("self_ret_dyn", i, detail))
@@ -484,11 +618,14 @@ def run(args):
             print(f"  {status} {k}: {fs.summary()}")
         print(f"  Total: PASS={total_pass}  FAIL={total_fail}")
         if failures:
-            print(f"\n⚠️  {len(failures)} failure(s) detected — see {logfile}")
+            print(f"\n⚠️  {len(failures)} failure(s) detected — see {display_path(logfile)}")
         else:
             print(f"\n🎉 All tests passed! Seed={current_seed}")
-        print(f"📝 Full log: {logfile}")
-        print(f"🔑 Reproduce: python weaviate_vector_fuzz_test.py --seed {current_seed}")
+        print(f"📝 Full log: {display_path(logfile)}")
+        repro = f"python weaviate_vector_fuzz_test.py --seed {current_seed} --vector-index {t.vi_type}"
+        if args.dynamic:
+            repro += " --dynamic"
+        print(f"🔑 Reproduce: {repro}")
         print("=" * 80)
 
     finally:
@@ -508,6 +645,7 @@ if __name__ == "__main__":
     parser.add_argument("--grpc-port", type=int, default=GRPC_PORT, dest="grpc_port")
     parser.add_argument("-N", type=int, default=N)
     parser.add_argument("--dim", type=int, default=DIM)
+    parser.add_argument("--vector-index", choices=["random", *ALL_VECTOR_INDEX_TYPES], default="random")
     parser.add_argument("--dynamic", action="store_true")
     args = parser.parse_args()
     run(args)
