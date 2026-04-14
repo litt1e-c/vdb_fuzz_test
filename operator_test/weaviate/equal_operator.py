@@ -24,6 +24,7 @@ ROWS = [
         properties={
             "tag": "a",
             "textField": "Alpha Beta",
+            "searchOnlyText": "Alpha Beta",
             "wordText": "Alpha Beta",
             "intVal": 10,
             "boolVal": True,
@@ -39,6 +40,7 @@ ROWS = [
         properties={
             "tag": "b",
             "textField": "alpha beta",
+            "searchOnlyText": "alpha beta",
             "wordText": "alpha beta",
             "intVal": 20,
             "boolVal": False,
@@ -54,6 +56,7 @@ ROWS = [
         properties={
             "tag": "c",
             "textField": "Alpha",
+            "searchOnlyText": "Alpha",
             "wordText": "Alpha",
             "intVal": 10,
             "boolVal": True,
@@ -69,6 +72,7 @@ ROWS = [
         properties={
             "tag": "d",
             "textField": "Alpha-Beta",
+            "searchOnlyText": "Alpha-Beta",
             "wordText": "Alpha-Beta",
             "intVal": -10,
             "boolVal": False,
@@ -95,6 +99,13 @@ def create_collection(client, name):
                 data_type=DataType.TEXT,
                 tokenization=Tokenization.FIELD,
                 index_filterable=True,
+            ),
+            Property(
+                name="searchOnlyText",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                index_filterable=False,
+                index_searchable=True,
             ),
             Property(
                 name="wordText",
@@ -212,6 +223,22 @@ def main():
             "For the fuzzer's Tokenization.FIELD subset, case-mismatched strings should not match.",
             ["b"],
             fetch_tags(collection, Filter.by_property("textField").equal("alpha beta")),
+        ))
+
+        checks.append(print_check(
+            "search_only_field_text_equal_local_extension",
+            "The checked docs document Equal on text values, but they do not precisely define whether a property must be filterable rather than merely searchable.",
+            "For the inverted-focused local extension, Tokenization.FIELD search-only TEXT equality is modeled as exact case-sensitive string equality on the stored value.",
+            ["a"],
+            fetch_tags(collection, Filter.by_property("searchOnlyText").equal("Alpha Beta")),
+        ))
+
+        checks.append(print_check(
+            "search_only_field_text_equal_case_mismatch_local_extension",
+            "The checked docs say multi-word text equality depends on tokenization; they do not separately document searchable-only FIELD text equality.",
+            "For the inverted-focused local extension, search-only FIELD TEXT equality remains case-sensitive and matches only the exact stored string.",
+            ["b"],
+            fetch_tags(collection, Filter.by_property("searchOnlyText").equal("alpha beta")),
         ))
 
         checks.append(print_check(

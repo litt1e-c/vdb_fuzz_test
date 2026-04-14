@@ -860,6 +860,55 @@ def normalize_scalar_for_compare(ftype, value):
     return value
 
 
+def normalize_array_compare_item(ftype, value):
+    if value is None:
+        return None
+    if isinstance(value, float) and np.isnan(value):
+        return None
+    if ftype == FieldType.INT:
+        return int(value)
+    if ftype == FieldType.NUMBER:
+        return float(value)
+    if ftype == FieldType.BOOL:
+        return bool(value)
+    if ftype == FieldType.TEXT:
+        return str(value)
+    if ftype == FieldType.DATE:
+        return to_utc_timestamp(value)
+    return convert_numpy_types(value)
+
+
+def normalize_array_compare_items(ftype, value):
+    if not isinstance(value, list):
+        return None
+    out = [normalize_array_compare_item(ftype, item) for item in value]
+    return [item for item in out if item is not None]
+
+
+def array_membership_mask(series, item_type, targets, mode):
+    normalized_targets = [normalize_array_compare_item(item_type, target) for target in targets]
+    normalized_targets = [target for target in normalized_targets if target is not None]
+    normalized_target_set = set(normalized_targets)
+
+    if mode == "contains_any":
+        return series.apply(
+            lambda value, vals=normalized_targets: any(target in (normalize_array_compare_items(item_type, value) or []) for target in vals)
+            if isinstance(value, list)
+            else False
+        )
+    if mode == "contains_all":
+        return series.apply(
+            lambda value, vals=normalized_targets: all(target in (normalize_array_compare_items(item_type, value) or []) for target in vals)
+            if isinstance(value, list)
+            else False
+        )
+    return series.apply(
+        lambda value, vals=normalized_target_set: not any(item in vals for item in (normalize_array_compare_items(item_type, value) or []))
+        if isinstance(value, list)
+        else True
+    )
+
+
 def convert_numpy_types(obj):
     if isinstance(obj, np.integer):
         return int(obj)
@@ -1353,21 +1402,24 @@ class DataManager:
         for field in self.schema_config:
             fname = field["name"]
             ftype = field["type"]
+            null_ratio = self.null_ratio
+            if is_inverted_profile() and fname.startswith("searchOnlyText"):
+                null_ratio = 0.0
 
             if ftype in {FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE}:
-                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_scalar_value(ftype)
+                row[fname] = None if self.py_rng.random() < null_ratio else self._generate_scalar_value(ftype)
             elif ftype == FieldType.GEO:
-                row[fname] = None if self.py_rng.random() < self.null_ratio else self._random_geo(boundary=True)
+                row[fname] = None if self.py_rng.random() < null_ratio else self._random_geo(boundary=True)
             elif ftype == FieldType.INT_ARRAY:
-                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.INT)
+                row[fname] = None if self.py_rng.random() < null_ratio else self._generate_array_value(FieldType.INT)
             elif ftype == FieldType.TEXT_ARRAY:
-                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.TEXT)
+                row[fname] = None if self.py_rng.random() < null_ratio else self._generate_array_value(FieldType.TEXT)
             elif ftype == FieldType.NUMBER_ARRAY:
-                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.NUMBER)
+                row[fname] = None if self.py_rng.random() < null_ratio else self._generate_array_value(FieldType.NUMBER)
             elif ftype == FieldType.BOOL_ARRAY:
-                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.BOOL)
+                row[fname] = None if self.py_rng.random() < null_ratio else self._generate_array_value(FieldType.BOOL)
             elif ftype == FieldType.DATE_ARRAY:
-                row[fname] = None if self.py_rng.random() < self.null_ratio else self._generate_array_value(FieldType.DATE)
+                row[fname] = None if self.py_rng.random() < null_ratio else self._generate_array_value(FieldType.DATE)
             elif ftype == FieldType.OBJECT:
                 row[fname] = self._generate_object_value(field)
         return row
@@ -2445,8 +2497,8 @@ def generate_simple_aggregate_filter(dm):
         targets = _choose_array_targets(series, count=1)
         if not targets:
             return None, None, None
-        target = str(targets[0])
-        mask = series.apply(lambda item, value=target: value in item if isinstance(item, list) else False)
+        target = canonicalize_date_string(targets[0]) or str(targets[0])
+        mask = array_membership_mask(series, FieldType.DATE, [target], "contains_any")
         return Filter.by_property("agg_date_array_metric").contains_any([target]), mask, f"agg_date_array_metric contains_any [{target}]"
 
     if choice == "int_array_contains":
@@ -3575,16 +3627,19 @@ class OracleQueryGenerator:
         # Tokenization.FIELD → 精确匹配, 不再需要 .lower() 变换
         if mode == "contains_any":
             fc = Filter.by_property(fname).contains_any(targets)
-            mask = series.apply(lambda x: any(i in targets for i in x) if isinstance(x, list) else False)
+            item_type = rest_array_item_type(ftype)
+            mask = array_membership_mask(series, item_type, targets, "contains_any")
             return fc, mask, f"{fname} contains_any {targets}"
         elif mode == "contains_all":
             fc = Filter.by_property(fname).contains_all(targets)
-            mask = series.apply(lambda x: all(t in x for t in targets) if isinstance(x, list) else False)
+            item_type = rest_array_item_type(ftype)
+            mask = array_membership_mask(series, item_type, targets, "contains_all")
             return fc, mask, f"{fname} contains_all {targets}"
         else:
             # contains_none: 不含 targets 中任何值; null 数组视为匹配
             fc = Filter.by_property(fname).contains_none(targets)
-            mask = series.apply(lambda x: not any(i in targets for i in x) if isinstance(x, list) else True)
+            item_type = rest_array_item_type(ftype)
+            mask = array_membership_mask(series, item_type, targets, "contains_none")
             return fc, mask, f"{fname} contains_none {targets}"
 
     def gen_geo_expr(self):
@@ -3745,6 +3800,40 @@ class OracleQueryGenerator:
                 return base.greater_than(target), lengths > target, f"len({name}) > {target}"
             return base.greater_or_equal(target), lengths >= target, f"len({name}) >= {target}"
         return None, None, None
+
+    def gen_search_only_text_exact_expr(self):
+        if not self.search_only_text_schema:
+            return None, None, None
+
+        field = random.choice(self.search_only_text_schema)
+        name = field["name"]
+        series = self.df[name]
+        null_mask = self._effective_null_mask(series, FieldType.TEXT)
+        target = self.get_value_for_query(name, FieldType.TEXT)
+        if target is None:
+            return None, None, None
+
+        target = str(target)
+        if random.random() < 0.5:
+            return (
+                Filter.by_property(name).equal(target),
+                series.apply(
+                    lambda value, tv=target: str(value) == tv
+                    if value is not None and not (isinstance(value, float) and np.isnan(value))
+                    else False
+                ),
+                f'{name} == "{target}" [search-only]',
+            )
+
+        return (
+            Filter.by_property(name).not_equal(target),
+            series.apply(
+                lambda value, tv=target: str(value) != tv
+                if value is not None and not (isinstance(value, float) and np.isnan(value))
+                else True
+            ) | null_mask,
+            f'{name} != "{target}" [search-only]',
+        )
 
     def _creation_time_values(self):
         if self.creation_time_series is None:
@@ -4094,10 +4183,8 @@ class OracleQueryGenerator:
             if all_items:
                 t = self._convert_to_native(random.choice(all_items))
                 fc = Filter.not_(Filter.by_property(name).contains_any([t]))
-                if ftype == FieldType.TEXT_ARRAY:
-                    # Tokenization.FIELD → 精确比较
-                    return fc, series.apply(lambda x: not any(str(i) == str(t) for i in x) if isinstance(x, list) else True), f"NOT({name} contains {t})"
-                return fc, series.apply(lambda x: t not in x if isinstance(x, list) else True), f"NOT({name} contains {t})"
+                item_type = rest_array_item_type(ftype)
+                return fc, array_membership_mask(series, item_type, [t], "contains_none"), f"NOT({name} contains {t})"
 
         elif strat == "not_null" and ENABLE_NULL_FILTER:
             fc = Filter.not_(Filter.by_property(name).is_none(True))
@@ -4135,6 +4222,12 @@ class OracleQueryGenerator:
 
         if self.property_length_schema and random.random() < property_length_rate:
             res = self.gen_property_length_expr()
+            if res[0] is not None:
+                return res
+
+        search_only_exact_rate = 0.18 if self._inverted_profile else 0.0
+        if self.search_only_text_schema and random.random() < search_only_exact_rate:
+            res = self.gen_search_only_text_exact_expr()
             if res[0] is not None:
                 return res
 
@@ -4339,7 +4432,8 @@ class OracleQueryGenerator:
             if all_items:
                 t = self._convert_to_native(random.choice(all_items))
                 fc = Filter.by_property(name).contains_any([t])
-                mask = series.apply(lambda x, tt=t: tt in x if isinstance(x, list) else False)
+                item_type = rest_array_item_type(ftype)
+                mask = array_membership_mask(series, item_type, [t], "contains_any")
                 es = f'{name} contains {t}'
             else:
                 if ENABLE_NULL_FILTER:
@@ -4515,6 +4609,7 @@ def generate_simple_rest_filter(qg):
         field for field in qg.schema
         if field["type"] in [FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE]
     ]
+    search_only_text_schema = list(getattr(qg, "search_only_text_schema", []) or [])
     supported_array_schema = [
         field for field in qg.schema
         if field["type"] in [FieldType.INT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY, FieldType.TEXT_ARRAY, FieldType.DATE_ARRAY]
@@ -4529,6 +4624,8 @@ def generate_simple_rest_filter(qg):
     if supported_scalar_schema:
         choices.extend(["scalar"] * 9)
         choices.extend(["null"] * 2)
+    if search_only_text_schema:
+        choices.extend(["search_only_exact"] * 3)
     if supported_array_schema:
         choices.extend(["array"] * 4)
         choices.extend(["null"] * 2)
@@ -4574,6 +4671,29 @@ def generate_simple_rest_filter(qg):
         mask = null_mask if is_null else ~null_mask
         return build_rest_where([name], "IsNull", raw_key="valueBoolean", value=is_null), mask, f"{name} is {'null' if is_null else 'not null'}"
 
+    if choice == "search_only_exact":
+        field = random.choice(search_only_text_schema)
+        name = field["name"]
+        series = df[name]
+        target = qg.get_value_for_query(name, FieldType.TEXT)
+        if target is None:
+            return None, None, None
+        target = str(target)
+        operator = random.choice(["Equal", "NotEqual"])
+        if operator == "Equal":
+            mask = series.apply(
+                lambda value, tv=target: str(value) == tv
+                if value is not None and not (isinstance(value, float) and np.isnan(value))
+                else False
+            )
+        else:
+            mask = series.apply(
+                lambda value, tv=target: str(value) != tv
+                if value is not None and not (isinstance(value, float) and np.isnan(value))
+                else True
+            )
+        return build_rest_where([name], operator, ftype=FieldType.TEXT, value=target), mask, f"{name} {operator} {target} [search-only]"
+
     if choice == "array":
         field = random.choice(supported_array_schema)
         name, ftype = field["name"], field["type"]
@@ -4587,11 +4707,11 @@ def generate_simple_rest_filter(qg):
             targets = [canonicalize_date_string(target) or str(target) for target in targets]
         mode = random.choice(["ContainsAny", "ContainsAll", "ContainsNone"])
         if mode == "ContainsAny":
-            mask = series.apply(lambda value, vals=targets: any(target in value for target in vals) if isinstance(value, list) else False)
+            mask = array_membership_mask(series, item_type, targets, "contains_any")
         elif mode == "ContainsAll":
-            mask = series.apply(lambda value, vals=targets: all(target in value for target in vals) if isinstance(value, list) else False)
+            mask = array_membership_mask(series, item_type, targets, "contains_all")
         else:
-            mask = series.apply(lambda value, vals=targets: not any(target in value for target in vals) if isinstance(value, list) else True)
+            mask = array_membership_mask(series, item_type, targets, "contains_none")
         return build_rest_where([name], mode, ftype=item_type, value=targets), mask, f"{name} {mode.lower()} {targets}"
 
     field = random.choice(supported_scalar_schema)

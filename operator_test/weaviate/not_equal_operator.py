@@ -24,6 +24,7 @@ ROWS = [
         properties={
             "tag": "a",
             "textField": "Alpha Beta",
+            "searchOnlyText": "Alpha Beta",
             "wordText": "Alpha Beta",
             "intVal": 10,
             "boolVal": True,
@@ -42,6 +43,7 @@ ROWS = [
         properties={
             "tag": "b",
             "textField": "alpha beta",
+            "searchOnlyText": "alpha beta",
             "wordText": "alpha beta",
             "intVal": 20,
             "boolVal": False,
@@ -60,6 +62,7 @@ ROWS = [
         properties={
             "tag": "c",
             "textField": "Alpha",
+            "searchOnlyText": "Alpha",
             "wordText": "Alpha",
             "intVal": 10,
             "boolVal": True,
@@ -78,6 +81,7 @@ ROWS = [
         properties={
             "tag": "d",
             "textField": "Alpha-Beta",
+            "searchOnlyText": "Alpha-Beta",
             "wordText": "Alpha-Beta",
             "intVal": -10,
             "boolVal": False,
@@ -104,6 +108,13 @@ def create_collection(client, name):
                 data_type=DataType.TEXT,
                 tokenization=Tokenization.FIELD,
                 index_filterable=True,
+            ),
+            Property(
+                name="searchOnlyText",
+                data_type=DataType.TEXT,
+                tokenization=Tokenization.FIELD,
+                index_filterable=False,
+                index_searchable=True,
             ),
             Property(
                 name="wordText",
@@ -239,6 +250,14 @@ def main():
             "Current fuzzer uses Tokenization.FIELD for TEXT, so non-empty text NotEqual is modeled as exact case-sensitive string inequality plus null or omitted inclusion.",
             ["b", "c", "d"],
             fetch_tags(collection, Filter.by_property("textField").not_equal("Alpha Beta")),
+        ))
+
+        checks.append(print_check(
+            "search_only_field_text_not_equal_local_extension",
+            "The checked docs document NotEqual on text values, but they do not precisely define whether a property must be filterable rather than merely searchable.",
+            "For the inverted-focused local extension, search-only FIELD TEXT NotEqual is modeled as exact case-sensitive string inequality on the stored value.",
+            ["b", "c", "d"],
+            fetch_tags(collection, Filter.by_property("searchOnlyText").not_equal("Alpha Beta")),
         ))
 
         checks.append(print_check(
