@@ -38,6 +38,7 @@ import sys
 import uuid
 import argparse
 import re
+import shlex
 import requests
 from dataclasses import dataclass
 from datetime import timedelta, timezone
@@ -49,7 +50,7 @@ from weaviate.classes.config import (
 from weaviate.classes.query import Filter, GeoCoordinate, GroupBy, Sort, MetadataQuery
 from weaviate.classes.data import DataObject
 from weaviate.classes.config import ConsistencyLevel
-from weaviate.collections.classes.aggregate import Metrics
+from weaviate.collections.classes.aggregate import Metrics, GroupByAggregate
 
 # --- Null 过滤默认启用 ---
 ENABLE_NULL_FILTER = True
@@ -199,6 +200,10 @@ def unique_float_values(values):
         seen.add(bits)
         out.append(float(fv))
     return out
+
+
+def stable_unique_values(values):
+    return list(dict.fromkeys(values))
 
 
 def format_rfc3339_timestamp(ts, offset_minutes=0):
@@ -592,7 +597,8 @@ ALL_CONSISTENCY_LEVELS = [ConsistencyLevel.ONE, ConsistencyLevel.QUORUM, Consist
 DEFAULT_CONSISTENCY_LEVEL = ConsistencyLevel.ALL
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "weaviate_log")
+DEFAULT_LOG_DIR = os.getenv("WEAVIATE_FUZZ_LOG_DIR", os.path.join(SCRIPT_DIR, "weaviate_log"))
+LOG_RUN_SUFFIX = os.getenv("WEAVIATE_FUZZ_LOG_SUFFIX", "")
 
 
 def ensure_log_dir():
@@ -604,11 +610,91 @@ def make_log_path(filename: str) -> str:
     return os.path.join(ensure_log_dir(), filename)
 
 
+def set_log_dir(path: str | None):
+    global DEFAULT_LOG_DIR
+    if path:
+        DEFAULT_LOG_DIR = os.path.abspath(os.path.expanduser(path))
+
+
+def set_log_suffix(value: str | None):
+    global LOG_RUN_SUFFIX
+    LOG_RUN_SUFFIX = str(value or "")
+
+
+def sanitize_log_token(value) -> str:
+    text = str(value)
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", text)
+    return text.strip("-") or "x"
+
+
+def stable_log_filename(prefix: str, seed, rounds, mode: str, *extra_tokens) -> str:
+    tokens = [
+        prefix,
+        f"mode-{mode}",
+        f"seed-{seed}",
+        f"rounds-{rounds}",
+        f"N-{N}",
+        f"profile-{get_fuzz_profile()}",
+    ]
+    tokens.extend(str(token) for token in extra_tokens if token not in (None, ""))
+    if LOG_RUN_SUFFIX:
+        tokens.append(f"tag-{LOG_RUN_SUFFIX}")
+    return "__".join(sanitize_log_token(token) for token in tokens) + ".log"
+
+
 def display_path(path: str) -> str:
     try:
         return os.path.relpath(path, start=os.getcwd())
     except Exception:
         return path
+
+
+@dataclass(frozen=True)
+class GraphQLEnum:
+    value: str
+
+
+def graphql_with_enum_operators(value):
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if key == "operator" and isinstance(item, str):
+                out[key] = GraphQLEnum(item)
+            else:
+                out[key] = graphql_with_enum_operators(item)
+        return out
+    if isinstance(value, list):
+        return [graphql_with_enum_operators(item) for item in value]
+    if isinstance(value, tuple):
+        return [graphql_with_enum_operators(item) for item in value]
+    return value
+
+
+def graphql_input_literal(value):
+    if isinstance(value, GraphQLEnum):
+        return str(value.value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        if not np.isfinite(value):
+            raise ValueError(f"Non-finite float not supported in GraphQL literal: {value!r}")
+        text = repr(float(value))
+        return text if "." in text or "e" in text.lower() else f"{text}.0"
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(graphql_input_literal(item) for item in value) + "]"
+    if isinstance(value, dict):
+        ordered_keys = [
+            key for key in ("path", "operator", "operands") if key in value
+        ] + sorted(key for key in value.keys() if key not in {"path", "operator", "operands"})
+        parts = [f"{key}:{graphql_input_literal(value[key])}" for key in ordered_keys]
+        return "{ " + " ".join(parts) + " }"
+    raise TypeError(f"Unsupported GraphQL literal type: {type(value)!r}")
 
 
 def consistency_label(consistency, randomize=False):
@@ -626,15 +712,38 @@ def parse_consistency_arg(value: str):
     return mapping[value.lower()]
 
 
-def format_repro_command(seed, consistency, randomize_consistency=False):
-    parts = [f"python weaviate_fuzz_oracle.py --seed {seed}"]
+def format_repro_command(
+    seed,
+    consistency,
+    randomize_consistency=False,
+    mode="oracle",
+    rounds=None,
+    rows=None,
+    dynamic_enabled=True,
+    host=None,
+    port=None,
+    extra_args=None,
+):
+    parts = ["python", "weaviate_fuzz_oracle.py", "--mode", str(mode), "--seed", str(seed)]
+    if rounds is not None:
+        parts.extend(["--rounds", str(rounds)])
+    if rows is not None:
+        parts.extend(["-N", str(rows)])
+    if host is not None:
+        parts.extend(["--host", str(host)])
+    if port is not None:
+        parts.extend(["--port", str(port)])
     if get_fuzz_profile() != FUZZ_PROFILE_DEFAULT:
-        parts.append(f"--profile {get_fuzz_profile()}")
+        parts.extend(["--profile", get_fuzz_profile()])
+    if not dynamic_enabled:
+        parts.append("--no-dynamic")
     if randomize_consistency:
         parts.append("--random-consistency")
     elif (consistency or DEFAULT_CONSISTENCY_LEVEL) != DEFAULT_CONSISTENCY_LEVEL:
-        parts.append(f"--consistency {(consistency or DEFAULT_CONSISTENCY_LEVEL).name.lower()}")
-    return " ".join(parts)
+        parts.extend(["--consistency", (consistency or DEFAULT_CONSISTENCY_LEVEL).name.lower()])
+    for item in extra_args or []:
+        parts.append(str(item))
+    return shlex.join(parts)
 
 
 # --- 1. Data Manager ---
@@ -2871,7 +2980,8 @@ class WeaviateManager:
         new_vectors = []
         synced_ids = []
 
-        for object_id, obj in objects_by_id.items():
+        for object_id in sorted(objects_by_id):
+            obj = objects_by_id[object_id]
             row_idx = id_to_index.get(str(object_id))
             fallback_row = dm.df.iloc[row_idx].to_dict() if row_idx is not None else None
             canonical = canonical_row_from_weaviate_props(dm, object_id, getattr(obj, "properties", None), fallback_row=fallback_row)
@@ -3163,6 +3273,7 @@ class OracleQueryGenerator:
     def __init__(self, dm):
         self.profile = getattr(dm, "profile", get_fuzz_profile())
         self._inverted_profile = self.profile == FUZZ_PROFILE_INVERTED
+        self._absent_uuid_counter = 0
         self.schema_all = dm.schema_config
         # Only use filterable fields for query generation to avoid index-not-enabled errors
         filterable = getattr(dm, 'filterable_fields', None)
@@ -3348,7 +3459,13 @@ class OracleQueryGenerator:
     def _random_absent_uuid(self, existing_ids=None):
         existing = set(existing_ids or self._existing_ids())
         while True:
-            candidate = str(uuid.uuid4())
+            candidate = str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_DNS,
+                    f"weaviate-fuzz-absent-{self.dm.seed}-{self._absent_uuid_counter}",
+                )
+            )
+            self._absent_uuid_counter += 1
             if candidate not in existing:
                 return candidate
 
@@ -3370,6 +3487,415 @@ class OracleQueryGenerator:
             return False
 
         return series.apply(comp)
+
+    def _scalar_contains_expr_value(self, ftype, value):
+        if ftype == FieldType.INT:
+            return int(value)
+        if ftype == FieldType.NUMBER:
+            return float(value)
+        if ftype == FieldType.BOOL:
+            return bool(value)
+        if ftype == FieldType.DATE:
+            return canonicalize_date_string(value) or str(value)
+        return value
+
+    def _scalar_contains_query_value(self, ftype, value):
+        if ftype == FieldType.INT:
+            return int(value)
+        if ftype == FieldType.NUMBER:
+            return float(value)
+        if ftype == FieldType.BOOL:
+            return bool(value)
+        if ftype == FieldType.DATE:
+            ts = to_utc_timestamp(value)
+            return ts.to_pydatetime() if ts is not None else None
+        return value
+
+    def _scalar_contains_mask(self, series, ftype, targets, mode):
+        expr_targets = tuple(self._scalar_contains_expr_value(ftype, target) for target in targets)
+        if mode == "contains_all":
+            expr_targets = expr_targets[:1]
+        if ftype == FieldType.INT:
+            if mode == "contains_any":
+                return series.apply(lambda value, vals=expr_targets: int(value) in vals if not is_null_like(value) else False)
+            if mode == "contains_none":
+                return series.apply(lambda value, vals=expr_targets: int(value) not in vals if not is_null_like(value) else True)
+            return series.apply(
+                lambda value, vals=expr_targets: all(int(value) == target for target in vals)
+                if not is_null_like(value)
+                else False
+            )
+        if ftype == FieldType.NUMBER:
+            if mode == "contains_any":
+                return series.apply(lambda value, vals=expr_targets: float(value) in vals if not is_null_like(value) else False)
+            if mode == "contains_none":
+                return series.apply(lambda value, vals=expr_targets: float(value) not in vals if not is_null_like(value) else True)
+            return series.apply(
+                lambda value, vals=expr_targets: all(float(value) == target for target in vals)
+                if not is_null_like(value)
+                else False
+            )
+        if ftype == FieldType.BOOL:
+            if mode == "contains_any":
+                return series.apply(lambda value, vals=expr_targets: bool(value) in vals if not is_null_like(value) else False)
+            if mode == "contains_none":
+                return series.apply(lambda value, vals=expr_targets: bool(value) not in vals if not is_null_like(value) else True)
+            return series.apply(
+                lambda value, vals=expr_targets: all(bool(value) == target for target in vals)
+                if not is_null_like(value)
+                else False
+            )
+        if ftype == FieldType.DATE:
+            if mode == "contains_any":
+                return series.apply(
+                    lambda value, vals=expr_targets: (canonicalize_date_string(value) or str(value)) in vals
+                    if to_utc_timestamp(value) is not None
+                    else False
+                )
+            if mode == "contains_none":
+                return series.apply(
+                    lambda value, vals=expr_targets: (canonicalize_date_string(value) or str(value)) not in vals
+                    if to_utc_timestamp(value) is not None
+                    else True
+                )
+            return series.apply(
+                lambda value, vals=expr_targets: all((canonicalize_date_string(value) or str(value)) == target for target in vals)
+                if to_utc_timestamp(value) is not None
+                else False
+            )
+        return pd.Series(False, index=series.index, dtype=bool)
+
+    def _build_scalar_contains_filter_clause(self, name, ftype, series, mode, targets):
+        query_targets = []
+        expr_targets = []
+        for target in targets:
+            query_value = self._scalar_contains_query_value(ftype, target)
+            if ftype == FieldType.DATE and query_value is None:
+                return None, None, None
+            query_targets.append(query_value)
+            expr_targets.append(self._scalar_contains_expr_value(ftype, target))
+        if mode == "contains_all":
+            query_targets = query_targets[:1]
+            expr_targets = expr_targets[:1]
+        filter_builder = getattr(Filter.by_property(name), mode)
+        mask = self._scalar_contains_mask(series, ftype, targets, mode)
+        return filter_builder(query_targets), self._normalize_mask(mask), f"{name} {mode} {expr_targets}"
+
+    def _build_scalar_contains_rest_clause(self, name, ftype, series, mode, targets):
+        rest_operator = {
+            "contains_any": "ContainsAny",
+            "contains_all": "ContainsAll",
+            "contains_none": "ContainsNone",
+        }[mode]
+        rest_targets = [self._scalar_contains_expr_value(ftype, target) for target in targets]
+        if mode == "contains_all":
+            rest_targets = rest_targets[:1]
+        mask = self._scalar_contains_mask(series, ftype, targets, mode)
+        return build_rest_where([name], rest_operator, ftype=ftype, value=rest_targets), self._normalize_mask(mask), f"{name} {mode} {rest_targets}"
+
+    def _scalar_contains_contrast_value(self, ftype, value):
+        if ftype == FieldType.INT:
+            primary = int(value)
+            contrast = clamp_weaviate_int(primary + random.choice([1, 7, 13, 101, -1, -7, -13, -101]))
+            if contrast == primary:
+                contrast = clamp_weaviate_int(primary + 1)
+            return contrast
+        if ftype == FieldType.NUMBER:
+            primary = float(value)
+            contrast = float(primary + random.choice([-17.0, -0.25, 0.25, 17.0]))
+            if contrast == primary:
+                contrast += 1.0
+            return contrast
+        if ftype == FieldType.BOOL:
+            return not bool(value)
+        if ftype == FieldType.DATE:
+            ts = to_utc_timestamp(value)
+            if ts is None:
+                return None
+            return ts + random.choice(
+                [pd.Timedelta(days=7), -pd.Timedelta(days=7), pd.Timedelta(seconds=1), -pd.Timedelta(seconds=1)]
+            )
+        return None
+
+    def gen_scalar_contains_compound_expr(self):
+        candidates = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.DATE)]
+        random.shuffle(candidates)
+        for field in candidates:
+            name, ftype = field["name"], field["type"]
+            series = self.df[name]
+            value = self.get_value_for_query(name, ftype)
+            if value is None:
+                continue
+            contrast = self._scalar_contains_contrast_value(ftype, value)
+            strategies = ["not_contains_any", "contains_any_or_null", "contains_all_and_not_none"]
+            if ftype in (FieldType.INT, FieldType.NUMBER, FieldType.DATE):
+                strategies.append("contains_none_and_range")
+            strategy = random.choice(strategies)
+            if strategy == "not_contains_any":
+                targets = [value]
+                if contrast is not None and random.random() < 0.55:
+                    targets.append(contrast)
+                contains_filter, contains_mask, contains_expr = self._build_scalar_contains_filter_clause(
+                    name, ftype, series, "contains_any", targets
+                )
+                if contains_filter is None:
+                    continue
+                return Filter.not_(contains_filter), self._apply_not_mask(contains_mask), f"NOT({contains_expr})"
+            if strategy == "contains_any_or_null":
+                targets = [value]
+                if contrast is not None:
+                    targets.append(contrast)
+                contains_filter, contains_mask, contains_expr = self._build_scalar_contains_filter_clause(
+                    name, ftype, series, "contains_any", targets
+                )
+                if contains_filter is None:
+                    continue
+                null_filter = Filter.by_property(name).is_none(True)
+                null_mask = self._effective_null_mask(series, ftype)
+                return (
+                    contains_filter | null_filter,
+                    self._normalize_mask(contains_mask) | self._normalize_mask(null_mask),
+                    f"({contains_expr} OR {name} is null)",
+                )
+            if strategy == "contains_all_and_not_none":
+                contains_all_filter, contains_all_mask, contains_all_expr = self._build_scalar_contains_filter_clause(
+                    name, ftype, series, "contains_all", [value]
+                )
+                contains_none_filter, contains_none_mask, contains_none_expr = self._build_scalar_contains_filter_clause(
+                    name, ftype, series, "contains_none", [value]
+                )
+                if contains_all_filter is None or contains_none_filter is None:
+                    continue
+                return (
+                    contains_all_filter & Filter.not_(contains_none_filter),
+                    self._normalize_mask(contains_all_mask) & self._apply_not_mask(contains_none_mask),
+                    f"({contains_all_expr} AND NOT({contains_none_expr}))",
+                )
+            if contrast is None:
+                continue
+            contains_none_filter, contains_none_mask, contains_none_expr = self._build_scalar_contains_filter_clause(
+                name, ftype, series, "contains_none", [contrast]
+            )
+            if contains_none_filter is None:
+                continue
+            if ftype == FieldType.INT:
+                pivot = int(value)
+                range_filter = Filter.by_property(name).greater_or_equal(pivot)
+                range_mask = series.apply(lambda item, target=pivot: int(item) >= target if not is_null_like(item) else False)
+                return (
+                    contains_none_filter & range_filter,
+                    self._normalize_mask(contains_none_mask) & self._normalize_mask(range_mask),
+                    f"({contains_none_expr} AND {name} >= {pivot})",
+                )
+            if ftype == FieldType.NUMBER:
+                pivot = float(value)
+                lo, hi = float_window(pivot)
+                if lo is None or hi is None:
+                    continue
+                range_filter = Filter.by_property(name).greater_or_equal(lo) & Filter.by_property(name).less_or_equal(hi)
+                range_mask = series.apply(
+                    lambda item, left=lo, right=hi: left <= float(item) <= right if not is_null_like(item) else False
+                )
+                return (
+                    contains_none_filter & range_filter,
+                    self._normalize_mask(contains_none_mask) & self._normalize_mask(range_mask),
+                    f"({contains_none_expr} AND {name} in [{lo}, {hi}])",
+                )
+            pivot = canonicalize_date_string(value) or str(value)
+            pivot_ts = to_utc_timestamp(value)
+            if pivot_ts is None:
+                continue
+            pivot_dt = pivot_ts.to_pydatetime()
+            range_filter = Filter.by_property(name).greater_or_equal(pivot_dt) & Filter.by_property(name).less_or_equal(pivot_dt)
+            range_mask = series.apply(
+                lambda item, target=pivot: (canonicalize_date_string(item) or str(item)) == target
+                if to_utc_timestamp(item) is not None
+                else False
+            )
+            return (
+                contains_none_filter & range_filter,
+                self._normalize_mask(contains_none_mask) & self._normalize_mask(range_mask),
+                f"({contains_none_expr} AND {name} in [{pivot}, {pivot}])",
+            )
+        return None, None, None
+
+    def gen_scalar_contains_compound_rest_expr(self):
+        candidates = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.DATE)]
+        random.shuffle(candidates)
+        for field in candidates:
+            name, ftype = field["name"], field["type"]
+            series = self.df[name]
+            value = self.get_value_for_query(name, ftype)
+            if value is None:
+                continue
+            contrast = self._scalar_contains_contrast_value(ftype, value)
+            strategies = ["not_contains_any", "contains_any_or_null", "contains_all_and_not_none"]
+            if ftype in (FieldType.INT, FieldType.NUMBER, FieldType.DATE):
+                strategies.append("contains_none_and_range")
+            strategy = random.choice(strategies)
+            if strategy == "not_contains_any":
+                targets = [value]
+                if contrast is not None and random.random() < 0.55:
+                    targets.append(contrast)
+                contains_where, contains_mask, contains_expr = self._build_scalar_contains_rest_clause(
+                    name, ftype, series, "contains_any", targets
+                )
+                if contains_where is None:
+                    continue
+                return build_rest_compound("Not", [contains_where]), self._apply_not_mask(contains_mask), f"NOT({contains_expr})"
+            if strategy == "contains_any_or_null":
+                targets = [value]
+                if contrast is not None:
+                    targets.append(contrast)
+                contains_where, contains_mask, contains_expr = self._build_scalar_contains_rest_clause(
+                    name, ftype, series, "contains_any", targets
+                )
+                if contains_where is None:
+                    continue
+                null_where = build_rest_where([name], "IsNull", raw_key="valueBoolean", value=True)
+                null_mask = self._effective_null_mask(series, ftype)
+                return (
+                    build_rest_compound("Or", [contains_where, null_where]),
+                    self._normalize_mask(contains_mask) | self._normalize_mask(null_mask),
+                    f"({contains_expr} OR {name} is null)",
+                )
+            if strategy == "contains_all_and_not_none":
+                contains_all_where, contains_all_mask, contains_all_expr = self._build_scalar_contains_rest_clause(
+                    name, ftype, series, "contains_all", [value]
+                )
+                contains_none_where, contains_none_mask, contains_none_expr = self._build_scalar_contains_rest_clause(
+                    name, ftype, series, "contains_none", [value]
+                )
+                if contains_all_where is None or contains_none_where is None:
+                    continue
+                return (
+                    build_rest_compound("And", [contains_all_where, build_rest_compound("Not", [contains_none_where])]),
+                    self._normalize_mask(contains_all_mask) & self._apply_not_mask(contains_none_mask),
+                    f"({contains_all_expr} AND NOT({contains_none_expr}))",
+                )
+            if contrast is None:
+                continue
+            contains_none_where, contains_none_mask, contains_none_expr = self._build_scalar_contains_rest_clause(
+                name, ftype, series, "contains_none", [contrast]
+            )
+            if contains_none_where is None:
+                continue
+            if ftype == FieldType.INT:
+                pivot = int(value)
+                range_where = build_rest_where([name], "GreaterThanEqual", ftype=FieldType.INT, value=pivot)
+                range_mask = series.apply(lambda item, target=pivot: int(item) >= target if not is_null_like(item) else False)
+                return (
+                    build_rest_compound("And", [contains_none_where, range_where]),
+                    self._normalize_mask(contains_none_mask) & self._normalize_mask(range_mask),
+                    f"({contains_none_expr} AND {name} >= {pivot})",
+                )
+            if ftype == FieldType.NUMBER:
+                pivot = float(value)
+                lo, hi = float_window(pivot)
+                if lo is None or hi is None:
+                    continue
+                range_where = build_rest_compound(
+                    "And",
+                    [
+                        build_rest_where([name], "GreaterThanEqual", ftype=FieldType.NUMBER, value=lo),
+                        build_rest_where([name], "LessThanEqual", ftype=FieldType.NUMBER, value=hi),
+                    ],
+                )
+                range_mask = series.apply(
+                    lambda item, left=lo, right=hi: left <= float(item) <= right if not is_null_like(item) else False
+                )
+                return (
+                    build_rest_compound("And", [contains_none_where, range_where]),
+                    self._normalize_mask(contains_none_mask) & self._normalize_mask(range_mask),
+                    f"({contains_none_expr} AND {name} in [{lo}, {hi}])",
+                )
+            pivot = canonicalize_date_string(value) or str(value)
+            pivot_ts = to_utc_timestamp(value)
+            if pivot_ts is None:
+                continue
+            range_where = build_rest_compound(
+                "And",
+                [
+                    build_rest_where([name], "GreaterThanEqual", ftype=FieldType.DATE, value=pivot),
+                    build_rest_where([name], "LessThanEqual", ftype=FieldType.DATE, value=pivot),
+                ],
+            )
+            range_mask = series.apply(
+                lambda item, target=pivot: (canonicalize_date_string(item) or str(item)) == target
+                if to_utc_timestamp(item) is not None
+                else False
+            )
+            return (
+                build_rest_compound("And", [contains_none_where, range_where]),
+                self._normalize_mask(contains_none_mask) & self._normalize_mask(range_mask),
+                f"({contains_none_expr} AND {name} in [{pivot}, {pivot}])",
+            )
+        return None, None, None
+
+    def gen_true_scalar_contains_compound(self, row):
+        fields = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.DATE)]
+        random.shuffle(fields)
+        for field in fields:
+            name, ftype = field["name"], field["type"]
+            value = row.get(name)
+            if self._is_effectively_null_value(value, ftype):
+                continue
+            series = self.df[name]
+            contrast = self._scalar_contains_contrast_value(ftype, value)
+            strategies = ["contains_all_and_not_none", "contains_any_or_null"]
+            if contrast is not None:
+                strategies.append("contains_none_guard")
+            strategy = random.choice(strategies)
+            if strategy == "contains_all_and_not_none":
+                contains_all_filter, _, contains_all_expr = self._build_scalar_contains_filter_clause(
+                    name, ftype, series, "contains_all", [value]
+                )
+                contains_none_filter, contains_none_mask, contains_none_expr = self._build_scalar_contains_filter_clause(
+                    name, ftype, series, "contains_none", [value]
+                )
+                if contains_all_filter is None or contains_none_filter is None:
+                    continue
+                return (
+                    contains_all_filter & Filter.not_(contains_none_filter),
+                    f"({contains_all_expr} AND NOT({contains_none_expr}))",
+                )
+            if strategy == "contains_any_or_null":
+                targets = [value]
+                if contrast is not None:
+                    targets.append(contrast)
+                contains_any_filter, _, contains_any_expr = self._build_scalar_contains_filter_clause(
+                    name, ftype, series, "contains_any", targets
+                )
+                if contains_any_filter is None:
+                    continue
+                return contains_any_filter | Filter.by_property(name).is_none(True), f"({contains_any_expr} OR {name} is null)"
+            contains_none_filter, _, contains_none_expr = self._build_scalar_contains_filter_clause(
+                name, ftype, series, "contains_none", [contrast]
+            )
+            if contains_none_filter is None:
+                continue
+            if ftype == FieldType.BOOL:
+                guard = Filter.by_property(name).equal(bool(value))
+                return contains_none_filter & guard, f"({contains_none_expr} AND {name} == {bool(value)})"
+            if ftype == FieldType.INT:
+                pivot = int(value)
+                guard = Filter.by_property(name).greater_or_equal(pivot)
+                return contains_none_filter & guard, f"({contains_none_expr} AND {name} >= {pivot})"
+            if ftype == FieldType.NUMBER:
+                pivot = float(value)
+                lo, hi = float_window(pivot)
+                if lo is None or hi is None:
+                    continue
+                guard = Filter.by_property(name).greater_or_equal(lo) & Filter.by_property(name).less_or_equal(hi)
+                return contains_none_filter & guard, f"({contains_none_expr} AND {name} in [{lo}, {hi}])"
+            pivot = canonicalize_date_string(value) or str(value)
+            pivot_ts = to_utc_timestamp(value)
+            if pivot_ts is None:
+                continue
+            pivot_dt = pivot_ts.to_pydatetime()
+            guard = Filter.by_property(name).greater_or_equal(pivot_dt) & Filter.by_property(name).less_or_equal(pivot_dt)
+            return contains_none_filter & guard, f"({contains_none_expr} AND {name} in [{pivot}, {pivot}])"
+        return None, None
 
     def get_value_for_query(self, fname, ftype):
         valid_values = self._field_values.get(fname, [])
@@ -3618,10 +4144,11 @@ class OracleQueryGenerator:
             pass
         if not all_items:
             return None, None, None
-        num = min(random.randint(2, 4), len(set(all_items)))
+        unique_items = stable_unique_values(all_items)
+        num = min(random.randint(2, 4), len(unique_items))
         if num < 1:
             return None, None, None
-        targets = [self._convert_to_native(t) for t in random.sample(list(set(all_items)), num)]
+        targets = [self._convert_to_native(t) for t in random.sample(unique_items, num)]
 
         mode = random.choice(["contains_any", "contains_all", "contains_none"])
         # Tokenization.FIELD → 精确匹配, 不再需要 .lower() 变换
@@ -3738,8 +4265,9 @@ class OracleQueryGenerator:
             return Filter.by_id().not_equal(target), id_series != target, f'id != "{target}"'
 
         if mode == "contains_any_present":
-            sample_size = min(len(set(id_values)), random.randint(1, 3))
-            targets = random.sample(list(set(id_values)), sample_size)
+            unique_ids = stable_unique_values(id_values)
+            sample_size = min(len(unique_ids), random.randint(1, 3))
+            targets = random.sample(unique_ids, sample_size)
             if random.random() < 0.5:
                 targets.append(fake_id)
             targets = list(dict.fromkeys(targets))
@@ -3749,8 +4277,9 @@ class OracleQueryGenerator:
             targets = [fake_id]
             return Filter.by_id().contains_any(targets), id_series.isin(targets), f"id contains_any {targets}"
 
-        sample_size = min(len(set(id_values)), random.randint(1, 3))
-        targets = random.sample(list(set(id_values)), sample_size)
+        unique_ids = stable_unique_values(id_values)
+        sample_size = min(len(unique_ids), random.randint(1, 3))
+        targets = random.sample(unique_ids, sample_size)
         if random.random() < 0.5:
             targets.append(fake_id)
         targets = list(dict.fromkeys(targets))
@@ -4095,9 +4624,11 @@ class OracleQueryGenerator:
 
     def gen_nested_object_expr(self):
         """Nested Object 查询 (gen_json_advanced_expr)
-        NOTE: Weaviate 当前版本对 OBJECT 类型仅可靠使用 is_none(True)
-        以及 NOT(is_none(True)) 过滤；direct is_none(False) 属于未实现/不支持边界。
-        不支持嵌套属性路径过滤 (metaObj.price > X)。
+        NOTE: Local Weaviate v1.36.10 仅验证了 OBJECT 顶层 null-state。
+        `operator_test/weaviate/nested_object_filter_operator.py` 显示
+        `path:["metaObj","price"]` 这类 child path 会被 GraphQL/REST 解析器拒绝，
+        报错 `missing an argument after 'price'`，因此当前主 fuzzer 不生成该类路径。
+        顶层仅可靠使用 is_none(True) 以及 NOT(is_none(True))；direct is_none(False) 仍属于未实现/不支持边界。
         主要价值: 数据完整性验证 + null 测试。
         """
         obj_fields = [f for f in self.schema if f["type"] == FieldType.OBJECT]
@@ -4205,6 +4736,14 @@ class OracleQueryGenerator:
         property_length_rate = 0.22 if self._inverted_profile else 0.12
         like_rate = 0.36 if self._inverted_profile else 0.24
 
+        def boundary_like_expr(field_name, field_series):
+            pattern = random.choice(["*", "**", "???", "%", "_"])
+            return (
+                Filter.by_property(field_name).like(pattern),
+                rest_like_mask(field_series, pattern),
+                f'{field_name} like "{pattern}"',
+            )
+
         if random.random() < id_rate:
             res = self.gen_id_expr()
             if res[0] is not None:
@@ -4238,6 +4777,8 @@ class OracleQueryGenerator:
             sv = self.get_value_for_query(name, FieldType.TEXT)
             if sv is not None:
                 sv = str(sv)
+                if random.random() < 0.12:
+                    return boundary_like_expr(name, series)
                 if random.random() < 0.40:
                     mode = random.choice(["contains_any", "contains_all", "contains_none"])
                     if mode == "contains_all":
@@ -4337,10 +4878,27 @@ class OracleQueryGenerator:
 
         if ftype == FieldType.BOOL:
             vb = bool(val)
-            if random.random() < 0.3:
+            mode = random.choices(
+                ["equal", "not_equal", "contains_any", "contains_none", "contains_all"],
+                weights=[0.34, 0.18, 0.18, 0.18, 0.12],
+                k=1,
+            )[0]
+            if mode == "not_equal":
                 fc = Filter.by_property(name).not_equal(vb)
                 mask = series.apply(safe_cmp("!=", vb)) | null_mask
                 es = f"{name} != {vb}"
+            elif mode == "contains_any":
+                fc = Filter.by_property(name).contains_any([vb])
+                mask = series.apply(lambda x, target=vb: bool(x) == target if not is_null_like(x) else False)
+                es = f"{name} contains_any [{vb}]"
+            elif mode == "contains_none":
+                fc = Filter.by_property(name).contains_none([vb])
+                mask = series.apply(lambda x, target=vb: bool(x) != target if not is_null_like(x) else True)
+                es = f"{name} contains_none [{vb}]"
+            elif mode == "contains_all":
+                fc = Filter.by_property(name).contains_all([vb])
+                mask = series.apply(lambda x, target=vb: bool(x) == target if not is_null_like(x) else False)
+                es = f"{name} contains_all [{vb}]"
             else:
                 fc = Filter.by_property(name).equal(vb)
                 mask = series.apply(safe_cmp("==", vb))
@@ -4348,25 +4906,79 @@ class OracleQueryGenerator:
 
         elif ftype == FieldType.INT:
             vi = int(val)
-            op = random.choice([">", "<", "==", ">=", "<=", "!="])
+            op = random.choices(
+                [">", "<", "==", ">=", "<=", "!=", "contains_any", "contains_none", "contains_all"],
+                weights=[0.11, 0.11, 0.14, 0.10, 0.10, 0.10, 0.12, 0.12, 0.10],
+                k=1,
+            )[0]
             op_map = {"==": "equal", "!=": "not_equal", ">": "greater_than", "<": "less_than", ">=": "greater_or_equal", "<=": "less_or_equal"}
-            fc = getattr(Filter.by_property(name), op_map[op])(vi)
-            mask = series.apply(safe_cmp(op, vi))
+            if op == "contains_any":
+                targets = [vi]
+                if random.random() < 0.55:
+                    targets.append(clamp_weaviate_int(vi + random.choice([7, 13, 101, -7, -13, -101])))
+                target_set = set(targets)
+                fc = Filter.by_property(name).contains_any(targets)
+                mask = series.apply(lambda x, vals=target_set: int(x) in vals if not is_null_like(x) else False)
+                es = f"{name} contains_any {targets}"
+            elif op == "contains_none":
+                targets = [vi]
+                if random.random() < 0.55:
+                    targets.append(clamp_weaviate_int(vi + random.choice([7, 13, 101, -7, -13, -101])))
+                target_set = set(targets)
+                fc = Filter.by_property(name).contains_none(targets)
+                mask = series.apply(lambda x, vals=target_set: int(x) not in vals if not is_null_like(x) else True)
+                es = f"{name} contains_none {targets}"
+            elif op == "contains_all":
+                fc = Filter.by_property(name).contains_all([vi])
+                mask = series.apply(lambda x, target=vi: int(x) == target if not is_null_like(x) else False)
+                es = f"{name} contains_all [{vi}]"
+            else:
+                fc = getattr(Filter.by_property(name), op_map[op])(vi)
+                mask = series.apply(safe_cmp(op, vi))
+                es = f"{name} {op} {vi}"
             if op == "!=":
                 mask = mask | null_mask  # Weaviate not_equal includes null rows
-            es = f"{name} {op} {vi}"
 
         elif ftype == FieldType.NUMBER:
             vf = float(val)
-            op = random.choice([">", "<", ">=", "<=", "!="])
+            op = random.choices(
+                [">", "<", ">=", "<=", "!=", "contains_any", "contains_none", "contains_all"],
+                weights=[0.14, 0.14, 0.12, 0.12, 0.12, 0.14, 0.12, 0.10],
+                k=1,
+            )[0]
             op_map = {"!=": "not_equal", ">": "greater_than", "<": "less_than", ">=": "greater_or_equal", "<=": "less_or_equal"}
-            fc = getattr(Filter.by_property(name), op_map[op])(vf)
-            mask = series.apply(safe_cmp(op, vf))
+            if op == "contains_any":
+                targets = [vf]
+                if random.random() < 0.55:
+                    noise = float(vf + random.choice([-17.0, -0.25, 0.25, 17.0]))
+                    targets.append(noise)
+                target_set = set(targets)
+                fc = Filter.by_property(name).contains_any(targets)
+                mask = series.apply(lambda x, vals=target_set: float(x) in vals if not is_null_like(x) else False)
+                es = f"{name} contains_any {targets}"
+            elif op == "contains_none":
+                targets = [vf]
+                if random.random() < 0.55:
+                    noise = float(vf + random.choice([-17.0, -0.25, 0.25, 17.0]))
+                    targets.append(noise)
+                target_set = set(targets)
+                fc = Filter.by_property(name).contains_none(targets)
+                mask = series.apply(lambda x, vals=target_set: float(x) not in vals if not is_null_like(x) else True)
+                es = f"{name} contains_none {targets}"
+            elif op == "contains_all":
+                fc = Filter.by_property(name).contains_all([vf])
+                mask = series.apply(lambda x, target=vf: float(x) == target if not is_null_like(x) else False)
+                es = f"{name} contains_all [{vf}]"
+            else:
+                fc = getattr(Filter.by_property(name), op_map[op])(vf)
+                mask = series.apply(safe_cmp(op, vf))
+                es = f"{name} {op} {vf}"
             if op == "!=":
                 mask = mask | null_mask  # Weaviate not_equal includes null rows
-            es = f"{name} {op} {vf}"
 
         elif ftype == FieldType.TEXT:
+            if random.random() < 0.12:
+                return boundary_like_expr(name, series)
             op = random.choice(["==", "!=", "like_prefix", "like_suffix", "like_contains", "like_single"])
             sv = str(val)
             if op == "==":
@@ -4416,13 +5028,55 @@ class OracleQueryGenerator:
                 es = f'{name} like "{prefix}*"'
 
         elif ftype == FieldType.DATE:
-            op = random.choice([">", "<", ">=", "<=", "==", "!="])
+            target_ts = to_utc_timestamp(val)
+            target_dt = target_ts.to_pydatetime() if target_ts is not None else val
+            op = random.choices(
+                [">", "<", ">=", "<=", "==", "!=", "contains_any", "contains_none", "contains_all"],
+                weights=[0.11, 0.11, 0.11, 0.11, 0.12, 0.10, 0.12, 0.12, 0.10],
+                k=1,
+            )[0]
             op_map = {"==": "equal", "!=": "not_equal", ">": "greater_than", "<": "less_than", ">=": "greater_or_equal", "<=": "less_or_equal"}
-            fc = getattr(Filter.by_property(name), op_map[op])(val)
-            mask = self._date_cmp_mask(series, op, val)
+            if op == "contains_any":
+                targets = [target_dt]
+                if target_ts is not None and random.random() < 0.55:
+                    noise_ts = target_ts + random.choice([pd.Timedelta(days=7), pd.Timedelta(seconds=1), -pd.Timedelta(days=7), -pd.Timedelta(seconds=1)])
+                    targets.append(noise_ts.to_pydatetime())
+                target_values = {canonicalize_date_string(target) or str(target) for target in targets}
+                fc = Filter.by_property(name).contains_any(targets)
+                mask = series.apply(
+                    lambda x, vals=target_values: (canonicalize_date_string(x) or str(x)) in vals
+                    if to_utc_timestamp(x) is not None
+                    else False
+                )
+                es = f"{name} contains_any {sorted(target_values)}"
+            elif op == "contains_none":
+                targets = [target_dt]
+                if target_ts is not None and random.random() < 0.55:
+                    noise_ts = target_ts + random.choice([pd.Timedelta(days=7), pd.Timedelta(seconds=1), -pd.Timedelta(days=7), -pd.Timedelta(seconds=1)])
+                    targets.append(noise_ts.to_pydatetime())
+                target_values = {canonicalize_date_string(target) or str(target) for target in targets}
+                fc = Filter.by_property(name).contains_none(targets)
+                mask = series.apply(
+                    lambda x, vals=target_values: (canonicalize_date_string(x) or str(x)) not in vals
+                    if to_utc_timestamp(x) is not None
+                    else True
+                )
+                es = f"{name} contains_none {sorted(target_values)}"
+            elif op == "contains_all":
+                target_value = canonicalize_date_string(target_dt) or str(target_dt)
+                fc = Filter.by_property(name).contains_all([target_dt])
+                mask = series.apply(
+                    lambda x, target=target_value: (canonicalize_date_string(x) or str(x)) == target
+                    if to_utc_timestamp(x) is not None
+                    else False
+                )
+                es = f"{name} contains_all [{target_value}]"
+            else:
+                fc = getattr(Filter.by_property(name), op_map[op])(val)
+                mask = self._date_cmp_mask(series, op, val)
+                es = f"{name} {op} {val}"
             if op == "!=":
                 mask = mask | null_mask
-            es = f"{name} {op} {val}"
 
         elif ftype in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY, FieldType.DATE_ARRAY]:
             all_items = []
@@ -4503,23 +5157,27 @@ class OracleQueryGenerator:
         leaf_cutoff = 0.12 if self._inverted_profile else 0.20
         if depth == 0 or random.random() < leaf_cutoff:
             r = random.random()
-            if r < 0.04:
+            if r < 0.10:
+                res = self.gen_scalar_contains_compound_expr()
+                if res[0] is not None:
+                    return self._finalize_expr(*res)
+            elif r < 0.14:
                 res = self.gen_constant_expr()
                 if res[0]:
                     return self._finalize_expr(*res)
-            elif r < 0.22:
+            elif r < 0.32:
                 res = self.gen_boundary_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
-            elif r < 0.28 and self.array_schema:
+            elif r < 0.38 and self.array_schema:
                 res = self.gen_multi_array_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
-            elif r < 0.42:
+            elif r < 0.52:
                 res = self.gen_not_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
-            elif r < 0.45:
+            elif r < 0.55:
                 res = self.gen_nested_object_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
@@ -4747,6 +5405,20 @@ def generate_simple_rest_filter(qg):
             return None, None, None
         target = int(target)
         if random.random() < 0.30:
+            mode = random.choice(["ContainsAny", "ContainsNone", "ContainsAll"])
+            targets = [target]
+            if mode != "ContainsAll" and random.random() < 0.50:
+                targets.append(clamp_weaviate_int(target + random.choice([7, 13, 101, -7, -13, -101])))
+            target_set = set(targets)
+            if mode == "ContainsAny":
+                mask = series.apply(lambda value, vals=target_set: int(value) in vals if not is_null_like(value) else False)
+            elif mode == "ContainsNone":
+                mask = series.apply(lambda value, vals=target_set: int(value) not in vals if not is_null_like(value) else True)
+            else:
+                mask = series.apply(lambda value, tv=target: int(value) == tv if not is_null_like(value) else False)
+                targets = [target]
+            return build_rest_where([name], mode, ftype=FieldType.INT, value=targets), mask, f"{name} {mode} {targets}"
+        if random.random() < 0.30:
             other = qg.get_value_for_query(name, FieldType.INT)
             if other is not None:
                 lo, hi = sorted([target, int(other)])
@@ -4770,6 +5442,20 @@ def generate_simple_rest_filter(qg):
         if target is None:
             return None, None, None
         target = float(target)
+        if random.random() < 0.30:
+            mode = random.choice(["ContainsAny", "ContainsNone", "ContainsAll"])
+            targets = [target]
+            if mode != "ContainsAll" and random.random() < 0.50:
+                targets.append(float(target + random.choice([-17.0, -0.25, 0.25, 17.0])))
+            target_set = set(targets)
+            if mode == "ContainsAny":
+                mask = series.apply(lambda value, vals=target_set: float(value) in vals if not is_null_like(value) else False)
+            elif mode == "ContainsNone":
+                mask = series.apply(lambda value, vals=target_set: float(value) not in vals if not is_null_like(value) else True)
+            else:
+                mask = series.apply(lambda value, tv=target: float(value) == tv if not is_null_like(value) else False)
+                targets = [target]
+            return build_rest_where([name], mode, ftype=FieldType.NUMBER, value=targets), mask, f"{name} {mode} {targets}"
         if random.random() < 0.45:
             lo, hi = float_window(target)
             if lo is not None and hi is not None:
@@ -4788,7 +5474,16 @@ def generate_simple_rest_filter(qg):
 
     if ftype == FieldType.BOOL:
         target = bool(qg.get_value_for_query(name, FieldType.BOOL))
-        operator = random.choice(["Equal", "NotEqual"])
+        operator = random.choice(["Equal", "NotEqual", "ContainsAny", "ContainsNone", "ContainsAll"])
+        if operator == "ContainsAny":
+            mask = series.apply(lambda value, tv=target: bool(value) == tv if not is_null_like(value) else False)
+            return build_rest_where([name], operator, ftype=FieldType.BOOL, value=[target]), mask, f"{name} {operator} [{target}]"
+        if operator == "ContainsNone":
+            mask = series.apply(lambda value, tv=target: bool(value) != tv if not is_null_like(value) else True)
+            return build_rest_where([name], operator, ftype=FieldType.BOOL, value=[target]), mask, f"{name} {operator} [{target}]"
+        if operator == "ContainsAll":
+            mask = series.apply(lambda value, tv=target: bool(value) == tv if not is_null_like(value) else False)
+            return build_rest_where([name], operator, ftype=FieldType.BOOL, value=[target]), mask, f"{name} {operator} [{target}]"
         mask = scalar_mask(operator, target)
         if operator == "NotEqual":
             mask = mask | null_mask
@@ -4800,7 +5495,7 @@ def generate_simple_rest_filter(qg):
             return None, None, None
         target = str(target)
         operator = random.choice(
-            ["Equal", "NotEqual", "LikePrefix", "LikeSuffix", "LikeContains", "LikeSingle", "ContainsAny", "ContainsNone"]
+            ["Equal", "NotEqual", "LikePrefix", "LikeSuffix", "LikeContains", "LikeSingle", "LikeStar", "LikeDoubleStar", "LikeThreeQ", "LikePercent", "LikeUnderscore", "ContainsAny", "ContainsNone"]
         )
         if operator == "Equal":
             mask = series.apply(lambda value, tv=target: str(value) == tv if value is not None and not (isinstance(value, float) and np.isnan(value)) else False)
@@ -4827,7 +5522,17 @@ def generate_simple_rest_filter(qg):
             )
             return build_rest_where([name], "ContainsNone", ftype=FieldType.TEXT, value=targets), mask, f"{name} contains_none {targets}"
 
-        if operator == "LikePrefix":
+        if operator == "LikeStar":
+            pattern = "*"
+        elif operator == "LikeDoubleStar":
+            pattern = "**"
+        elif operator == "LikeThreeQ":
+            pattern = "???"
+        elif operator == "LikePercent":
+            pattern = "%"
+        elif operator == "LikeUnderscore":
+            pattern = "_"
+        elif operator == "LikePrefix":
             prefix_len = random.randint(1, min(4, max(1, len(target))))
             pattern = f"{target[:prefix_len]}*"
         elif operator == "LikeSuffix":
@@ -4851,6 +5556,35 @@ def generate_simple_rest_filter(qg):
         if target is None:
             return None, None, None
         target = canonicalize_date_string(target) or str(target)
+        if random.random() < 0.30:
+            mode = random.choice(["ContainsAny", "ContainsNone", "ContainsAll"])
+            targets = [target]
+            anchor = to_utc_timestamp(target)
+            if mode != "ContainsAll" and anchor is not None and random.random() < 0.50:
+                noise = canonicalize_date_string(anchor + random.choice([pd.Timedelta(days=7), pd.Timedelta(seconds=1), -pd.Timedelta(days=7), -pd.Timedelta(seconds=1)]))
+                if noise:
+                    targets.append(noise)
+            target_set = set(targets)
+            if mode == "ContainsAny":
+                mask = series.apply(
+                    lambda value, vals=target_set: (canonicalize_date_string(value) or str(value)) in vals
+                    if to_utc_timestamp(value) is not None
+                    else False
+                )
+            elif mode == "ContainsNone":
+                mask = series.apply(
+                    lambda value, vals=target_set: (canonicalize_date_string(value) or str(value)) not in vals
+                    if to_utc_timestamp(value) is not None
+                    else True
+                )
+            else:
+                mask = series.apply(
+                    lambda value, tv=target: (canonicalize_date_string(value) or str(value)) == tv
+                    if to_utc_timestamp(value) is not None
+                    else False
+                )
+                targets = [target]
+            return build_rest_where([name], mode, ftype=FieldType.DATE, value=targets), mask, f"{name} {mode} {targets}"
         if random.random() < 0.30:
             anchor = to_utc_timestamp(target)
             if anchor is not None:
@@ -4884,6 +5618,10 @@ def generate_rest_filter(qg):
     base_index = qg.df.index
 
     def leaf():
+        if random.random() < 0.18:
+            where_filter, mask, expr = qg.gen_scalar_contains_compound_rest_expr()
+            if where_filter is not None:
+                return where_filter, _normalize_bool_mask(mask, base_index), expr, {"depth": 1, "atoms": 2}
         where_filter, mask, expr = generate_simple_rest_filter(qg)
         if where_filter is None:
             return None, None, None, None
@@ -5366,6 +6104,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_update_time().greater_or_equal(update_time.to_pydatetime()), f"update_time >= {update_time.isoformat()}"
                 return Filter.by_update_time().less_or_equal(update_time.to_pydatetime()), f"update_time <= {update_time.isoformat()}"
 
+        if random.random() < 0.18:
+            compound_filter, compound_expr = self.gen_true_scalar_contains_compound(row)
+            if compound_filter is not None:
+                return compound_filter, compound_expr
+
         pl_fields = self.property_length_schema[:]
         random.shuffle(pl_fields)
         for field in pl_fields:
@@ -5438,20 +6181,35 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).is_none(True), f"{fname} is null"
                 continue
             if ftype == FieldType.BOOL:
-                strat = random.choice(["eq", "neq"])
+                strat = random.choice(["eq", "neq", "contains_any_self", "contains_none_noise", "contains_all_self"])
                 if strat == "eq":
                     return Filter.by_property(fname).equal(bool(val)), f"{fname} == {bool(val)}"
+                if strat == "contains_any_self":
+                    return Filter.by_property(fname).contains_any([bool(val)]), f"{fname} contains_any [{bool(val)}]"
+                if strat == "contains_none_noise":
+                    return Filter.by_property(fname).contains_none([not bool(val)]), f"{fname} contains_none [{not bool(val)}]"
+                if strat == "contains_all_self":
+                    return Filter.by_property(fname).contains_all([bool(val)]), f"{fname} contains_all [{bool(val)}]"
                 else:
                     return Filter.by_property(fname).not_equal(not bool(val)), f"{fname} != {not bool(val)}"
             elif ftype == FieldType.INT:
                 vi = int(val)
-                strat = random.choice(["eq", "ge_self", "le_self", "lt_above", "range_tight", "range_pm1", "not_lt", "neq_fake"])
+                strat = random.choice(["eq", "ge_self", "le_self", "lt_above", "range_tight", "range_pm1", "not_lt", "neq_fake", "contains_any_self", "contains_none_noise", "contains_all_self"])
                 if strat == "eq":
                     return Filter.by_property(fname).equal(vi), f"{fname} == {vi}"
                 elif strat == "ge_self":
                     return Filter.by_property(fname).greater_or_equal(vi), f"{fname} >= {vi}"
                 elif strat == "le_self":
                     return Filter.by_property(fname).less_or_equal(vi), f"{fname} <= {vi}"
+                elif strat == "contains_any_self":
+                    return Filter.by_property(fname).contains_any([vi]), f"{fname} contains_any [{vi}]"
+                elif strat == "contains_none_noise":
+                    fake = clamp_weaviate_int(vi + random.choice([7, 13, 101, -7, -13, -101]))
+                    if fake == vi:
+                        fake = clamp_weaviate_int(fake + 1)
+                    return Filter.by_property(fname).contains_none([fake]), f"{fname} contains_none [{fake}]"
+                elif strat == "contains_all_self":
+                    return Filter.by_property(fname).contains_all([vi]), f"{fname} contains_all [{vi}]"
                 elif strat == "lt_above":
                     if vi < WEAVIATE_SAFE_INT_MAX:
                         upper = clamp_weaviate_int(vi + 1)
@@ -5468,7 +6226,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).not_equal(fake) & Filter.by_property(fname).equal(vi), f"{fname} != {fake} AND {fname} == {vi}"
             elif ftype == FieldType.NUMBER:
                 vf = float(val)
-                strat = random.choice(["ge_self", "le_self", "lt_above", "gt_below", "range", "not_gt"])
+                strat = random.choice(["ge_self", "le_self", "lt_above", "gt_below", "range", "not_gt", "contains_any_self", "contains_none_noise", "contains_all_self"])
                 lo, hi = float_window(vf)
                 if lo is None:
                     continue
@@ -5476,6 +6234,15 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     return Filter.by_property(fname).greater_or_equal(vf), f"{fname}>={vf}"
                 elif strat == "le_self":
                     return Filter.by_property(fname).less_or_equal(vf), f"{fname}<={vf}"
+                elif strat == "contains_any_self":
+                    return Filter.by_property(fname).contains_any([vf]), f"{fname} contains_any [{vf}]"
+                elif strat == "contains_none_noise":
+                    fake = float(vf + random.choice([-17.0, -0.25, 0.25, 17.0]))
+                    if fake == vf:
+                        fake += 1.0
+                    return Filter.by_property(fname).contains_none([fake]), f"{fname} contains_none [{fake}]"
+                elif strat == "contains_all_self":
+                    return Filter.by_property(fname).contains_all([vf]), f"{fname} contains_all [{vf}]"
                 elif strat == "lt_above":
                     return Filter.by_property(fname).less_than(hi), f"{fname}<{hi}"
                 elif strat == "gt_below":
@@ -5509,11 +6276,24 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 else:
                     return Filter.by_property(fname).equal(sv), f'{fname} == "{sv}"'
             elif ftype == FieldType.DATE:
-                strat = random.choice(["eq", "ge_self", "le_self", "lt_above", "gt_below"])
+                strat = random.choice(["eq", "ge_self", "le_self", "lt_above", "gt_below", "contains_any_self", "contains_none_noise", "contains_all_self"])
                 if strat == "ge_self":
                     return Filter.by_property(fname).greater_or_equal(str(val)), f'{fname} >= "{val}"'
                 if strat == "le_self":
                     return Filter.by_property(fname).less_or_equal(str(val)), f'{fname} <= "{val}"'
+                if strat == "contains_any_self":
+                    ts = to_utc_timestamp(val)
+                    if ts is not None:
+                        return Filter.by_property(fname).contains_any([ts.to_pydatetime()]), f'{fname} contains_any ["{canonicalize_date_string(val) or val}"]'
+                if strat == "contains_none_noise":
+                    ts = to_utc_timestamp(val)
+                    if ts is not None:
+                        fake = ts + pd.Timedelta(days=7)
+                        return Filter.by_property(fname).contains_none([fake.to_pydatetime()]), f'{fname} contains_none ["{canonicalize_date_string(fake)}"]'
+                if strat == "contains_all_self":
+                    ts = to_utc_timestamp(val)
+                    if ts is not None:
+                        return Filter.by_property(fname).contains_all([ts.to_pydatetime()]), f'{fname} contains_all ["{canonicalize_date_string(val) or val}"]'
                 if strat == "lt_above":
                     ts = to_utc_timestamp(val)
                     if ts is not None:
@@ -5578,6 +6358,178 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return None, None
 
 
+GRAPHQL_PROBE_CLASS_PREFIX = "GraphQLScalarProbe"
+GRAPHQL_PROBE_PROPERTIES = [
+    Property(name="tag", data_type=DataType.TEXT, tokenization=Tokenization.FIELD, index_filterable=True),
+    Property(name="bucket", data_type=DataType.INT, index_filterable=True, index_range_filters=True),
+    Property(name="flag", data_type=DataType.BOOL, index_filterable=True),
+    Property(name="score", data_type=DataType.NUMBER, index_filterable=True, index_range_filters=True),
+    Property(
+        name="body",
+        data_type=DataType.TEXT,
+        tokenization=Tokenization.WORD,
+        index_filterable=True,
+        index_searchable=True,
+    ),
+    Property(name="nullableText", data_type=DataType.TEXT, tokenization=Tokenization.FIELD, index_filterable=True),
+    Property(name="textArr", data_type=DataType.TEXT_ARRAY, tokenization=Tokenization.FIELD, index_filterable=True),
+]
+GRAPHQL_PROBE_FIXTURE = [
+    {
+        "tag": "alpha",
+        "bucket": 0,
+        "flag": True,
+        "score": 1.0,
+        "body": "nebula anchor apple red",
+        "nullableText": "red",
+        "textArr": ["red", "alpha"],
+        "vector": [1.0, 0.0, 0.0, 0.0],
+    },
+    {
+        "tag": "beta",
+        "bucket": 1,
+        "flag": False,
+        "score": 2.5,
+        "body": "nebula orange blue",
+        "nullableText": None,
+        "textArr": ["blue", "beta"],
+        "vector": [0.0, 1.0, 0.0, 0.0],
+    },
+    {
+        "tag": "gamma",
+        "bucket": 2,
+        "flag": True,
+        "score": 3.5,
+        "body": "anchor grape green",
+        "nullableText": "green",
+        "textArr": ["green", "gamma"],
+        "vector": [0.0, 0.0, 1.0, 0.0],
+    },
+    {
+        "tag": "delta",
+        "bucket": 1,
+        "flag": True,
+        "score": -1.0,
+        "body": "delta red marker",
+        "nullableText": "red",
+        "textArr": ["red", "delta"],
+        "vector": [0.0, 0.0, 0.0, 1.0],
+    },
+    {
+        "tag": "epsilon",
+        "bucket": 2,
+        "flag": False,
+        "score": 0.0,
+        "body": "epsilon neutral yellow",
+        "nullableText": "yellow",
+        "textArr": ["yellow", "epsilon"],
+        "vector": [0.70710677, 0.70710677, 0.0, 0.0],
+    },
+    {
+        "tag": "zeta",
+        "bucket": 3,
+        "flag": True,
+        "score": 10.0,
+        "body": "zeta comet tail",
+        "textArr": ["tail", "zeta"],
+        "vector": [0.6, 0.0, 0.8, 0.0],
+    },
+]
+
+
+def graphql_probe_collection_name(seed):
+    return f"{GRAPHQL_PROBE_CLASS_PREFIX}{int(seed) % 1_000_000_000}"
+
+
+def graphql_probe_uuid(seed, tag):
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"weaviate-graphql-probe-{seed}-{tag}"))
+
+
+def graphql_probe_rows(seed):
+    rows = []
+    for item in GRAPHQL_PROBE_FIXTURE:
+        props = {key: value for key, value in item.items() if key != "vector"}
+        rows.append(
+            {
+                "id": graphql_probe_uuid(seed, props["tag"]),
+                "properties": props,
+                "vector": list(item["vector"]),
+            }
+        )
+    return rows
+
+
+def reset_graphql_probe_collection(client, collection_name, seed):
+    try:
+        client.collections.delete(collection_name)
+    except Exception:
+        pass
+    client.collections.create(
+        name=collection_name,
+        properties=GRAPHQL_PROBE_PROPERTIES,
+        vector_config=Configure.Vectors.self_provided(
+            vector_index_config=Configure.VectorIndex.hnsw(
+                distance_metric=VectorDistances.COSINE,
+                ef_construction=64,
+                max_connections=16,
+            )
+        ),
+        inverted_index_config=Configure.inverted_index(
+            index_null_state=True,
+            index_property_length=True,
+            index_timestamps=True,
+        ),
+    )
+    collection = client.collections.get(collection_name)
+    objects = [
+        DataObject(uuid=row["id"], properties=row["properties"], vector=row["vector"])
+        for row in graphql_probe_rows(seed)
+    ]
+    result = collection.data.insert_many(objects)
+    errors = getattr(result, "errors", None)
+    if errors:
+        raise RuntimeError(f"GraphQL probe insert errors: {errors}")
+    return collection
+
+
+def graphql_raw_query_or_raise(client, query):
+    result = client.graphql_raw_query(query)
+    errors = getattr(result, "errors", None)
+    if errors:
+        raise RuntimeError(f"GraphQL errors: {errors} | query={query}")
+    return result
+
+
+def graphql_get_tags(result, collection_name):
+    rows = getattr(result, "get", {}).get(collection_name, []) or []
+    return [str(row.get("tag")) for row in rows]
+
+
+def graphql_aggregate_groups(result, collection_name):
+    return getattr(result, "aggregate", {}).get(collection_name, []) or []
+
+
+def graphql_probe_expected_tags(seed, predicate):
+    return sorted(
+        row["properties"]["tag"]
+        for row in graphql_probe_rows(seed)
+        if predicate(row["properties"])
+    )
+
+
+def graphql_probe_expected_group_counts(seed, field_name):
+    counts = {}
+    for row in graphql_probe_rows(seed):
+        value = row["properties"].get(field_name)
+        counts[str(value)] = counts.get(str(value), 0) + 1
+    return counts
+
+
+def graphql_probe_case_order(seed, total_cases):
+    offset = int(seed) % max(1, total_cases)
+    return offset
+
+
 # --- 6. Main Execution ---
 
 def initialize_seeded_run(seed=None):
@@ -5633,9 +6585,27 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
         wm.insert(dm)
         wm.sync_creation_times(dm)
         wm.sync_update_times(dm)
-        ts = int(time.time())
-        logf = make_log_path(f"weaviate_fuzz_test_{ts}.log")
-        repro_cmd = format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)
+        logf = make_log_path(
+            stable_log_filename(
+                "weaviate_fuzz_test",
+                current_seed,
+                rounds,
+                "oracle",
+                f"dynamic-{'on' if enable_dynamic_ops else 'off'}",
+                f"consistency-{consistency_label(resolved_consistency, randomize=randomize_consistency)}",
+            )
+        )
+        repro_cmd = format_repro_command(
+            current_seed,
+            resolved_consistency,
+            randomize_consistency=randomize_consistency,
+            mode="oracle",
+            rounds=rounds,
+            rows=N,
+            dynamic_enabled=enable_dynamic_ops,
+            host=HOST,
+            port=PORT,
+        )
         print(f"\n📝 Log: {display_path(logf)}")
         print(f"    Reproduce: {repro_cmd}")
         print(" Testing...")
@@ -5657,7 +6627,8 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
 
             def sample(ids, lim=5):
                 if not ids: return []
-                return dm.df[dm.df["id"].isin(list(ids))].to_dict("records")[:lim]
+                stable_ids = sorted(str(object_id) for object_id in ids)
+                return dm.df[dm.df["id"].isin(stable_ids)].sort_values("id").to_dict("records")[:lim]
 
             def diagnose_id_mismatch(target_id, expr):
                 row_df = dm.df[dm.df["id"] == target_id]
@@ -5876,7 +6847,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                     except Exception as e:
                         flog(f"[Reconfig] Failed: {e}")
 
-                depth_lo, depth_hi = (4, 18) if is_inverted_profile() else (1, 15)
+                depth_lo, depth_hi = (5, 22) if is_inverted_profile() else (2, 18)
                 depth = random.randint(depth_lo, depth_hi)
                 fo = None
                 rest_where = None
@@ -5962,7 +6933,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                             flog(f"  -> MISMATCH! {dm_}")
                             if mi: flog(f"  Missing: {sample(mi)}")
                             if ex: flog(f"  Extra: {sample(ex)}")
-                            for eid in list(ex)[:2]:
+                            for eid in sorted(ex)[:2]:
                                 try:
                                     obj = col.query.fetch_object_by_id(eid)
                                     exists = obj is not None
@@ -5972,7 +6943,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                         flog(f"      {d}")
                                 except Exception as ve:
                                     flog(f"    ExtraID verify err: {ve}")
-                            for mid in list(mi)[:2]:
+                            for mid in sorted(mi)[:2]:
                                 try:
                                     verdict, diffs = diagnose_id_mismatch(mid, es)
                                     flog(f"    MissingID {mid}: verdict={verdict}")
@@ -6151,15 +7122,253 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
             for c in fails[:10]:
                 print(f"  🔴 T{c['id']}: {c.get('detail','')[:100]}")
         print(f"📄 Log: {display_path(logf)}")
-        print(f" Reproduce: {format_repro_command(current_seed, resolved_consistency, randomize_consistency=randomize_consistency)}")
+        print(f" Reproduce: {repro_cmd}")
     finally:
+        wm.close()
+
+
+def run_graphql_probe_mode(rounds=12, seed=None):
+    current_seed = seed if seed is not None else random.randint(0, 2**31 - 1)
+    random.seed(current_seed)
+    np.random.seed(current_seed)
+
+    logf = make_log_path(stable_log_filename("weaviate_graphql_probe", current_seed, rounds, "graphql-probe"))
+    repro_cmd = format_repro_command(
+        current_seed,
+        DEFAULT_CONSISTENCY_LEVEL,
+        mode="graphql-probe",
+        rounds=rounds,
+        rows=N,
+        dynamic_enabled=False,
+        host=HOST,
+        port=PORT,
+    )
+    collection_name = graphql_probe_collection_name(current_seed)
+
+    print(
+        f"\n GraphQL Probe Mode | Seed: {current_seed} | Class: {collection_name} | "
+        f"Cases/Loop: 8"
+    )
+    print(f"📄 Log: {display_path(logf)}")
+    print(f"🔁 Reproduce: {repro_cmd}")
+
+    wm = WeaviateManager()
+    wm.connect()
+    try:
+        reset_graphql_probe_collection(wm.client, collection_name, current_seed)
+        stats = FuzzStats()
+        failures = []
+
+        where_range = graphql_with_enum_operators({
+            "operator": "And",
+            "operands": [
+                {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
+                {"path": ["bucket"], "operator": "LessThanEqual", "valueInt": 2},
+            ],
+        })
+        where_compound = graphql_with_enum_operators({
+            "operator": "And",
+            "operands": [
+                {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
+                {
+                    "operator": "Or",
+                    "operands": [
+                        {"path": ["tag"], "operator": "Like", "valueText": "a*"},
+                        {"path": ["textArr"], "operator": "ContainsAny", "valueText": ["delta"]},
+                    ],
+                },
+            ],
+        })
+        agg_where = graphql_with_enum_operators({
+            "operator": "And",
+            "operands": [
+                {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
+                {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
+            ],
+        })
+
+        expected_where_range = graphql_probe_expected_tags(
+            current_seed,
+            lambda props: 1 <= int(props["bucket"]) <= 2,
+        )
+        expected_where_compound = graphql_probe_expected_tags(
+            current_seed,
+            lambda props: bool(props["flag"]) and (
+                str(props["tag"]).startswith("a") or "delta" in (props.get("textArr") or [])
+            ),
+        )
+        expected_agg_where = [
+            row["properties"]
+            for row in graphql_probe_rows(current_seed)
+            if int(row["properties"]["bucket"]) >= 1 and bool(row["properties"]["flag"])
+        ]
+        expected_group_counts = graphql_probe_expected_group_counts(current_seed, "bucket")
+
+        cases = [
+            (
+                "get-where-range",
+                (
+                    "{ Get { "
+                    f"{collection_name}(where:{graphql_input_literal(where_range)}, limit:20) "
+                    "{ tag _additional { id } } } }"
+                ),
+                lambda result: (
+                    sorted(graphql_get_tags(result, collection_name)) == expected_where_range,
+                    f"expected={expected_where_range} observed={sorted(graphql_get_tags(result, collection_name))}",
+                ),
+            ),
+            (
+                "get-where-compound",
+                (
+                    "{ Get { "
+                    f"{collection_name}(where:{graphql_input_literal(where_compound)}, limit:20) "
+                    "{ tag } } }"
+                ),
+                lambda result: (
+                    sorted(graphql_get_tags(result, collection_name)) == expected_where_compound,
+                    f"expected={expected_where_compound} observed={sorted(graphql_get_tags(result, collection_name))}",
+                ),
+            ),
+            (
+                "get-bm25-and",
+                (
+                    "{ Get { "
+                    f"{collection_name}(bm25:{graphql_input_literal({'query': 'nebula anchor', 'properties': ['body'], 'searchOperator': {'operator': GraphQLEnum('And')}})}, limit:5) "
+                    "{ tag } } }"
+                ),
+                lambda result: (
+                    sorted(graphql_get_tags(result, collection_name)) == ["alpha"],
+                    f"expected=['alpha'] observed={sorted(graphql_get_tags(result, collection_name))}",
+                ),
+            ),
+            (
+                "get-hybrid-top1",
+                (
+                    "{ Get { "
+                    f"{collection_name}(hybrid:{graphql_input_literal({'query': 'nebula anchor', 'alpha': 0.2, 'vector': [1.0, 0.0, 0.0, 0.0], 'properties': ['body'], 'bm25SearchOperator': {'operator': GraphQLEnum('And')}})}, limit:3) "
+                    "{ tag } } }"
+                ),
+                lambda result: (
+                    bool(graphql_get_tags(result, collection_name))
+                    and graphql_get_tags(result, collection_name)[0] == "alpha",
+                    f"top_tags={graphql_get_tags(result, collection_name)}",
+                ),
+            ),
+            (
+                "aggregate-where-score",
+                (
+                    "{ Aggregate { "
+                    f"{collection_name}(where:{graphql_input_literal(agg_where)}) "
+                    "{ meta { count } score { count minimum maximum sum mean } } } }"
+                ),
+                lambda result: (
+                    (lambda groups: (
+                        len(groups) == 1
+                        and int((groups[0].get("meta") or {}).get("count") or 0) == len(expected_agg_where)
+                        and int((groups[0].get("score") or {}).get("count") or 0) == len(expected_agg_where)
+                        and _floats_match(float((groups[0].get("score") or {}).get("minimum") or 0.0), min(float(row["score"]) for row in expected_agg_where))
+                        and _floats_match(float((groups[0].get("score") or {}).get("maximum") or 0.0), max(float(row["score"]) for row in expected_agg_where))
+                        and _floats_match(float((groups[0].get("score") or {}).get("sum") or 0.0), sum(float(row["score"]) for row in expected_agg_where))
+                        and _floats_match(float((groups[0].get("score") or {}).get("mean") or 0.0), sum(float(row["score"]) for row in expected_agg_where) / len(expected_agg_where))
+                    ))(graphql_aggregate_groups(result, collection_name)),
+                    f"observed={graphql_aggregate_groups(result, collection_name)}",
+                ),
+            ),
+            (
+                "aggregate-groupby-bucket",
+                (
+                    "{ Aggregate { "
+                    f"{collection_name}(groupBy:[\"bucket\"]) "
+                    "{ meta { count } groupedBy { path value } } } }"
+                ),
+                lambda result: (
+                    (lambda groups: (
+                        {str((group.get('groupedBy') or {}).get('value')): int((group.get('meta') or {}).get('count') or 0) for group in groups} == expected_group_counts
+                        and all((group.get("groupedBy") or {}).get("path") == ["bucket"] for group in groups)
+                    ))(graphql_aggregate_groups(result, collection_name)),
+                    f"expected={expected_group_counts} observed={graphql_aggregate_groups(result, collection_name)}",
+                ),
+            ),
+            (
+                "aggregate-near-vector-local-boundary",
+                (
+                    "{ Aggregate { "
+                    f"{collection_name}(objectLimit:1 nearVector:{graphql_input_literal({'vector': [1.0, 0.0, 0.0, 0.0], 'distance': 0.0002})}) "
+                    "{ meta { count } score { count minimum maximum } } } }"
+                ),
+                lambda result: (
+                    (lambda groups: (
+                        len(groups) == 1
+                        and int((groups[0].get("meta") or {}).get("count") or 0) == 0
+                        and int((groups[0].get("score") or {}).get("count") or 0) == 0
+                    ))(graphql_aggregate_groups(result, collection_name)),
+                    f"local-boundary observed={graphql_aggregate_groups(result, collection_name)}",
+                ),
+            ),
+            (
+                "aggregate-hybrid-object-limit",
+                (
+                    "{ Aggregate { "
+                    f"{collection_name}(objectLimit:1 hybrid:{graphql_input_literal({'query': 'nebula anchor', 'alpha': 0.0, 'properties': ['body'], 'bm25SearchOperator': {'operator': GraphQLEnum('And')}})}) "
+                    "{ meta { count } score { count minimum maximum } } } }"
+                ),
+                lambda result: (
+                    (lambda groups: (
+                        len(groups) == 1
+                        and int((groups[0].get("meta") or {}).get("count") or 0) == 1
+                        and int((groups[0].get("score") or {}).get("count") or 0) == 1
+                        and _floats_match(float((groups[0].get("score") or {}).get("minimum") or 0.0), 1.0)
+                        and _floats_match(float((groups[0].get("score") or {}).get("maximum") or 0.0), 1.0)
+                    ))(graphql_aggregate_groups(result, collection_name)),
+                    f"observed={graphql_aggregate_groups(result, collection_name)}",
+                ),
+            ),
+        ]
+
+        offset = graphql_probe_case_order(current_seed, len(cases))
+        with open(logf, "w", encoding="utf-8") as f:
+            def flog(message):
+                f.write(message + "\n")
+                f.flush()
+
+            flog(f"GraphQL Probe | Seed:{current_seed} | Class:{collection_name}")
+            flog(f"Reproduce: {repro_cmd}")
+            flog("=" * 80)
+
+            for i in range(rounds):
+                case_name, query, checker = cases[(offset + i) % len(cases)]
+                print(f"\r⏳ GraphQL {i+1}/{rounds} [{case_name}]   ", end="", flush=True)
+                t0 = time.time()
+                try:
+                    result = graphql_raw_query_or_raise(wm.client, query)
+                    ok, detail = checker(result)
+                    error_cat = None if ok else case_name
+                except Exception as exc:
+                    ok, detail, error_cat = False, f"ERR: {exc}", f"{case_name}_error"
+                latency_ms = (time.time() - t0) * 1000.0
+                stats.record(ok, latency_ms=latency_ms, error_cat=error_cat)
+                flog(f"\n[T{i}] {case_name}")
+                flog(f"  Query: {query}")
+                flog(f"  Result: {'PASS' if ok else 'FAIL'} {latency_ms:.1f}ms")
+                flog(f"  Detail: {detail}")
+                if not ok:
+                    failures.append({"id": i, "case": case_name, "detail": detail, "query": query})
+
+        print()
+        print(f"📊 GraphQL Probe: {stats.summary()}")
+        print(f"{'✅ All passed' if not failures else f'🚫 {len(failures)} failures'}. Log: {display_path(logf)}")
+    finally:
+        try:
+            wm.client.collections.delete(collection_name)
+        except Exception:
+            pass
         wm.close()
 
 
 def run_equivalence_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
-    logf = make_log_path(f"weaviate_equiv_test_{int(time.time())}.log")
+    logf = make_log_path(stable_log_filename("weaviate_equiv_test", seed, rounds, "equiv"))
     print(f"\n Equivalence Mode | Seed: {seed} | Profile: {get_fuzz_profile()} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
     print(
         f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
@@ -6201,7 +7410,7 @@ def run_equivalence_mode(rounds=100, seed=None):
                                 flog(f"  {mut['type']}: FAIL ({detail})")
                                 print(f"\n❌ [T{i}] {mut['type']} FAIL ({detail})")
                                 # Deep evidence: print details of diff IDs
-                                for did in list(diff)[:3]:
+                                for did in sorted(diff)[:3]:
                                     row = dm.df[dm.df['id'] == did]
                                     if not row.empty:
                                         null_cols = [c for c in row.columns if row[c].isna().any()]
@@ -6222,7 +7431,7 @@ def run_equivalence_mode(rounds=100, seed=None):
 def run_pqs_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
-    logf = make_log_path(f"weaviate_pqs_test_{int(time.time())}.log")
+    logf = make_log_path(stable_log_filename("weaviate_pqs_test", seed, rounds, "pqs"))
     print(f"\n PQS Mode | Seed: {seed} | Profile: {get_fuzz_profile()} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
     print(
         f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
@@ -6283,7 +7492,7 @@ def run_pqs_mode(rounds=100, seed=None):
 def run_groupby_mode(rounds=100, seed=None):
     seed = initialize_seeded_run(seed)
 
-    logf = make_log_path(f"weaviate_groupby_test_{int(time.time())}.log")
+    logf = make_log_path(stable_log_filename("weaviate_groupby_test", seed, rounds, "groupby"))
     print(f"\n GroupBy Mode | Seed: {seed} | Profile: {get_fuzz_profile()} | VecIdx: {VECTOR_INDEX_TYPE} | BoundaryRate: {BOUNDARY_INJECTION_RATE:.2f}")
     print(
         f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
@@ -6324,7 +7533,8 @@ def run_groupby_mode(rounds=100, seed=None):
                     group_source = "flattened objects"
                     if isinstance(response_groups, dict):
                         group_source = "response.groups"
-                        for group_name, group_data in response_groups.items():
+                        for group_name in sorted(response_groups, key=lambda item: str(item)):
+                            group_data = response_groups[group_name]
                             groups[str(group_name)] = [str(o.uuid) for o in (getattr(group_data, "objects", None) or [])]
                     else:
                         group_source = "belongs_to_group"
@@ -6369,7 +7579,15 @@ def run_aggregate_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_LE
     current_seed = initialize_seeded_run(seed)
     resolved_consistency = consistency or DEFAULT_CONSISTENCY_LEVEL
 
-    logf = make_log_path(f"weaviate_aggregate_test_{int(time.time())}.log")
+    logf = make_log_path(
+        stable_log_filename(
+            "weaviate_aggregate_test",
+            current_seed,
+            rounds,
+            "aggregate",
+            f"consistency-{consistency_label(resolved_consistency, randomize=randomize_consistency)}",
+        )
+    )
     print(
         f"\n Aggregate Mode | Seed: {current_seed} | Profile: {get_fuzz_profile()} | VecIdx: {VECTOR_INDEX_TYPE} | "
         f"Consistency: aggregate-default"
@@ -6529,7 +7747,15 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
     current_seed = initialize_seeded_run(seed)
     resolved_consistency = consistency or DEFAULT_CONSISTENCY_LEVEL
 
-    logf = make_log_path(f"weaviate_rest_filter_test_{int(time.time())}.log")
+    logf = make_log_path(
+        stable_log_filename(
+            "weaviate_rest_filter_test",
+            current_seed,
+            rounds,
+            "rest-filter",
+            f"consistency-{consistency_label(resolved_consistency, randomize=randomize_consistency)}",
+        )
+    )
     print(
         f"\n REST Filter Mode | Seed: {current_seed} | Profile: {get_fuzz_profile()} | VecIdx: {VECTOR_INDEX_TYPE} | "
         f"Consistency: rest-default"
@@ -6683,7 +7909,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Weaviate Fuzz Oracle V2")
     parser.add_argument("--seed", type=int, default=None, help="Random seed")
     parser.add_argument("--rounds", type=int, default=500, help="Test rounds (default: 500)")
-    parser.add_argument("--mode", choices=["oracle", "equiv", "pqs", "groupby", "aggregate", "rest-filter"], default="oracle", help="Test mode")
+    parser.add_argument(
+        "--mode",
+        choices=["oracle", "equiv", "pqs", "groupby", "aggregate", "rest-filter", "graphql-probe"],
+        default="oracle",
+        help="Test mode",
+    )
     parser.add_argument("--profile", choices=ALL_FUZZ_PROFILES, default=FUZZ_PROFILE_DEFAULT, help="Schema/query generation profile")
     parser.add_argument("--no-dynamic", action="store_true", help="Disable dynamic ops")
     parser.add_argument(
@@ -6707,8 +7938,12 @@ if __name__ == "__main__":
     parser.add_argument("--rest-filter-max-depth", type=int, default=None, help="Maximum recursive depth for REST filter-mode filters")
     parser.add_argument("--rest-filter-max-compare-results", type=int, default=None, help="Skip REST dry-run comparisons above this matched-row count")
     parser.add_argument("--oracle-rest-crosscheck-rate", type=float, default=None, help="Probability of using a REST-crosschecked stable filter inside oracle mode")
+    parser.add_argument("--log-dir", type=str, default=None, help="Directory for deterministic fuzzer-internal logs")
+    parser.add_argument("--log-suffix", type=str, default=None, help="Stable suffix appended to fuzzer-internal log filenames")
     args = parser.parse_args()
     set_fuzz_profile(args.profile)
+    set_log_dir(args.log_dir)
+    set_log_suffix(args.log_suffix)
 
     if args.host: HOST = args.host
     if args.port: PORT = args.port
@@ -6757,6 +7992,8 @@ if __name__ == "__main__":
             consistency=resolved_consistency,
             randomize_consistency=args.random_consistency,
         )
+    elif args.mode == "graphql-probe":
+        run_graphql_probe_mode(rounds=args.rounds, seed=args.seed)
     else:
         run(
             rounds=args.rounds,

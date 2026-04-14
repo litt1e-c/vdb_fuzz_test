@@ -1,0 +1,30 @@
+operator_id: scalar_contains_compound
+family: membership_boolean_composition
+syntax_examples:
+  - 'Filter.not_(Filter.by_property("intVal").contains_none([1]))'
+  - 'Filter.by_property("intVal").contains_none([1]) & Filter.by_property("intVal").greater_or_equal(2)'
+  - 'Filter.by_property("numVal").contains_all([2.5]) & Filter.not_(Filter.by_property("numVal").contains_none([2.5]))'
+  - 'Filter.by_property("ts").contains_any([datetime(2024, 1, 2, tzinfo=UTC)]) | Filter.by_property("ts").is_none(True)'
+doc_status: local_compound_validated
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - int
+  - number
+  - boolean
+  - date
+doc_semantics: "This YAML records locally validated compound semantics for scalar contains filters under boolean composition on local Weaviate v1.36.10. The key point is not that every composition is officially documented, but that the installed stack consistently composes scalar `contains_any` / `contains_none` / singleton `contains_all` with `NOT`, `AND`, `OR`, `is_null`, and selected range predicates."
+doc_notes:
+  - "Validated patterns include NOT wrapping scalar contains, contains_none combined with numeric/date guards, singleton contains_all combined with NOT(contains_none(same target)), and contains_any OR is_null."
+  - "The local semantics are important for oracle modeling: positive contains_none includes missing/null rows, while NOT(contains_none(...)) removes those rows again."
+  - "This YAML is intentionally narrower than a full algebraic law set; it only records the compound subset directly checked by the dedicated operator script."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.10, `scalar_contains_compound_operator.py` validated deeper scalar membership compositions: `NOT(int contains_none [1])` returned only the matching INT rows, `int contains_none [1] AND int >= 2` returned the expected present non-1 rows within the guarded range, `NOT(flag contains_any [true])` included false rows plus the missing row, `num contains_all [2.5] AND NOT(num contains_none [2.5])` remained stable on the 2.5 rows, and `date contains_any [2024-01-02] OR is_null` included both matching timestamps and the missing-date row."
+oracle_support:
+  - pandas
+  - pqs
+  - rest-filter
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/scalar_contains_compound_operator.py"
+oracle_mapping: "The main Weaviate oracle may now safely generate a small, explainable subset of deeper scalar contains compounds. For scalar INT/NUMBER/BOOL/DATE fields, it can model `NOT(contains_any(...))`, `contains_any(...) OR is_null`, singleton `contains_all([v]) AND NOT(contains_none([v]))`, and selected `contains_none(...) AND range/guard` patterns using explicit boolean-mask composition that respects the locally validated null/missing behavior."

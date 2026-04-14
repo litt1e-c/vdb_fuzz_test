@@ -1,0 +1,24 @@
+operator_id: nested_object_filter
+family: object_path
+syntax_examples:
+  - 'where: { path: ["metaObj", "price"], operator: GreaterThan, valueInt: 100 }'
+  - 'DELETE /v1/batch/objects {"match":{"class":"FuzzOracleV2","where":{"path":["metaObj","price"],"operator":"GreaterThan","valueInt":100}},"dryRun":true,"output":"verbose"}'
+doc_status: local_boundary_only
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - object
+  - nested object child path
+doc_semantics: "This YAML records a local unsupported boundary rather than an adopted mainline oracle semantics. On local Weaviate v1.36.10, child-property filter paths such as `path:[\"metaObj\",\"price\"]` are rejected during filter-path parsing."
+doc_notes:
+  - "The checked official filter docs describe generic `where` paths, but they do not provide a precise, version-pinned truth table for OBJECT child-property paths in the local Python-client + server combination used here."
+  - "The installed Python client in this environment exposes `Filter.by_property(name, length=False)` only; it does not expose a multi-segment property-builder helper for OBJECT child paths."
+  - "Local GraphQL and REST parser behavior is therefore the deciding evidence for whether OBJECT child paths are safe to include in the main oracle on this version."
+verify_status: locally_rejected
+observed_summary: "On local Weaviate v1.36.10 with the installed Python client, `nested_object_filter_operator.py` reproduced the same boundary in both GraphQL and REST. A GraphQL `where` clause with `path:[\"metaObj\",\"price\"]` returned an error containing `missing an argument after 'price'`. A REST batch-delete dry-run with the same path also failed with the same parser message. Because both query front doors reject the child path before evaluation, nested OBJECT child-property filtering is not treated as a stable supported subset for this local experiment stack."
+oracle_support:
+  - boundary_validation
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/weaviate/nested_object_filter_operator.py"
+oracle_mapping: "The main Weaviate oracle keeps OBJECT coverage conservative on this local version. Randomized generation uses only top-level OBJECT null-state checks (`metaObj.is_none(True)`) plus validated NOT wrappers around that subset. The fuzzer does not generate child paths such as `metaObj.price > 100` in either the main fetch-based oracle or REST filter mode. This is an explicit local-version boundary, not a claim about all Weaviate versions."

@@ -8,6 +8,7 @@ without relying on recall-rate thresholds:
   1. Distance Ordering:  returned distances must be monotonically sorted.
   2. TopK Monotonicity:  topK=10 ⊆ topK=20 (parameter-containment).
   3. Self-Retrieval:     insert V, search(V, top1) == V with dist ≈ 0.
+  4. Scalar-Filtered Search: nearVector + scalar filters must stay in-filter.
 
 Usage:
   python weaviate_vector_fuzz_test.py                       # default 200 rounds
@@ -23,10 +24,12 @@ import argparse
 import uuid
 import sys
 import os
+import re
+import shlex
 import numpy as np
 import weaviate
 from weaviate.classes.config import (
-    Configure, Property, DataType, VectorDistances,
+    Configure, Property, DataType, VectorDistances, Tokenization,
 )
 from weaviate.classes.query import Filter, MetadataQuery
 from weaviate.classes.data import DataObject
@@ -72,7 +75,8 @@ CLASS_NAME = "VecFuzzTest"
 N = 2000
 DIM = 128
 BATCH_SIZE = 500
-LOG_DIR = "weaviate_log"
+LOG_DIR = os.getenv("WEAVIATE_FUZZ_LOG_DIR", "weaviate_log")
+LOG_RUN_SUFFIX = os.getenv("WEAVIATE_FUZZ_LOG_SUFFIX", "")
 SELF_RETRIEVAL_TIMEOUT_SEC = 4.0
 SELF_RETRIEVAL_POLL_SEC = 0.2
 
@@ -101,6 +105,64 @@ def make_log_path(prefix):
     return os.path.join(ensure_log_dir(), prefix)
 
 
+def set_log_dir(path):
+    global LOG_DIR
+    if path:
+        LOG_DIR = os.path.abspath(os.path.expanduser(path))
+
+
+def set_log_suffix(value):
+    global LOG_RUN_SUFFIX
+    LOG_RUN_SUFFIX = str(value or "")
+
+
+def sanitize_log_token(value):
+    text = str(value)
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", text)
+    return text.strip("-") or "x"
+
+
+def stable_log_filename(prefix, seed, rounds, n, dim, vector_index, dynamic):
+    tokens = [
+        prefix,
+        f"seed-{seed}",
+        f"rounds-{rounds}",
+        f"N-{n}",
+        f"dim-{dim}",
+        f"vi-{vector_index}",
+        f"dynamic-{'on' if dynamic else 'off'}",
+    ]
+    if LOG_RUN_SUFFIX:
+        tokens.append(f"tag-{LOG_RUN_SUFFIX}")
+    return "__".join(sanitize_log_token(token) for token in tokens) + ".log"
+
+
+def format_repro_command(seed, vector_index, rounds, n, dim, host, port, grpc_port, dynamic):
+    parts = [
+        "python",
+        "weaviate_vector_fuzz_test.py",
+        "--seed",
+        str(seed),
+        "--rounds",
+        str(rounds),
+        "-N",
+        str(n),
+        "--dim",
+        str(dim),
+        "--host",
+        str(host),
+        "--port",
+        str(port),
+        "--grpc-port",
+        str(grpc_port),
+        "--vector-index",
+        str(vector_index),
+    ]
+    if dynamic:
+        parts.append("--dynamic")
+    return shlex.join(parts)
+
+
 def display_path(path):
     return path
 
@@ -123,6 +185,46 @@ class WeaviateVectorFuzzTest:
         self.actual_vi_type = None
         self.vectors = None   # (N, DIM) float32
         self.ids = []         # list[str] (UUID)
+        self.props = []       # list[dict] aligned with ids/vectors
+        self._uuid_counter = 0
+        self._prop_counter = 0
+
+    def _next_uuid(self):
+        uid = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"weaviate-vector-fuzz-{self.seed}-{self._uuid_counter}"))
+        self._uuid_counter += 1
+        return uid
+
+    def _make_props(self, ordinal):
+        ordinal = int(ordinal)
+        return {
+            "row_num": ordinal,
+            "tag": ordinal % 100,
+            "bucket": ordinal % 7,
+            "flag": bool((ordinal % 2) == 0),
+            "label": f"group_{ordinal % 5}",
+        }
+
+    def _next_props(self):
+        props = self._make_props(self._prop_counter)
+        self._prop_counter += 1
+        return props
+
+    def _append_shadow_row(self, uid, vec, props):
+        self.ids.append(uid)
+        self.props.append(dict(props))
+        if self.vectors is None:
+            self.vectors = vec.reshape(1, -1)
+        else:
+            self.vectors = np.vstack([self.vectors, vec.reshape(1, -1)])
+
+    def _remove_shadow_row(self, idx):
+        self.ids.pop(idx)
+        self.props.pop(idx)
+        self.vectors = np.delete(self.vectors, idx, axis=0)
+
+    def _replace_shadow_row(self, idx, vec, props):
+        self.vectors[idx] = vec
+        self.props[idx] = dict(props)
 
     # ── connection ──────────────────────────────────────────────────────────
 
@@ -167,6 +269,9 @@ class WeaviateVectorFuzzTest:
         properties = [
             Property(name="row_num", data_type=DataType.INT),
             Property(name="tag", data_type=DataType.INT, index_filterable=True),
+            Property(name="bucket", data_type=DataType.INT, index_filterable=True, index_range_filters=True),
+            Property(name="flag", data_type=DataType.BOOL, index_filterable=True),
+            Property(name="label", data_type=DataType.TEXT, tokenization=Tokenization.FIELD, index_filterable=True),
         ]
 
         if self.vi_type == "hnsw":
@@ -253,7 +358,8 @@ class WeaviateVectorFuzzTest:
         norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1
         self.vectors = (self.vectors / norms).astype(np.float32)
-        self.ids = [str(uuid.uuid4()) for _ in range(self.n)]
+        self.ids = [self._next_uuid() for _ in range(self.n)]
+        self.props = [self._next_props() for _ in range(self.n)]
 
         col = self.client.collections.get(CLASS_NAME)
         print(f"⚡ Inserting {self.n} vectors (dim={self.dim}) …")
@@ -264,7 +370,7 @@ class WeaviateVectorFuzzTest:
             for i in range(start, end):
                 objs.append(DataObject(
                     uuid=self.ids[i],
-                    properties={"row_num": i, "tag": i % 100},
+                    properties=dict(self.props[i]),
                     vector=self.vectors[i].tolist(),
                 ))
             col.data.insert_many(objs)
@@ -272,12 +378,13 @@ class WeaviateVectorFuzzTest:
 
     # ── search helper ───────────────────────────────────────────────────────
 
-    def _search(self, query_vec, top_k):
+    def _search(self, query_vec, top_k, filters=None):
         """Return list of (uuid_str, distance) tuples, ordered by DB."""
         col = self.client.collections.get(CLASS_NAME)
         res = col.query.near_vector(
             near_vector=query_vec,
             limit=top_k,
+            filters=filters,
             return_metadata=MetadataQuery(distance=True),
         )
         hits = []
@@ -293,19 +400,126 @@ class WeaviateVectorFuzzTest:
         except Exception:
             pass
 
-    def _wait_for_self_hit(self, query_vec, expected_uid, *, top_k=5, timeout_s=SELF_RETRIEVAL_TIMEOUT_SEC):
+    def _wait_for_self_hit(self, query_vec, expected_uid, *, filters=None, top_k=5, timeout_s=SELF_RETRIEVAL_TIMEOUT_SEC):
         deadline = time.time() + timeout_s
         attempts = 0
         last_hits = []
         while True:
             attempts += 1
-            last_hits = self._search(query_vec, top_k)
+            last_hits = self._search(query_vec, top_k, filters=filters)
             found_ids = [uid for uid, _ in last_hits]
             if expected_uid in found_ids:
                 return last_hits, attempts, True
             if time.time() >= deadline:
                 return last_hits, attempts, False
             time.sleep(SELF_RETRIEVAL_POLL_SEC)
+
+    def _id_to_props(self):
+        return {uid: props for uid, props in zip(self.ids, self.props)}
+
+    def _choose_filtered_query(self):
+        if not self.ids or not self.props:
+            return None
+
+        props_map = self._id_to_props()
+        for _ in range(12):
+            anchor_idx = random.randint(0, len(self.props) - 1)
+            anchor_props = self.props[anchor_idx]
+            mode = random.choice(["tag", "bucket_range", "flag", "label"])
+
+            if mode == "tag":
+                target = int(anchor_props["tag"])
+                flt = Filter.by_property("tag").equal(target)
+                predicate = lambda props, target=target: int(props["tag"]) == target
+                desc = f"tag == {target}"
+            elif mode == "bucket_range":
+                bucket = int(anchor_props["bucket"])
+                lo = max(0, bucket - random.choice([0, 1]))
+                hi = min(6, bucket + random.choice([0, 1]))
+                flt = Filter.by_property("bucket").greater_or_equal(lo) & Filter.by_property("bucket").less_or_equal(hi)
+                predicate = lambda props, lo=lo, hi=hi: lo <= int(props["bucket"]) <= hi
+                desc = f"bucket in [{lo}, {hi}]"
+            elif mode == "flag":
+                target = bool(anchor_props["flag"])
+                flt = Filter.by_property("flag").equal(target)
+                predicate = lambda props, target=target: bool(props["flag"]) == target
+                desc = f"flag == {target}"
+            else:
+                target = str(anchor_props["label"])
+                flt = Filter.by_property("label").equal(target)
+                predicate = lambda props, target=target: str(props["label"]) == target
+                desc = f'label == "{target}"'
+
+            matching_ids = [
+                uid for uid, props in props_map.items()
+                if predicate(props)
+            ]
+            if matching_ids:
+                return {
+                    "description": desc,
+                    "filters": flt,
+                    "predicate": predicate,
+                    "anchor_uid": self.ids[anchor_idx],
+                    "anchor_vector": self.vectors[anchor_idx].tolist(),
+                    "matching_ids": matching_ids,
+                }
+        return None
+
+    def test_filtered_subset(self, *, top_k=10):
+        case = self._choose_filtered_query()
+        if case is None:
+            return True, "trivial (no usable filter case)"
+
+        hits, attempts, found = self._wait_for_self_hit(
+            case["anchor_vector"],
+            case["anchor_uid"],
+            filters=case["filters"],
+            top_k=max(top_k, 8),
+        )
+        if not hits:
+            return False, f'filtered query returned 0 hits for {case["description"]} after {attempts} poll(s)'
+        if not found:
+            return False, (
+                f'anchor missing under filter {case["description"]}: '
+                f"anchor={case['anchor_uid'][:8]} polls={attempts}"
+            )
+
+        props_map = self._id_to_props()
+        mismatches = []
+        for uid, _ in hits:
+            props = props_map.get(uid)
+            if props is None or not case["predicate"](props):
+                mismatches.append(uid)
+        if mismatches:
+            return False, (
+                f'filtered subset violated for {case["description"]}: '
+                f"bad_hits={mismatches[:5]}"
+            )
+        return True, f'{case["description"]} ok ({len(hits)} hits, polls={attempts})'
+
+    def test_filtered_self_retrieval(self):
+        uid = self._next_uuid()
+        vec = self._random_vector()
+        props = self._next_props()
+        vec_list = vec.tolist()
+        filters = Filter.by_property("bucket").equal(int(props["bucket"])) & Filter.by_property("flag").equal(bool(props["flag"]))
+        col = self.client.collections.get(CLASS_NAME)
+        try:
+            col.data.insert(properties=dict(props), uuid=uid, vector=vec_list)
+            hits, attempts, found = self._wait_for_self_hit(vec_list, uid, filters=filters, top_k=8)
+            if not found:
+                return False, (
+                    f"filtered self-retrieval timeout: uuid={uid[:8]} filter=bucket={props['bucket']} flag={props['flag']} "
+                    f"polls={attempts} top={hits[:3]}"
+                )
+            if hits[0][0] != uid:
+                return False, (
+                    f"filtered self-retrieval top1 mismatch: uuid={uid[:8]} top1={hits[0][0][:8]} "
+                    f"polls={attempts}"
+                )
+            return True, f"ok filter=bucket={props['bucket']} flag={props['flag']} polls={attempts}"
+        finally:
+            self._safe_delete_by_id(uid)
 
     # ── dynamic ops ─────────────────────────────────────────────────────────
 
@@ -319,19 +533,17 @@ class WeaviateVectorFuzzTest:
         op = random.choices(["insert", "delete", "update"], weights=[0.4, 0.3, 0.3], k=1)[0]
 
         if op == "insert":
-            uid = str(uuid.uuid4())
+            uid = self._next_uuid()
             vec = self._random_vector()
-            col.data.insert(properties={"row_num": -1, "tag": random.randint(0, 99)},
-                            uuid=uid, vector=vec.tolist())
-            self.ids.append(uid)
-            self.vectors = np.vstack([self.vectors, vec.reshape(1, -1)])
-            return f"INSERT uuid={uid[:8]}"
+            props = self._next_props()
+            col.data.insert(properties=dict(props), uuid=uid, vector=vec.tolist())
+            self._append_shadow_row(uid, vec, props)
+            return f"INSERT uuid={uid[:8]} bucket={props['bucket']} flag={props['flag']} label={props['label']}"
         elif op == "delete" and len(self.ids) > 200:
             idx = random.randint(0, len(self.ids) - 1)
             uid = self.ids[idx]
             col.data.delete_by_id(uid)
-            self.ids.pop(idx)
-            self.vectors = np.delete(self.vectors, idx, axis=0)
+            self._remove_shadow_row(idx)
             return f"DELETE uuid={uid[:8]}"
         else:  # update
             if not self.ids:
@@ -339,11 +551,10 @@ class WeaviateVectorFuzzTest:
             idx = random.randint(0, len(self.ids) - 1)
             uid = self.ids[idx]
             vec = self._random_vector()
-            col.data.replace(uuid=uid,
-                             properties={"row_num": -1, "tag": random.randint(0, 99)},
-                             vector=vec.tolist())
-            self.vectors[idx] = vec
-            return f"UPDATE uuid={uid[:8]}"
+            props = self._next_props()
+            col.data.replace(uuid=uid, properties=dict(props), vector=vec.tolist())
+            self._replace_shadow_row(idx, vec, props)
+            return f"UPDATE uuid={uid[:8]} bucket={props['bucket']} flag={props['flag']} label={props['label']}"
 
     # ── Test 1: distance ordering ───────────────────────────────────────────
 
@@ -384,12 +595,13 @@ class WeaviateVectorFuzzTest:
     # ── Test 3: self-retrieval ──────────────────────────────────────────────
 
     def test_self_retrieval(self):
-        uid = str(uuid.uuid4())
+        uid = self._next_uuid()
         vec = self._random_vector()
+        props = self._next_props()
         vec_list = vec.tolist()
         col = self.client.collections.get(CLASS_NAME)
         try:
-            col.data.insert(properties={"row_num": -1, "tag": 0}, uuid=uid, vector=vec_list)
+            col.data.insert(properties=dict(props), uuid=uid, vector=vec_list)
             hits, attempts, found = self._wait_for_self_hit(vec_list, uid, top_k=5)
 
             if not found:
@@ -424,24 +636,23 @@ class WeaviateVectorFuzzTest:
 
     def test_self_retrieval_after_ops(self, n_ops=5):
         col = self.client.collections.get(CLASS_NAME)
-        uid = str(uuid.uuid4())
+        uid = self._next_uuid()
         vec = self._random_vector()
+        props = self._next_props()
         vec_list = vec.tolist()
 
-        col.data.insert(properties={"row_num": -1, "tag": 0}, uuid=uid, vector=vec_list)
-        self.ids.append(uid)
-        self.vectors = np.vstack([self.vectors, vec.reshape(1, -1)])
+        col.data.insert(properties=dict(props), uuid=uid, vector=vec_list)
+        self._append_shadow_row(uid, vec, props)
 
         ops_done = []
         for _ in range(n_ops):
             op = random.choices(["insert", "delete", "update"], weights=[0.4, 0.3, 0.3], k=1)[0]
             if op == "insert":
-                oid = str(uuid.uuid4())
+                oid = self._next_uuid()
                 ov = self._random_vector()
-                col.data.insert(properties={"row_num": -1, "tag": random.randint(0, 99)},
-                                uuid=oid, vector=ov.tolist())
-                self.ids.append(oid)
-                self.vectors = np.vstack([self.vectors, ov.reshape(1, -1)])
+                oprops = self._next_props()
+                col.data.insert(properties=dict(oprops), uuid=oid, vector=ov.tolist())
+                self._append_shadow_row(oid, ov, oprops)
                 ops_done.append(f"ins({oid[:8]})")
             elif op == "delete" and len(self.ids) > 200:
                 candidates = [x for x in self.ids if x != uid]
@@ -449,8 +660,7 @@ class WeaviateVectorFuzzTest:
                     did = random.choice(candidates)
                     didx = self.ids.index(did)
                     col.data.delete_by_id(did)
-                    self.ids.pop(didx)
-                    self.vectors = np.delete(self.vectors, didx, axis=0)
+                    self._remove_shadow_row(didx)
                     ops_done.append(f"del({did[:8]})")
             elif op == "update":
                 candidates = [x for x in self.ids if x != uid]
@@ -458,10 +668,9 @@ class WeaviateVectorFuzzTest:
                     upd = random.choice(candidates)
                     upidx = self.ids.index(upd)
                     uv = self._random_vector()
-                    col.data.replace(uuid=upd,
-                                     properties={"row_num": -1, "tag": random.randint(0, 99)},
-                                     vector=uv.tolist())
-                    self.vectors[upidx] = uv
+                    uprops = self._next_props()
+                    col.data.replace(uuid=upd, properties=dict(uprops), vector=uv.tolist())
+                    self._replace_shadow_row(upidx, uv, uprops)
                     ops_done.append(f"upd({upd[:8]})")
 
         try:
@@ -475,8 +684,7 @@ class WeaviateVectorFuzzTest:
         finally:
             if uid in self.ids:
                 idx = self.ids.index(uid)
-                self.ids.pop(idx)
-                self.vectors = np.delete(self.vectors, idx, axis=0)
+                self._remove_shadow_row(idx)
             self._safe_delete_by_id(uid)
 
 
@@ -501,11 +709,31 @@ def run(args):
         t.setup_collection()
         t.generate_and_insert()
 
-        ts = int(time.time())
-        logfile = make_log_path(f"weaviate_vector_fuzz_{ts}.log")
+        logfile = make_log_path(
+            stable_log_filename(
+                "weaviate_vector_fuzz",
+                current_seed,
+                args.rounds,
+                args.N,
+                args.dim,
+                t.vi_type,
+                args.dynamic,
+            )
+        )
+        repro_cmd = format_repro_command(
+            current_seed,
+            t.vi_type,
+            args.rounds,
+            args.N,
+            args.dim,
+            args.host,
+            args.port,
+            args.grpc_port,
+            args.dynamic,
+        )
         print(f"📝 Log: {display_path(logfile)}")
 
-        fuzz_stats = {k: FuzzStats() for k in ["ordering", "monotonicity", "self_ret", "self_ret_dyn"]}
+        fuzz_stats = {k: FuzzStats() for k in ["ordering", "monotonicity", "filtered", "self_ret", "filtered_self", "self_ret_dyn"]}
         failures = []
 
         with open(logfile, "w", encoding="utf-8") as flog:
@@ -515,10 +743,7 @@ def run(args):
                 f"Distance: {t.distance_metric}  N={args.N}  DIM={args.dim}\n"
             )
             flog.write(f"Dynamic: {args.dynamic}\n")
-            flog.write(f"Reproduce: python weaviate_vector_fuzz_test.py --seed {current_seed} --vector-index {t.vi_type}")
-            if args.dynamic:
-                flog.write(" --dynamic")
-            flog.write("\n")
+            flog.write(f"Reproduce: {repro_cmd}\n")
             flog.write("=" * 80 + "\n\n")
 
             for i in range(args.rounds):
@@ -563,6 +788,20 @@ def run(args):
                     failures.append(("monotonicity", i, detail))
                     print(f"  ❌ [R{i}] MONOTONICITY FAIL: {detail[:120]}")
 
+                # Test 2b
+                t0 = time.time()
+                try:
+                    ok, detail = t.test_filtered_subset(top_k=random.choice([5, 8, 10, 15]))
+                    error_cat = None if ok else "filtered"
+                except Exception as exc:
+                    ok, detail, error_cat = False, f"CRASH: {exc}", "filtered_crash"
+                lat_ms = (time.time() - t0) * 1000
+                fuzz_stats["filtered"].record(ok, lat_ms, error_cat=error_cat)
+                flog.write(f"[R{i:04d}] FILTERED_SUBSET: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
+                if not ok:
+                    failures.append(("filtered_subset", i, detail))
+                    print(f"  ❌ [R{i}] FILTERED_SUBSET FAIL: {detail[:120]}")
+
                 # Test 3
                 if i % 10 == 0:
                     t0 = time.time()
@@ -577,6 +816,21 @@ def run(args):
                     if not ok:
                         failures.append(("self_retrieval", i, detail))
                         print(f"  ❌ [R{i}] SELF_RETRIEVAL FAIL: {detail[:120]}")
+
+                # Test 3a
+                if i % 12 == 0:
+                    t0 = time.time()
+                    try:
+                        ok, detail = t.test_filtered_self_retrieval()
+                        error_cat = None if ok else "filtered_self"
+                    except Exception as exc:
+                        ok, detail, error_cat = False, f"CRASH: {exc}", "filtered_self_crash"
+                    lat_ms = (time.time() - t0) * 1000
+                    fuzz_stats["filtered_self"].record(ok, lat_ms, error_cat=error_cat)
+                    flog.write(f"[R{i:04d}] FILTERED_SELF: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
+                    if not ok:
+                        failures.append(("filtered_self", i, detail))
+                        print(f"  ❌ [R{i}] FILTERED_SELF FAIL: {detail[:120]}")
 
                 # Test 3b
                 if args.dynamic and i % 30 == 0 and i > 0:
@@ -596,7 +850,9 @@ def run(args):
                 if (i + 1) % 50 == 0:
                     print(f"  [R{i+1}/{args.rounds}] ordering=P{fuzz_stats['ordering'].passed}/F{fuzz_stats['ordering'].failed} "
                           f"mono=P{fuzz_stats['monotonicity'].passed}/F{fuzz_stats['monotonicity'].failed} "
+                          f"filtered=P{fuzz_stats['filtered'].passed}/F{fuzz_stats['filtered'].failed} "
                           f"self=P{fuzz_stats['self_ret'].passed}/F{fuzz_stats['self_ret'].failed} "
+                          f"fself=P{fuzz_stats['filtered_self'].passed}/F{fuzz_stats['filtered_self'].failed} "
                           f"dyn=P{fuzz_stats['self_ret_dyn'].passed}/F{fuzz_stats['self_ret_dyn'].failed}")
 
             flog.write("\n" + "=" * 80 + "\n")
@@ -622,10 +878,7 @@ def run(args):
         else:
             print(f"\n🎉 All tests passed! Seed={current_seed}")
         print(f"📝 Full log: {display_path(logfile)}")
-        repro = f"python weaviate_vector_fuzz_test.py --seed {current_seed} --vector-index {t.vi_type}"
-        if args.dynamic:
-            repro += " --dynamic"
-        print(f"🔑 Reproduce: {repro}")
+        print(f"🔑 Reproduce: {repro_cmd}")
         print("=" * 80)
 
     finally:
@@ -647,5 +900,9 @@ if __name__ == "__main__":
     parser.add_argument("--dim", type=int, default=DIM)
     parser.add_argument("--vector-index", choices=["random", *ALL_VECTOR_INDEX_TYPES], default="random")
     parser.add_argument("--dynamic", action="store_true")
+    parser.add_argument("--log-dir", type=str, default=None, help="Directory for deterministic fuzzer-internal logs")
+    parser.add_argument("--log-suffix", type=str, default=None, help="Stable suffix appended to fuzzer-internal log filenames")
     args = parser.parse_args()
+    set_log_dir(args.log_dir)
+    set_log_suffix(args.log_suffix)
     run(args)
