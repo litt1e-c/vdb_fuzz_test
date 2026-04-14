@@ -38,6 +38,18 @@ ORACLE_PATH = SCRIPT_DIR / "weaviate_fuzz_oracle.py"
 DEFAULT_LAUNCHER = SCRIPT_DIR / "start_weaviate_cov.sh"
 DEFAULT_LOG_ROOT = SCRIPT_DIR / "weaviate_log"
 DEFAULT_COV_ROOT = SCRIPT_DIR / ".cov"
+DEFAULT_SCALAR_PERCENT_REGEX = (
+    r"adapters/repos/db$|adapters/repos/db/(aggregator|inverted)|"
+    r"adapters/handlers/rest/filterext|"
+    r"adapters/handlers/graphql/local/(aggregate|common_filters)|"
+    r"entities/(filters|inverted)"
+)
+DEFAULT_SCALAR_FUNC_REGEX = (
+    r"adapters/repos/db/(aggregator|inverted)/|"
+    r"adapters/handlers/rest/filterext/|"
+    r"adapters/handlers/graphql/local/(aggregate|common_filters)/|"
+    r"entities/(filters|inverted)/|^total:"
+)
 
 
 @dataclass
@@ -382,20 +394,51 @@ def run_case(command: list[str], log_path: Path) -> tuple[int, float]:
     return exit_code, time.time() - start
 
 
-def collect_covdata(go_bin: str, cov_dir: Path, out_dir: Path, percent_regex: str | None) -> dict:
+def resolve_go_cover_cwd() -> Path:
+    candidates: list[Path] = []
+    env_root = os.environ.get("WEAVIATE_GO_ROOT")
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+    candidates.extend(
+        [
+            SCRIPT_DIR,
+            SCRIPT_DIR.parent / "weaviate",
+            Path.home() / "weaviate",
+        ]
+    )
+
+    for candidate in candidates:
+        go_mod = candidate / "go.mod"
+        if not go_mod.is_file():
+            continue
+        try:
+            content = go_mod.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if "module github.com/weaviate/weaviate" in content:
+            return candidate
+    return SCRIPT_DIR
+
+
+def collect_covdata(
+    go_bin: str,
+    cov_inputs: str,
+    out_dir: Path,
+    percent_regex: str | None,
+    func_regex: str | None,
+) -> dict:
     summary: dict[str, str | int | bool] = {"available": False}
     if shutil.which(go_bin) is None:
         summary["detail"] = f"`{go_bin}` not found; skipped covdata export"
-        return summary
-    if not cov_dir.exists():
-        summary["detail"] = f"coverage dir missing: {cov_dir}"
         return summary
 
     out_dir.mkdir(parents=True, exist_ok=True)
     percent_path = out_dir / "coverage_percent.txt"
     textfmt_path = out_dir / "coverage_profile.txtfmt"
+    func_path = out_dir / "coverage_func.txt"
+    cover_cwd = resolve_go_cover_cwd()
 
-    percent_cmd = [go_bin, "tool", "covdata", "percent", "-i", str(cov_dir)]
+    percent_cmd = [go_bin, "tool", "covdata", "percent", "-i", cov_inputs]
     percent_proc = subprocess.run(percent_cmd, cwd=str(SCRIPT_DIR), capture_output=True, text=True)
     percent_output = (percent_proc.stdout or "") + (percent_proc.stderr or "")
     percent_path.write_text(percent_output, encoding="utf-8")
@@ -407,8 +450,20 @@ def collect_covdata(go_bin: str, cov_dir: Path, out_dir: Path, percent_regex: st
         filtered_path = out_dir / "coverage_percent.filtered.txt"
         filtered_path.write_text("\n".join(filtered_lines) + ("\n" if filtered_lines else ""), encoding="utf-8")
 
-    textfmt_cmd = [go_bin, "tool", "covdata", "textfmt", "-i", str(cov_dir), "-o", str(textfmt_path)]
+    textfmt_cmd = [go_bin, "tool", "covdata", "textfmt", "-i", cov_inputs, "-o", str(textfmt_path)]
     textfmt_proc = subprocess.run(textfmt_cmd, cwd=str(SCRIPT_DIR), capture_output=True, text=True)
+    func_cmd = [go_bin, "tool", "cover", "-func", str(textfmt_path)]
+    func_proc = subprocess.run(func_cmd, cwd=str(cover_cwd), capture_output=True, text=True) if textfmt_proc.returncode == 0 else None
+    func_output = ""
+    filtered_func_path = None
+    if func_proc is not None:
+        func_output = (func_proc.stdout or "") + (func_proc.stderr or "")
+        func_path.write_text(func_output, encoding="utf-8")
+        if func_regex:
+            regex = re.compile(func_regex)
+            filtered_lines = [line for line in func_output.splitlines() if regex.search(line)]
+            filtered_func_path = out_dir / "coverage_func.filtered.txt"
+            filtered_func_path.write_text("\n".join(filtered_lines) + ("\n" if filtered_lines else ""), encoding="utf-8")
 
     summary.update(
         {
@@ -419,13 +474,20 @@ def collect_covdata(go_bin: str, cov_dir: Path, out_dir: Path, percent_regex: st
             "textfmt_cmd": " ".join(textfmt_cmd),
             "textfmt_path": str(textfmt_path),
             "textfmt_returncode": textfmt_proc.returncode,
+            "func_cmd": " ".join(func_cmd),
+            "func_cwd": str(cover_cwd),
+            "func_path": str(func_path) if func_proc is not None else None,
+            "func_returncode": func_proc.returncode if func_proc is not None else None,
             "filtered_percent_path": str(filtered_path) if filtered_path else None,
+            "filtered_func_path": str(filtered_func_path) if filtered_func_path else None,
         }
     )
     if percent_proc.returncode != 0:
         summary["detail"] = percent_output.strip() or "covdata percent failed"
     elif textfmt_proc.returncode != 0:
         summary["detail"] = (textfmt_proc.stdout or textfmt_proc.stderr or "").strip() or "covdata textfmt failed"
+    elif func_proc is not None and func_proc.returncode != 0:
+        summary["detail"] = func_output.strip() or "go tool cover -func failed"
     else:
         summary["detail"] = "covdata export complete"
     return summary
@@ -433,6 +495,50 @@ def collect_covdata(go_bin: str, cov_dir: Path, out_dir: Path, percent_regex: st
 
 def write_summary_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def normalize_cov_inputs(raw_inputs: str | None, fallback_cov_dir: Path | None) -> str | None:
+    parts: list[str] = []
+    if raw_inputs:
+        for item in raw_inputs.split(","):
+            item = item.strip()
+            if item:
+                parts.append(str(Path(item).expanduser().resolve()))
+    elif fallback_cov_dir is not None:
+        parts.append(str(fallback_cov_dir.expanduser().resolve()))
+
+    if not parts:
+        return None
+    return ",".join(parts)
+
+
+def print_report_summary(
+    log_dir: Path,
+    summary_path: Path,
+    cov_summary: dict,
+    elapsed_seconds: float,
+    title: str = "Coverage Report",
+) -> int:
+    print(f"\n{BOLD}{'=' * 76}{RESET}")
+    print(f"{BOLD}{title}{RESET}")
+    print(f"{'=' * 76}")
+    print(f"  Duration:    {fmt_duration(elapsed_seconds)}")
+    print(f"  Logs:        {log_dir}")
+    print(f"  Summary:     {summary_path}")
+    if cov_summary.get("available"):
+        print(f"  Coverage:    {cov_summary.get('percent_path')}")
+        if cov_summary.get("filtered_percent_path"):
+            print(f"  Cov filter:  {cov_summary.get('filtered_percent_path')}")
+        if cov_summary.get("func_path"):
+            print(f"  Cover func:  {cov_summary.get('func_path')}")
+        if cov_summary.get("filtered_func_path"):
+            print(f"  Func filter: {cov_summary.get('filtered_func_path')}")
+        print(f"  Textfmt:     {cov_summary.get('textfmt_path')}")
+        print(f"\n{GREEN}{BOLD}Coverage report generated.{RESET}")
+        return 0
+
+    print(f"  Coverage:    failed ({cov_summary.get('detail', 'unknown reason')})")
+    return 1
 
 
 def main() -> int:
@@ -445,11 +551,21 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080, help="Weaviate HTTP port")
     parser.add_argument("--run-id", default=None, help="Run id used for data/.cov directories")
     parser.add_argument("--cov-dir", default=None, help="Explicit coverage dir; useful with --reuse-running-server")
+    parser.add_argument(
+        "--coverage-inputs",
+        default=None,
+        help="Comma-separated GOCOVERDIR directories to analyze/merge for the coverage report",
+    )
     parser.add_argument("--ready-timeout", type=float, default=90.0, help="Seconds to wait for Weaviate readiness")
     parser.add_argument("--query-page-size", type=int, default=1000, help="Pass-through query page size for fuzz cases")
     parser.add_argument("--stop-on-fail", action="store_true", help="Abort the suite on first failed fuzz case")
     parser.add_argument("--max-cases", type=int, default=None, help="Run only the first N expanded cases")
     parser.add_argument("--dry-run", action="store_true", help="Print the case matrix without starting Weaviate")
+    parser.add_argument(
+        "--coverage-report-only",
+        action="store_true",
+        help="Skip fuzz execution and only generate a coverage report for --coverage-inputs/--cov-dir",
+    )
     parser.add_argument(
         "--reuse-running-server",
         action="store_true",
@@ -457,18 +573,51 @@ def main() -> int:
     )
     parser.add_argument(
         "--coverage-percent-regex",
-        default=None,
+        default=DEFAULT_SCALAR_PERCENT_REGEX,
         help="Optional regex to keep only matching `covdata percent` lines in a filtered report",
+    )
+    parser.add_argument(
+        "--coverage-func-regex",
+        default=DEFAULT_SCALAR_FUNC_REGEX,
+        help="Optional regex to keep only matching `go tool cover -func` lines in a filtered report",
     )
     args = parser.parse_args()
 
     launcher = Path(args.launcher).expanduser().resolve()
-    if not launcher.exists():
+    if not args.coverage_report_only and not launcher.exists():
         print(f"{RED}Launcher not found:{RESET} {launcher}")
         return 2
-    if not ORACLE_PATH.exists():
+    if not args.coverage_report_only and not ORACLE_PATH.exists():
         print(f"{RED}Oracle script not found:{RESET} {ORACLE_PATH}")
         return 2
+
+    fallback_cov_dir = Path(args.cov_dir).expanduser().resolve() if args.cov_dir else None
+    cov_inputs = normalize_cov_inputs(args.coverage_inputs, fallback_cov_dir)
+
+    if args.coverage_report_only:
+        report_run_id = args.run_id or f"coverage-report-{now_utc_stamp()}"
+        log_dir = DEFAULT_LOG_ROOT / f"coverage_suite_{report_run_id}"
+        artifacts_dir = log_dir / "artifacts"
+        started = time.time()
+        if not cov_inputs:
+            print(f"{RED}No coverage input provided.{RESET} Use --coverage-inputs or --cov-dir.")
+            return 2
+        cov_summary = collect_covdata(
+            args.go_bin,
+            cov_inputs,
+            artifacts_dir,
+            args.coverage_percent_regex,
+            args.coverage_func_regex,
+        )
+        payload = {
+            "run_id": report_run_id,
+            "coverage_inputs": cov_inputs.split(","),
+            "coverage": cov_summary,
+        }
+        log_dir.mkdir(parents=True, exist_ok=True)
+        summary_path = log_dir / "suite_summary.json"
+        write_summary_json(summary_path, payload)
+        return print_report_summary(log_dir, summary_path, cov_summary, time.time() - started)
 
     cases = expand_templates(SUITES[args.suite])
     if args.max_cases is not None:
@@ -480,6 +629,7 @@ def main() -> int:
     run_id = args.run_id or f"weaviate-cov-{args.suite}-{now_utc_stamp()}"
     log_dir = DEFAULT_LOG_ROOT / f"coverage_suite_{run_id}"
     cov_dir = Path(args.cov_dir).expanduser().resolve() if args.cov_dir else (DEFAULT_COV_ROOT / run_id)
+    cov_inputs = normalize_cov_inputs(args.coverage_inputs, cov_dir)
     artifacts_dir = log_dir / "artifacts"
 
     print(f"\n{BOLD}{CYAN}{'=' * 76}{RESET}")
@@ -582,7 +732,13 @@ def main() -> int:
             ),
         }
     else:
-        cov_summary = collect_covdata(args.go_bin, cov_dir, artifacts_dir, args.coverage_percent_regex)
+        cov_summary = collect_covdata(
+            args.go_bin,
+            cov_inputs or str(cov_dir),
+            artifacts_dir,
+            args.coverage_percent_regex,
+            args.coverage_func_regex,
+        )
     suite_elapsed = time.time() - suite_start
     passed_count = sum(1 for item in results if item.passed)
     failed = [item for item in results if not item.passed]
@@ -616,6 +772,10 @@ def main() -> int:
         print(f"  Coverage:    {cov_summary.get('percent_path')}")
         if cov_summary.get("filtered_percent_path"):
             print(f"  Cov filter:  {cov_summary.get('filtered_percent_path')}")
+        if cov_summary.get("func_path"):
+            print(f"  Cover func:  {cov_summary.get('func_path')}")
+        if cov_summary.get("filtered_func_path"):
+            print(f"  Func filter: {cov_summary.get('filtered_func_path')}")
         print(f"  Textfmt:     {cov_summary.get('textfmt_path')}")
     else:
         print(f"  Coverage:    skipped ({cov_summary.get('detail', 'unknown reason')})")
