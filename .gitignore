@@ -47,3 +47,4 @@ c3_triage_agent/auto_cases/
 !c3_triage_agent/incidents/*.txt
 
 deploy_*
+.codex
