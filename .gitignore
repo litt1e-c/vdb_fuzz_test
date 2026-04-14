@@ -45,3 +45,5 @@ c3_triage_agent/auto_cases/
 !c3_triage_agent/history_issue_catalog.json
 !c3_triage_agent/incidents/
 !c3_triage_agent/incidents/*.txt
+
+deploy_*
