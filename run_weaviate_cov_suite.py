@@ -334,6 +334,22 @@ def apply_seed_strategy(cases: list[SuiteCase], seed_strategy: str, suite_seed: 
     return derived_cases
 
 
+def select_budget_base_case(
+    cases: list[SuiteCase],
+    suite_seed: int,
+    global_index: int,
+    budget_schedule: str,
+) -> SuiteCase:
+    if budget_schedule == "cycle":
+        return cases[(global_index - 1) % len(cases)]
+    if budget_schedule == "random":
+        payload = f"{suite_seed}|budget-random-case|{global_index}|{len(cases)}".encode("utf-8")
+        digest = hashlib.sha256(payload).digest()
+        case_index = int.from_bytes(digest[:8], byteorder="big", signed=False) % len(cases)
+        return cases[case_index]
+    raise ValueError(f"unsupported budget schedule: {budget_schedule}")
+
+
 def materialize_budget_case(case: SuiteCase, suite_seed: int, global_index: int) -> SuiteCase:
     return SuiteCase(
         name=case.name,
@@ -989,6 +1005,9 @@ def write_summary_markdown(
         lines.append(f"- Seed strategy: `{payload.get('seed_strategy')}`")
     if payload.get("suite_seed") is not None:
         lines.append(f"- Suite seed: `{payload.get('suite_seed')}`")
+    if payload.get("time_budget_seconds") is not None:
+        lines.append(f"- Time budget: `{fmt_duration(float(payload.get('time_budget_seconds')))}`")
+        lines.append(f"- Budget schedule: `{payload.get('budget_schedule', 'cycle')}`")
     lines.append(f"- Summary JSON: `{summary_json_path}`")
     if cases_csv_path is not None:
         lines.append(f"- Case CSV: `{cases_csv_path}`")
@@ -1164,6 +1183,15 @@ def main() -> int:
         help="Keep cycling the selected case matrix until this wall-clock budget is reached",
     )
     parser.add_argument(
+        "--budget-schedule",
+        choices=["cycle", "random"],
+        default="cycle",
+        help=(
+            "Case selection policy used with --time-budget-seconds. `cycle` repeats the matrix in order; "
+            "`random` chooses a reproducible pseudo-random case per completed slot from --suite-seed."
+        ),
+    )
+    parser.add_argument(
         "--coverage-timeline",
         action="store_true",
         help=(
@@ -1278,6 +1306,9 @@ def main() -> int:
                 "so repeated cycles are reproducible but not identical."
             )
             return 2
+    elif args.budget_schedule != "cycle":
+        print(f"{RED}--budget-schedule is only meaningful with --time-budget-seconds.{RESET}")
+        return 2
     if args.coverage_timeline:
         if args.reuse_running_server:
             print(f"{RED}--coverage-timeline cannot be combined with --reuse-running-server.{RESET}")
@@ -1320,6 +1351,7 @@ def main() -> int:
     print(f"  Cases:      {len(cases)}")
     if args.time_budget_seconds is not None:
         print(f"  Budget:     {fmt_duration(args.time_budget_seconds)}")
+        print(f"  Schedule:   {args.budget_schedule}")
     if args.max_cases is not None:
         cap_label = args.max_cases if args.time_budget_seconds is not None else len(cases)
         print(f"  Case cap:   {cap_label}")
@@ -1334,7 +1366,11 @@ def main() -> int:
     if args.time_budget_seconds is not None:
         preview_count = min(len(cases), len(cases) if args.max_cases is None else max(0, args.max_cases))
         preview_cases = [
-            materialize_budget_case(cases[(index - 1) % len(cases)], int(args.suite_seed), index)
+            materialize_budget_case(
+                select_budget_base_case(cases, int(args.suite_seed), index, args.budget_schedule),
+                int(args.suite_seed),
+                index,
+            )
             for index in range(1, preview_count + 1)
         ]
     for index, case in enumerate(preview_cases, start=1):
@@ -1357,7 +1393,10 @@ def main() -> int:
     if args.time_budget_seconds is not None and len(preview_cases) < len(cases):
         print(f"  ... {len(cases) - len(preview_cases)} more base cases in each cycle")
     if args.time_budget_seconds is not None:
-        print("  (Budget mode will continue cycling this matrix with derived per-case seeds.)")
+        if args.budget_schedule == "random":
+            print("  (Budget mode will draw reproducible pseudo-random cases with derived per-case seeds.)")
+        else:
+            print("  (Budget mode will continue cycling this matrix with derived per-case seeds.)")
     if args.coverage_timeline:
         print("  (Coverage timeline mode restarts Weaviate per case to flush Go counters.)")
 
@@ -1427,7 +1466,7 @@ def main() -> int:
                 if args.max_cases is not None and index > args.max_cases:
                     print(f"{YELLOW}Case cap reached; stopping after completed case {index - 1}.{RESET}")
                     break
-                base_case = cases[(index - 1) % len(cases)]
+                base_case = select_budget_base_case(cases, int(args.suite_seed), index, args.budget_schedule)
                 case = materialize_budget_case(base_case, int(args.suite_seed), index)
                 progress_total = f"budget {fmt_duration(args.time_budget_seconds)}"
                 cycle = ((index - 1) // len(cases)) + 1
@@ -1541,6 +1580,7 @@ def main() -> int:
                         "grpc_port": args.grpc_port,
                         "query_page_size": args.query_page_size,
                         "time_budget_seconds": args.time_budget_seconds,
+                        "budget_schedule": args.budget_schedule,
                         "suite_elapsed_seconds": time.time() - suite_start,
                         "results": [asdict(item) for item in results],
                         "coverage_timeline": timeline_artifacts,
@@ -1618,6 +1658,7 @@ def main() -> int:
         "grpc_port": args.grpc_port,
         "query_page_size": args.query_page_size,
         "time_budget_seconds": args.time_budget_seconds,
+        "budget_schedule": args.budget_schedule,
         "suite_elapsed_seconds": suite_elapsed,
         "results": [asdict(item) for item in results],
         "failure_artifacts": failure_artifacts,
