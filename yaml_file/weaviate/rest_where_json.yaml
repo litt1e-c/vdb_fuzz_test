@@ -1,41 +1,33 @@
 operator_id: rest_where_json
-family: rest_filter
+family: other
 syntax_examples:
-  - 'DELETE /v1/batch/objects {"match":{"class":"FuzzOracleV2","where":{"path":["intVal"],"operator":"Equal","valueInt":7}},"dryRun":true,"output":"verbose"}'
-  - 'DELETE /v1/batch/objects {"match":{"class":"FuzzOracleV2","where":{"operator":"And","operands":[{"path":["textVal"],"operator":"Like","valueText":"alpha*"},{"path":["len(textVal)"],"operator":"GreaterThan","valueInt":3}]}},"dryRun":true,"output":"verbose"}'
-  - 'DELETE /v1/batch/objects {"match":{"class":"FuzzOracleV2","where":{"path":["dateArr"],"operator":"ContainsAny","valueDateArray":["2024-01-03T00:00:00Z"]}},"dryRun":true,"output":"verbose"}'
-doc_status: rest_and_filtering_documented
+- DELETE /v1/batch/objects {"match":{"class":"FuzzOracleV2","where":{"path":["intVal"],"operator":"Equal","valueInt":7}},"dryRun":true,"output":"verbose"}
+- DELETE /v1/batch/objects {"match":{"class":"FuzzOracleV2","where":{"operator":"And","operands":[{"path":["textVal"],"operator":"Like","valueText":"alpha*"},{"path":["len(textVal)"],"operator":"GreaterThan","valueInt":3}]}},"dryRun":true,"output":"verbose"}
+- DELETE /v1/batch/objects {"match":{"class":"FuzzOracleV2","where":{"path":["dateArr"],"operator":"ContainsAny","valueDateArray":["2024-01-03T00:00:00Z"]}},"dryRun":true,"output":"verbose"}
+doc_status: derived
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/manage-objects/delete"
-  - "https://docs.weaviate.io/weaviate/search/filters"
+- https://docs.weaviate.io/weaviate/manage-objects/delete
+- https://docs.weaviate.io/weaviate/search/filters
 doc_supported_types:
-  - rest_where_json
-  - batch_delete_dry_run
-  - id
-  - int
-  - number
-  - boolean
-  - text
-  - date
-  - int_array
-  - number_array
-  - boolean_array
-  - text_array
-  - date_array
-  - property_length
-doc_semantics: "Batch delete dry-run accepts a REST `where` JSON payload under `match.where`, parses it through the REST filter path, and returns the matched object IDs in `results.objects` without deleting data. This provides a direct REST oracle path for filter semantics."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+- scalar_datetime
+- scalar_uuid
+- array_field
+- metadata_field
+- unknown
+doc_semantics: Batch delete dry-run accepts a REST `where` JSON payload under `match.where`, parses it through the REST filter path, and returns the matched object IDs in `results.objects` without deleting data. This provides a direct REST oracle path for filter semantics.
 doc_notes:
-  - "The checked docs document batch delete and where-style filters separately; local validation shows `DELETE /v1/batch/objects` with `dryRun=true` and `output=verbose` returns match counts and IDs without deleting objects."
-  - "The local operator probe validated scalar comparisons, `Like`, `IsNull`, `ContainsAny` / `ContainsAll` / `ContainsNone`, boolean composition, `len(property)`, and array/date payloads through the REST JSON path."
-  - "For REST JSON arrays, the server expects typed array keys such as `valueIntArray`, `valueTextArray`, `valueBooleanArray`, `valueNumberArray`, and `valueDateArray` rather than scalar keys carrying JSON arrays."
-  - "Local validation showed REST date-array comparisons normalize timestamps by instant rather than by raw string formatting; the oracle now compares DATE / DATE_ARRAY values by parsed UTC instants."
-  - "The current oracle claims only the locally validated scalar/array subset and does not claim nested object path filtering."
+- The checked docs document batch delete and where-style filters separately; local validation shows `DELETE /v1/batch/objects` with `dryRun=true` and `output=verbose` returns match counts and IDs without deleting objects.
+- The local operator probe validated scalar comparisons, `Like`, `IsNull`, `ContainsAny` / `ContainsAll` / `ContainsNone`, boolean composition, `len(property)`, and array/date payloads through the REST JSON path.
+- For REST JSON arrays, the server expects typed array keys such as `valueIntArray`, `valueTextArray`, `valueBooleanArray`, `valueNumberArray`, and `valueDateArray` rather than scalar keys carrying JSON arrays.
+- Local validation showed REST date-array comparisons normalize timestamps by instant rather than by raw string formatting; the oracle now compares DATE / DATE_ARRAY values by parsed UTC instants.
+- The current oracle claims only the locally validated scalar/array subset and does not claim nested object path filtering.
 verify_status: edge_validated
-observed_summary: "On local Weaviate v1.36.x with anonymous auth enabled, `rest_where_json_operator.py` passed the validated subset through `DELETE /v1/batch/objects` dry-run. The probe covered `Equal`, `NotEqual`, numeric/date ranges, `Like`, `IsNull`, scalar-text `ContainsAny` / `ContainsNone`, array `ContainsAny` / `ContainsAll` / `ContainsNone`, `len(text)`, `And`, `Or`, `Not`, and the deprecated `valueString` alias. A local semantic check also showed `BOOL_ARRAY ContainsAll([true])` behaves like membership for that singleton target."
+observed_summary: On local Weaviate v1.36.x with anonymous auth enabled, `rest_where_json_operator.py` passed the validated subset through `DELETE /v1/batch/objects` dry-run. The probe covered `Equal`, `NotEqual`, numeric/date ranges, `Like`, `IsNull`, scalar-text `ContainsAny` / `ContainsNone`, array `ContainsAny` / `ContainsAll` / `ContainsNone`, `len(text)`, `And`, `Or`, `Not`, and the deprecated `valueString` alias. A local semantic check also showed `BOOL_ARRAY ContainsAll([true])` behaves like membership for that singleton target.
 oracle_support:
-  - pandas
-  - grpc
-  - rest
+- pandas
 case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/rest_where_json_operator.py"
-oracle_mapping: "The REST filter oracle builds a conservative recursive `where` JSON subset, computes the expected ID set from pandas using a dedicated REST evaluator over the final JSON tree, and compares both the Python client filter-builder path and the REST dry-run path against that expected set. DATE and DATE_ARRAY comparisons are normalized by parsed UTC instants, and zero-length arrays are treated as null-equivalent in the claimed subset. This is our local oracle rule, not an official claim."
+repro_path: /home/caihao/compare_test/operator_test/weaviate/rest_where_json_operator.py
+oracle_mapping: The REST filter oracle builds a conservative recursive `where` JSON subset, computes the expected ID set from pandas using a dedicated REST evaluator over the final JSON tree, and compares both the Python client filter-builder path and the REST dry-run path against that expected set. DATE and DATE_ARRAY comparisons are normalized by parsed UTC instants, and zero-length arrays are treated as null-equivalent in the claimed subset. This is our local oracle rule, not an official claim.

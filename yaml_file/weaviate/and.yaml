@@ -1,27 +1,26 @@
 operator_id: and
 family: logical
 syntax_examples:
-  - 'Filter.by_property("round").equal("Double") & Filter.by_property("points").less_than(600)'
-  - 'Filter.all_of([Filter.by_property("points").greater_than(300), Filter.by_property("points").less_than(700)])'
-  - 'where: { operator: And, operands: [...] }'
+- Filter.by_property("round").equal("Double") & Filter.by_property("points").less_than(600)
+- Filter.all_of([Filter.by_property("points").greater_than(300), Filter.by_property("points").less_than(700)])
+- 'where: { operator: And, operands: [...] }'
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/filters"
-  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+- https://docs.weaviate.io/weaviate/search/filters
+- https://docs.weaviate.io/weaviate/api/graphql/filters
 doc_supported_types:
-  - filter_operands
-  - property_filter_predicates
-doc_semantics: "AND combines multiple filter conditions so that only objects satisfying all operand filters are matched; in the GraphQL where structure, `And` uses an operands list, and the Python v4 client exposes both pairwise `&` and list-style `Filter.all_of([...])` composition."
+- unknown
+doc_semantics: AND combines multiple filter conditions so that only objects satisfying all operand filters are matched; in the GraphQL where structure, `And` uses an operands list, and the Python v4 client exposes both pairwise `&` and list-style `Filter.all_of([...])` composition.
 doc_notes:
-  - "The checked Filters guide states that multiple conditions use `And`, `Or`, and `Not`; it documents Python v4 `Filter.all_of([...])` and `&` as AND composition forms."
-  - "The checked API reference lists `And` as a where-filter operator and states that if the operator is `And` or `Or`, operands are a list of where filters."
-  - "The checked docs show nested And/Or filters and an AND operand containing NOT, but do not specify empty operand lists, evaluation order, short-circuit behavior, or complete null/missing truth tables."
+- The checked Filters guide states that multiple conditions use `And`, `Or`, and `Not`; it documents Python v4 `Filter.all_of([...])` and `&` as AND composition forms.
+- The checked API reference lists `And` as a where-filter operator and states that if the operator is `And` or `Or`, operands are a list of where filters.
+- The checked docs show nested And/Or filters and an AND operand containing NOT, but do not specify empty operand lists, evaluation order, short-circuit behavior, or complete null/missing truth tables.
 verify_status: edge_validated
-observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.18.1, `and_operator.py` passed the tested subset: pairwise `&`, `Filter.all_of` with three operands, nested AND/OR, AND with a NOT operand, AND between a numeric predicate and `is_none(True)` over explicit-null/omitted scalar rows, and AND between a numeric predicate and OBJECT `is_none(True)` over explicit-null/omitted object rows all returned the expected tag sets. The null/missing and OBJECT checks are local evidence for the fuzzer subset, not official AND-specific semantics; GitHub issue10642 is currently labeled as discussion/feature request/reproducible rather than a confirmed bug, so OBJECT `is_none(False)` is treated here as an unimplemented or unsupported feature boundary outside this AND record's validated subset."
+observed_summary: 'On local Weaviate v1.36.5 with weaviate-client 4.18.1, `and_operator.py` passed the tested subset: pairwise `&`, `Filter.all_of` with three operands, nested AND/OR, AND with a NOT operand, AND between a numeric predicate and `is_none(True)` over explicit-null/omitted scalar rows, and AND between a numeric predicate and OBJECT `is_none(True)` over explicit-null/omitted object rows all returned the expected tag sets. The null/missing and OBJECT checks are local evidence for the fuzzer subset, not official AND-specific semantics; GitHub issue10642 is currently labeled as discussion/feature request/reproducible rather than a confirmed bug, so OBJECT `is_none(False)` is treated here as an unimplemented or unsupported feature boundary outside this AND record''s validated subset.'
 oracle_support:
-  - pandas
-  - pqs
+- pandas
+- pqs
 case_refs:
-  - issue10642
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/and_operator.py"
-oracle_mapping: "Current fuzzer maps AND to pandas boolean conjunction (`mask_l & mask_r`) over generated subfilter masks, uses Python-client `&` to build Weaviate filters, and has PQS compose AND only from pivot-true operands. Support is partial but sound for the generated filter subset: scalar predicates, array contains predicates, selected null checks, NOT subfilters, and OBJECT `is_none(True)` as validated here. Metadata filters, reference filters, property length, cross-reference paths, arbitrary object paths, OBJECT `is_none(False)`, and undocumented empty-operand behavior are not covered. This is our oracle assumption, not an official claim."
+- issue10642
+repro_path: /home/caihao/compare_test/operator_test/weaviate/and_operator.py
+oracle_mapping: 'Current fuzzer maps AND to pandas boolean conjunction (`mask_l & mask_r`) over generated subfilter masks, uses Python-client `&` to build Weaviate filters, and has PQS compose AND only from pivot-true operands. Support is partial but sound for the generated filter subset: scalar predicates, array contains predicates, selected null checks, NOT subfilters, and OBJECT `is_none(True)` as validated here. Metadata filters, reference filters, property length, cross-reference paths, arbitrary object paths, OBJECT `is_none(False)`, and undocumented empty-operand behavior are not covered. This is our oracle assumption, not an official claim.'

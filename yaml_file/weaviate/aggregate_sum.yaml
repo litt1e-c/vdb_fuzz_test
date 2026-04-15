@@ -1,24 +1,21 @@
 operator_id: aggregate_sum
-family: aggregate
+family: other
 syntax_examples:
-  - 'collection.aggregate.over_all(return_metrics=Metrics("intVal").integer(sum_=True))'
-  - 'collection.aggregate.over_all(return_metrics=Metrics("numArr").number(sum_=True))'
+- collection.aggregate.over_all(return_metrics=Metrics("intVal").integer(sum_=True))
+- collection.aggregate.over_all(return_metrics=Metrics("numArr").number(sum_=True))
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/aggregate"
+- https://docs.weaviate.io/weaviate/search/aggregate
 doc_supported_types:
-  - int
-  - number
-  - int_array
-  - number_array
-doc_semantics: "Sum is a documented numeric aggregate metric. Local validation shows array sums are computed over flattened elements rather than per-object array containers."
+- scalar_numeric
+- array_field
+doc_semantics: Sum is a documented numeric aggregate metric. Local validation shows array sums are computed over flattened elements rather than per-object array containers.
 doc_notes:
-  - "The checked docs document numeric sum but do not state array flattening semantics explicitly."
+- The checked docs document numeric sum but do not state array flattening semantics explicitly.
 verify_status: edge_validated
-observed_summary: "The local aggregate probe validated scalar INT / NUMBER sums and flattened INT_ARRAY / NUMBER_ARRAY sums under full-scan, filtered, and empty-result cases."
+observed_summary: The local aggregate probe validated scalar INT / NUMBER sums and flattened INT_ARRAY / NUMBER_ARRAY sums under full-scan, filtered, and empty-result cases.
 oracle_support:
-  - pandas
-  - aggregate
+- pandas
 case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
-oracle_mapping: "The oracle models sum as the arithmetic sum of present scalar values or flattened numeric-array elements. Integer sums are compared exactly for the validated local subset; floating-point sums are compared with tolerance."
+repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+oracle_mapping: The oracle models sum as the arithmetic sum of present scalar values or flattened numeric-array elements. Integer sums are compared exactly for the validated local subset; floating-point sums are compared with tolerance.

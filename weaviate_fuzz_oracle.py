@@ -88,6 +88,9 @@ def _env_probability(name, default):
     return max(0.0, min(1.0, value))
 
 
+GRPC_PORT = _env_positive_int("WEAVIATE_GRPC_PORT", 50051)
+
+
 QUERY_MAXIMUM_RESULTS = _env_positive_int(
     "WEAVIATE_FUZZ_QUERY_MAXIMUM_RESULTS",
     _env_positive_int("QUERY_MAXIMUM_RESULTS", DEFAULT_QUERY_MAXIMUM_RESULTS),
@@ -722,6 +725,7 @@ def format_repro_command(
     dynamic_enabled=True,
     host=None,
     port=None,
+    grpc_port=None,
     extra_args=None,
 ):
     parts = ["python", "weaviate_fuzz_oracle.py", "--mode", str(mode), "--seed", str(seed)]
@@ -733,6 +737,8 @@ def format_repro_command(
         parts.extend(["--host", str(host)])
     if port is not None:
         parts.extend(["--port", str(port)])
+    if grpc_port is not None:
+        parts.extend(["--grpc-port", str(grpc_port)])
     if get_fuzz_profile() != FUZZ_PROFILE_DEFAULT:
         parts.extend(["--profile", get_fuzz_profile()])
     if not dynamic_enabled:
@@ -2716,9 +2722,9 @@ class WeaviateManager:
         self.actual_distance_metric = None
 
     def connect(self):
-        print(f"🔌 Connecting to Weaviate at {HOST}:{PORT}...")
+        print(f"🔌 Connecting to Weaviate at {HOST}:{PORT} (gRPC {GRPC_PORT})...")
         try:
-            self.client = weaviate.connect_to_local(host=HOST, port=PORT, grpc_port=50051)
+            self.client = weaviate.connect_to_local(host=HOST, port=PORT, grpc_port=GRPC_PORT)
             if self.client.is_ready():
                 print("✅ Connected to Weaviate.")
             else:
@@ -7194,6 +7200,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
             dynamic_enabled=enable_dynamic_ops,
             host=HOST,
             port=PORT,
+            grpc_port=GRPC_PORT,
         )
         print(f"\n📝 Log: {display_path(logf)}")
         print(f"    Reproduce: {repro_cmd}")
@@ -7747,6 +7754,7 @@ def run_graphql_probe_mode(rounds=12, seed=None):
         dynamic_enabled=False,
         host=HOST,
         port=PORT,
+        grpc_port=GRPC_PORT,
     )
     collection_name = graphql_probe_collection_name(current_seed)
 
@@ -8705,6 +8713,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--host", type=str, default=None, help="Weaviate host")
     parser.add_argument("--port", type=int, default=None, help="Weaviate port")
+    parser.add_argument("--grpc-port", type=int, default=None, help="Weaviate gRPC port")
     parser.add_argument("-N", type=int, default=None, help="Data rows")
     parser.add_argument("--query-page-size", type=int, default=None, help="Cursor fetch page size for large-result queries")
     parser.add_argument("--aggregate-filter-min-depth", type=int, default=None, help="Minimum recursive depth for aggregate-mode filters")
@@ -8722,6 +8731,7 @@ if __name__ == "__main__":
 
     if args.host: HOST = args.host
     if args.port: PORT = args.port
+    if args.grpc_port: GRPC_PORT = args.grpc_port
     if args.N: N = args.N
     if args.query_page_size: QUERY_PAGE_SIZE = max(1, args.query_page_size)
     if args.aggregate_filter_min_depth:

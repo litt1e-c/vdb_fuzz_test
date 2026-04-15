@@ -1,34 +1,28 @@
 operator_id: aggregate_count
-family: aggregate
+family: other
 syntax_examples:
-  - 'collection.aggregate.over_all(total_count=True, return_metrics=Metrics("intVal").integer(count=True))'
-  - 'collection.aggregate.over_all(return_metrics=Metrics("textArr").text(count=True, top_occurrences_count=True, top_occurrences_value=True, limit=5))'
-  - 'collection.aggregate.over_all(filters=Filter.by_property("bucket").equal(0), total_count=True, return_metrics=[...])'
+- collection.aggregate.over_all(total_count=True, return_metrics=Metrics("intVal").integer(count=True))
+- collection.aggregate.over_all(return_metrics=Metrics("textArr").text(count=True, top_occurrences_count=True, top_occurrences_value=True, limit=5))
+- collection.aggregate.over_all(filters=Filter.by_property("bucket").equal(0), total_count=True, return_metrics=[...])
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/aggregate"
-  - "https://docs.weaviate.io/weaviate/search/filters"
+- https://docs.weaviate.io/weaviate/search/aggregate
+- https://docs.weaviate.io/weaviate/search/filters
 doc_supported_types:
-  - int
-  - number
-  - boolean
-  - text
-  - date
-  - date_array
-  - int_array
-  - number_array
-  - bool_array
-  - text_array
-doc_semantics: "Aggregate count is a documented per-property metric, while `total_count` reports the number of matched objects for the whole aggregate query. Local validation shows scalar-property count tracks present non-null values, and array-property count tracks flattened element count."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+- scalar_datetime
+- array_field
+doc_semantics: Aggregate count is a documented per-property metric, while `total_count` reports the number of matched objects for the whole aggregate query. Local validation shows scalar-property count tracks present non-null values, and array-property count tracks flattened element count.
 doc_notes:
-  - "The checked aggregate guide documents `count` on aggregate metrics and `total_count` on the aggregate result."
-  - "The checked docs do not provide a full null / missing / empty-array truth table for per-property aggregate count."
-  - "Local validation indicates missing, null, and empty arrays contribute zero to per-property count, while `total_count` still counts matched objects."
+- The checked aggregate guide documents `count` on aggregate metrics and `total_count` on the aggregate result.
+- The checked docs do not provide a full null / missing / empty-array truth table for per-property aggregate count.
+- Local validation indicates missing, null, and empty arrays contribute zero to per-property count, while `total_count` still counts matched objects.
 verify_status: edge_validated
-observed_summary: "On the local Weaviate service, `aggregate_operator.py` validated that `total_count` matches the filtered object count, scalar-property `count` matches the number of present values, and array-property `count` matches the total flattened element count. Empty-result aggregates returned `total_count=0`, numeric count 0, boolean count 0, date count 0, and text count 0."
+observed_summary: On the local Weaviate service, `aggregate_operator.py` validated that `total_count` matches the filtered object count, scalar-property `count` matches the number of present values, and array-property `count` matches the total flattened element count. Empty-result aggregates returned `total_count=0`, numeric count 0, boolean count 0, date count 0, and text count 0.
 oracle_support:
-  - pandas
-  - aggregate
+- pandas
 case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
-oracle_mapping: "The aggregate oracle computes `total_count` from the matched DataFrame row count. Per-property `count` is modeled as the number of present scalar values or the number of flattened array elements after filtering, with null, missing, and empty-array cases contributing zero. This is our oracle assumption for the validated local subset, not an official claim."
+repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+oracle_mapping: The aggregate oracle computes `total_count` from the matched DataFrame row count. Per-property `count` is modeled as the number of present scalar values or the number of flattened array elements after filtering, with null, missing, and empty-array cases contributing zero. This is our oracle assumption for the validated local subset, not an official claim.

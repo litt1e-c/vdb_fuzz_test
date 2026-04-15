@@ -1,5 +1,4 @@
 import json
-import time
 import uuid
 
 import requests
@@ -11,7 +10,7 @@ from weaviate.classes.data import DataObject
 HOST = "127.0.0.1"
 PORT = 8080
 GRPC_PORT = 50051
-COLLECTION_PREFIX = "NestedObjectFilterValidation"
+COLLECTION_NAME = "NestedObjectFilterValidation"
 
 
 def deterministic_uuid(label):
@@ -116,14 +115,12 @@ def rest_batch_delete_dry_run(payload):
 
 
 def main():
-    suffix = f"{int(time.time())}{uuid.uuid4().hex[:8]}"
-    collection_name = f"{COLLECTION_PREFIX}{suffix}"
+    collection_name = COLLECTION_NAME
     client = weaviate.connect_to_local(host=HOST, port=PORT, grpc_port=GRPC_PORT)
     created = False
     try:
         if client.collections.exists(collection_name):
-            print(f"Refusing to reuse existing collection: {collection_name}")
-            return 2
+            client.collections.delete(collection_name)
 
         collection = create_collection(client, collection_name)
         created = True

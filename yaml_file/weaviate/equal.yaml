@@ -1,31 +1,31 @@
 operator_id: equal
 family: comparison
 syntax_examples:
-  - 'Filter.by_property("intVal").equal(10)'
-  - 'Filter.by_property("textField").equal("Alpha Beta")'
-  - 'where: { path: ["wordCount"], operator: Equal, valueInt: 1000 }'
+- Filter.by_property("intVal").equal(10)
+- Filter.by_property("textField").equal("Alpha Beta")
+- 'where: { path: ["wordCount"], operator: Equal, valueInt: 1000 }'
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/filters"
-  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+- https://docs.weaviate.io/weaviate/search/filters
+- https://docs.weaviate.io/weaviate/api/graphql/filters
 doc_supported_types:
-  - int
-  - number
-  - boolean
-  - text
-  - date
-doc_semantics: "Equal is a documented where-filter operator that matches objects whose path value equals the provided typed value; the API reference lists typed values such as valueInt, valueBoolean, valueText, valueNumber, and valueDate, while the Filters guide notes that Equal behavior for multi-word text depends on the property's tokenization."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+- scalar_datetime
+doc_semantics: Equal is a documented where-filter operator that matches objects whose path value equals the provided typed value; the API reference lists typed values such as valueInt, valueBoolean, valueText, valueNumber, and valueDate, while the Filters guide notes that Equal behavior for multi-word text depends on the property's tokenization.
 doc_notes:
-  - "The checked API reference lists `Equal` among where-filter operators and documents typed value fields for int, boolean, text-like, number, and date values."
-  - "The checked Filters guide states that multi-word textual Equal filters depend on property tokenization; the current fuzzer uses Tokenization.FIELD for TEXT and TEXT_ARRAY fields."
-  - "The checked docs do not provide an equality-specific null/missing truth table, signed-zero rule for NUMBER, or direct guidance for Equal on empty strings."
-  - "The checked API reference null-state section says zero-length arrays and empty strings are equivalent to a null value for IsNull; this is not documented as Equal semantics."
+- The checked API reference lists `Equal` among where-filter operators and documents typed value fields for int, boolean, text-like, number, and date values.
+- The checked Filters guide states that multi-word textual Equal filters depend on property tokenization; the current fuzzer uses Tokenization.FIELD for TEXT and TEXT_ARRAY fields.
+- The checked docs do not provide an equality-specific null/missing truth table, signed-zero rule for NUMBER, or direct guidance for Equal on empty strings.
+- The checked API reference null-state section says zero-length arrays and empty strings are equivalent to a null value for IsNull; this is not documented as Equal semantics.
 verify_status: mismatch_observed
-observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.18.1, `equal_operator.py` matched the current fuzzer subset for INT, BOOL, Tokenization.FIELD TEXT, DATE equality with UTC-normalized instants, non-null scalar equality excluding null/omitted rows, and regular finite NUMBER equality for 1.5. The same local probe also validated a search-only FIELD TEXT extension: a property created with `index_filterable=False` and `index_searchable=True` still supported exact case-sensitive `Equal(...)` matching on the full stored string, which is useful for the inverted-focused profile even though the checked docs do not specify this index requirement precisely. Observation-only probes showed WORD-tokenized text Equal matched a broader tokenized/case-insensitive set than the FIELD-tokenized fuzzer subset, and direct Equal('') matched the empty-string row even though empty strings are null-equivalent for null-state filters. Signed-zero probes reproduced a mismatch relevant to local historical issue10917: NUMBER equal(0.0) matched only the +0.0 row, equal(-0.0) matched only the -0.0 row, a tiny range around zero matched only +0.0, and greater_or_equal(0.0) omitted -0.0. These signed-zero observations are treated as engine-side mismatch evidence outside the current main fuzzer subset, not as oracle truth."
+observed_summary: 'On local Weaviate v1.36.5 with weaviate-client 4.18.1, `equal_operator.py` matched the current fuzzer subset for INT, BOOL, Tokenization.FIELD TEXT, DATE equality with UTC-normalized instants, non-null scalar equality excluding null/omitted rows, and regular finite NUMBER equality for 1.5. The same local probe also validated a search-only FIELD TEXT extension: a property created with `index_filterable=False` and `index_searchable=True` still supported exact case-sensitive `Equal(...)` matching on the full stored string, which is useful for the inverted-focused profile even though the checked docs do not specify this index requirement precisely. Observation-only probes showed WORD-tokenized text Equal matched a broader tokenized/case-insensitive set than the FIELD-tokenized fuzzer subset, and direct Equal('''') matched the empty-string row even though empty strings are null-equivalent for null-state filters. Signed-zero probes reproduced a mismatch relevant to local historical
+  issue10917: NUMBER equal(0.0) matched only the +0.0 row, equal(-0.0) matched only the -0.0 row, a tiny range around zero matched only +0.0, and greater_or_equal(0.0) omitted -0.0. These signed-zero observations are treated as engine-side mismatch evidence outside the current main fuzzer subset, not as oracle truth.'
 oracle_support:
-  - pandas
-  - pqs
+- pandas
+- pqs
 case_refs:
-  - issue10917
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/equal_operator.py"
-oracle_mapping: "Current fuzzer maps positive Equal to pandas exact equality for BOOL, INT, Tokenization.FIELD TEXT, and DATE after UTC timestamp normalization, with null/omitted values and empty text values excluded from generated positive equality matches. The inverted-focused profile also allows this exact-equality modeling on locally validated search-only FIELD TEXT properties (`index_filterable=False`, `index_searchable=True`) to exercise the searchable inverted path. Positive NUMBER Equal is intentionally not part of the main atomic oracle; numeric exact-value checks are modeled through small range windows in boundary/PQS paths, and -0.0 is excluded from generated NUMBER values because local signed-zero behavior is unstable. WORD-tokenized text Equal, Equal(''), arrays, objects, metadata filters, reference filters, and arbitrary object paths are not covered. This is our oracle assumption, not an official claim."
+- issue10917
+repro_path: /home/caihao/compare_test/operator_test/weaviate/equal_operator.py
+oracle_mapping: Current fuzzer maps positive Equal to pandas exact equality for BOOL, INT, Tokenization.FIELD TEXT, and DATE after UTC timestamp normalization, with null/omitted values and empty text values excluded from generated positive equality matches. The inverted-focused profile also allows this exact-equality modeling on locally validated search-only FIELD TEXT properties (`index_filterable=False`, `index_searchable=True`) to exercise the searchable inverted path. Positive NUMBER Equal is intentionally not part of the main atomic oracle; numeric exact-value checks are modeled through small range windows in boundary/PQS paths, and -0.0 is excluded from generated NUMBER values because local signed-zero behavior is unstable. WORD-tokenized text Equal, Equal(''), arrays, objects, metadata filters, reference filters, and arbitrary object paths are not covered. This is our oracle assumption, not an official claim.

@@ -1,23 +1,22 @@
 operator_id: aggregate_boolean_distribution
-family: aggregate
+family: other
 syntax_examples:
-  - 'collection.aggregate.over_all(return_metrics=Metrics("boolVal").boolean(count=True, total_true=True, total_false=True, percentage_true=True, percentage_false=True))'
-  - 'collection.aggregate.over_all(return_metrics=Metrics("boolArr").boolean(count=True, total_true=True, total_false=True, percentage_true=True, percentage_false=True))'
+- collection.aggregate.over_all(return_metrics=Metrics("boolVal").boolean(count=True, total_true=True, total_false=True, percentage_true=True, percentage_false=True))
+- collection.aggregate.over_all(return_metrics=Metrics("boolArr").boolean(count=True, total_true=True, total_false=True, percentage_true=True, percentage_false=True))
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/aggregate"
+- https://docs.weaviate.io/weaviate/search/aggregate
 doc_supported_types:
-  - boolean
-  - bool_array
-doc_semantics: "Boolean aggregate metrics report count, total_true, total_false, percentage_true, and percentage_false. Local validation shows BOOL_ARRAY aggregation uses flattened boolean elements."
+- scalar_bool
+- array_field
+doc_semantics: Boolean aggregate metrics report count, total_true, total_false, percentage_true, and percentage_false. Local validation shows BOOL_ARRAY aggregation uses flattened boolean elements.
 doc_notes:
-  - "The checked aggregate guide documents boolean totals and percentages."
-  - "The checked docs do not explicitly define the empty-result percentage representation; the current local client returns NaN percentages with zero counts and totals."
+- The checked aggregate guide documents boolean totals and percentages.
+- The checked docs do not explicitly define the empty-result percentage representation; the current local client returns NaN percentages with zero counts and totals.
 verify_status: edge_validated
-observed_summary: "The local aggregate probe validated boolean totals and percentages over scalar BOOL and flattened BOOL_ARRAY values, including empty-result behavior."
+observed_summary: The local aggregate probe validated boolean totals and percentages over scalar BOOL and flattened BOOL_ARRAY values, including empty-result behavior.
 oracle_support:
-  - pandas
-  - aggregate
+- pandas
 case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
-oracle_mapping: "The oracle computes boolean aggregates from scalar values or flattened array elements after filtering. For empty-result cases it follows the locally observed client behavior: count 0, totals 0, and NaN percentages."
+repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+oracle_mapping: 'The oracle computes boolean aggregates from scalar values or flattened array elements after filtering. For empty-result cases it follows the locally observed client behavior: count 0, totals 0, and NaN percentages.'

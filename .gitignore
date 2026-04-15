@@ -11,11 +11,16 @@ venv/
 *.txt
 *.csv
 *.json
+weaviate_log/
+qdrant_log/
+milvus_log/
 
 # ===== Fuzz / test artifacts =====
 *_test_*.log
 *_probe_*.log
 *_result*.log
+.cov/
+data/
 
 # ===== Databases / runtime data =====
 *.db

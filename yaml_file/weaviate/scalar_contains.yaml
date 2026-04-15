@@ -1,30 +1,32 @@
 operator_id: scalar_contains
-family: membership
+family: array_membership
 syntax_examples:
   - 'Filter.by_property("intVal").contains_any([1, 9])'
   - 'Filter.by_property("flag").contains_none([True])'
   - 'Filter.by_property("ts").contains_all([datetime(2024, 1, 2, tzinfo=UTC)])'
-doc_status: local_extension_validated
+doc_status: derived
 doc_source_urls:
   - "https://docs.weaviate.io/weaviate/search/filters"
   - "https://docs.weaviate.io/weaviate/api/graphql/filters"
 doc_supported_types:
-  - int
-  - number
-  - boolean
-  - date
-doc_semantics: "The checked official docs explicitly document `ContainsAny`, `ContainsAll`, and `ContainsNone` for text and array-like uses. This YAML records an additional locally validated scalar subset on local Weaviate v1.36.10: scalar INT, NUMBER, BOOL, and DATE also accept these operators in the installed Python-client/server combination."
+  - scalar_numeric
+  - scalar_bool
+  - scalar_datetime
+doc_semantics: "The official filter docs describe `ContainsAny`, `ContainsAll`, and `ContainsNone` as membership-style operators, but they do not explicitly specify the scalar INT/NUMBER/BOOL/DATE subset recorded in this entry."
 doc_notes:
-  - "Because the checked docs emphasize array and text semantics, this scalar subset is adopted as a local validated oracle assumption rather than as a broad official guarantee."
-  - "The validated subset is intentionally conservative: `contains_any` and `contains_none` are adopted for scalar INT/NUMBER/BOOL/DATE, and `contains_all` is adopted only for singleton target lists where local behavior matched equality."
-  - "The local validation showed null or missing scalar rows match positive `contains_none(...)` and do not match positive `contains_any(...)`."
-  - "A multi-target scalar `contains_all([v1, v2])` with distinct targets returned no rows in the tested INT case; the main oracle therefore keeps scalar `contains_all` to the singleton subset."
+  - "This entry captures a locally validated scalar subset on the installed Python-client/server stack."
+  - "The main oracle keeps scalar `contains_all` to singleton target lists only."
 verify_status: edge_validated
-observed_summary: "On local Weaviate v1.36.10 with the installed Python client, `scalar_contains_operator.py` validated scalar membership semantics beyond the previous array/text subset. INT, NUMBER, BOOL, and DATE all accepted `contains_any(...)` and `contains_none(...)` and returned the expected tag sets. For each of these scalar types, a singleton `contains_all([v])` behaved like equality to `v`. Missing scalar rows matched positive `contains_none(...)` and were excluded from positive `contains_any(...)`. A multi-target scalar `contains_all([1, 2])` on the INT probe returned no rows and is kept observation-only."
+observed_summary: "Local `scalar_contains_operator.py` validation on Weaviate v1.36.10 showed that scalar INT, NUMBER, BOOL, and DATE accepted `contains_any(...)` and `contains_none(...)`. Singleton `contains_all([v])` behaved like equality, while a multi-target scalar `contains_all([1, 2])` INT probe returned no rows. Missing scalar rows matched positive `contains_none(...)` and did not match positive `contains_any(...)`."
 oracle_support:
   - pandas
   - pqs
-  - rest-filter
-case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/scalar_contains_operator.py"
-oracle_mapping: "The main Weaviate oracle now generates scalar `contains_any` and `contains_none` for INT, NUMBER, BOOL, and DATE, and generates scalar `contains_all` only as a singleton list for the same types. pandas models these as scalar membership / exclusion over the validated local subset. Null or missing scalar rows are treated as matches for `contains_none` and as non-matches for `contains_any` and singleton `contains_all`. PQS pivot-true generation includes self-target `contains_any` / singleton `contains_all` and noise-target `contains_none` for these scalar types. This is our local oracle assumption, not a universal official claim."
+case_refs:
+  - int_scalar_contains_any
+  - int_scalar_contains_none
+  - int_scalar_contains_all_singleton
+  - number_scalar_contains_any
+  - bool_scalar_contains_any
+  - date_scalar_contains_any
+repro_path: "operator_test/weaviate/scalar_contains_operator.py"
+oracle_mapping: "The pandas oracle models the validated scalar subset as explicit scalar membership / exclusion masks: `contains_any` behaves like equality-OR over the target list, `contains_none` behaves like exclusion and keeps missing rows, and scalar `contains_all` is restricted to singleton targets. PQS only generates pivot-true instances inside this validated subset, and REST mode reuses the same pandas-side mask semantics."

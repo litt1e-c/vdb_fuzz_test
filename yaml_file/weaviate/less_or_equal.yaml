@@ -1,31 +1,31 @@
 operator_id: less_or_equal
 family: comparison
 syntax_examples:
-  - 'Filter.by_property("points").less_or_equal(300)'
-  - 'Filter.by_property("dateVal").less_or_equal("2024-03-01T00:00:00Z")'
-  - 'where: { path: ["wordCount"], operator: LessThanEqual, valueInt: 1000 }'
+- Filter.by_property("points").less_or_equal(300)
+- Filter.by_property("dateVal").less_or_equal("2024-03-01T00:00:00Z")
+- 'where: { path: ["wordCount"], operator: LessThanEqual, valueInt: 1000 }'
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/filters"
-  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
-  - "https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index"
+- https://docs.weaviate.io/weaviate/search/filters
+- https://docs.weaviate.io/weaviate/api/graphql/filters
+- https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index
 doc_supported_types:
-  - int
-  - number
-  - date
-doc_semantics: "LessThanEqual is a documented where-filter operator that matches objects whose path value is less than or equal to the provided typed value; the official docs show comparison filtering on numeric properties, list `LessThanEqual` in the GraphQL where-operator set, and state that RFC3339 date values can be filtered similarly to numbers."
+- scalar_numeric
+- scalar_datetime
+doc_semantics: LessThanEqual is a documented where-filter operator that matches objects whose path value is less than or equal to the provided typed value; the official docs show comparison filtering on numeric properties, list `LessThanEqual` in the GraphQL where-operator set, and state that RFC3339 date values can be filtered similarly to numbers.
 doc_notes:
-  - "The checked Filters guide documents property filtering with comparison operators and shows Python-client filter construction for numeric properties."
-  - "The checked GraphQL filter reference lists `LessThanEqual` as a where-filter operator and documents typed value fields such as `valueInt`, `valueNumber`, and `valueDate`."
-  - "The checked docs state that dates use RFC3339 format and can be filtered similarly to numbers."
-  - "The checked inverted-index reference says to enable one or both of `indexFilterable` and `indexRangeFilters`; when both are enabled, comparison operators use the range index, while equality and inequality use the filterable index."
-  - "The checked docs do not provide a LessThanEqual-specific null or missing truth table, signed-zero rule for NUMBER, or a precise statement about how standalone range-only indexing behaves in the current Python-client/server combination."
+- The checked Filters guide documents property filtering with comparison operators and shows Python-client filter construction for numeric properties.
+- The checked GraphQL filter reference lists `LessThanEqual` as a where-filter operator and documents typed value fields such as `valueInt`, `valueNumber`, and `valueDate`.
+- The checked docs state that dates use RFC3339 format and can be filtered similarly to numbers.
+- The checked inverted-index reference says to enable one or both of `indexFilterable` and `indexRangeFilters`; when both are enabled, comparison operators use the range index, while equality and inequality use the filterable index.
+- The checked docs do not provide a LessThanEqual-specific null or missing truth table, signed-zero rule for NUMBER, or a precise statement about how standalone range-only indexing behaves in the current Python-client/server combination.
 verify_status: mismatch_observed
-observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `less_or_equal_operator.py` passed the validated subset for INT, regular finite NUMBER, DATE with UTC-normalized instants, and strict exclusion of null or omitted scalar rows, all on properties created with `index_filterable=True`. Observation-only checks found two important boundaries. First, a property created with `index_filterable=False` and `index_range_filterable=True` was read back from collection config with `index_range_filters=False`, and `less_or_equal(...)` on that property failed with an error requiring `indexFilterable`; standalone range-only coverage is therefore not validated locally. Second, signed-zero behavior is inconsistent: `less_or_equal(0.0)` matched the mathematically expected negative, negative-zero, and positive-zero rows, but `less_or_equal(-0.0)` returned only the `-0.0` row and omitted both `-1.0` and `+0.0`. These signed-zero mismatches are treated as local engine-side observations related to issue10917, not as oracle truth."
+observed_summary: 'On local Weaviate v1.36.5 with weaviate-client 4.20.1, `less_or_equal_operator.py` passed the validated subset for INT, regular finite NUMBER, DATE with UTC-normalized instants, and strict exclusion of null or omitted scalar rows, all on properties created with `index_filterable=True`. Observation-only checks found two important boundaries. First, a property created with `index_filterable=False` and `index_range_filterable=True` was read back from collection config with `index_range_filters=False`, and `less_or_equal(...)` on that property failed with an error requiring `indexFilterable`; standalone range-only coverage is therefore not validated locally. Second, signed-zero behavior is inconsistent: `less_or_equal(0.0)` matched the mathematically expected negative, negative-zero, and positive-zero rows, but `less_or_equal(-0.0)` returned only the `-0.0` row and omitted both `-1.0` and `+0.0`. These signed-zero mismatches are treated as local engine-side observations related
+  to issue10917, not as oracle truth.'
 oracle_support:
-  - pandas
-  - pqs
+- pandas
+- pqs
 case_refs:
-  - issue10917
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/less_or_equal_operator.py"
-oracle_mapping: "Current fuzzer models less_or_equal with pandas strict `<=` on generated INT, NUMBER, and DATE masks; DATE values are normalized to UTC timestamps, and null or omitted rows are excluded. After the local refinement in this round, PQS also contains direct pivot-true `less_or_equal` generation for INT, NUMBER, and DATE, in addition to existing bounded-range uses. Current generation remains intentionally limited to fields that are locally queryable in this environment, so standalone range-only index configurations are not claimed. Signed `-0.0`, text or boolean ordering, arrays, objects, metadata filters, reference filters, and undocumented null/index interactions are outside the validated subset. This is our oracle assumption, not an official claim."
+- issue10917
+repro_path: /home/caihao/compare_test/operator_test/weaviate/less_or_equal_operator.py
+oracle_mapping: Current fuzzer models less_or_equal with pandas strict `<=` on generated INT, NUMBER, and DATE masks; DATE values are normalized to UTC timestamps, and null or omitted rows are excluded. After the local refinement in this round, PQS also contains direct pivot-true `less_or_equal` generation for INT, NUMBER, and DATE, in addition to existing bounded-range uses. Current generation remains intentionally limited to fields that are locally queryable in this environment, so standalone range-only index configurations are not claimed. Signed `-0.0`, text or boolean ordering, arrays, objects, metadata filters, reference filters, and undocumented null/index interactions are outside the validated subset. This is our oracle assumption, not an official claim.

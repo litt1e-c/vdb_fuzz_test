@@ -1,23 +1,22 @@
 operator_id: aggregate_top_occurrences
-family: aggregate
+family: other
 syntax_examples:
-  - 'collection.aggregate.over_all(return_metrics=Metrics("textVal").text(count=True, top_occurrences_count=True, top_occurrences_value=True, limit=5))'
-  - 'collection.aggregate.over_all(return_metrics=Metrics("textArr").text(count=True, top_occurrences_count=True, top_occurrences_value=True, limit=5))'
+- collection.aggregate.over_all(return_metrics=Metrics("textVal").text(count=True, top_occurrences_count=True, top_occurrences_value=True, limit=5))
+- collection.aggregate.over_all(return_metrics=Metrics("textArr").text(count=True, top_occurrences_count=True, top_occurrences_value=True, limit=5))
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/aggregate"
+- https://docs.weaviate.io/weaviate/search/aggregate
 doc_supported_types:
-  - text
-  - text_array
-doc_semantics: "Top occurrences is a documented text aggregate metric that returns the most frequent text values. Local validation shows TEXT_ARRAY aggregation is performed over flattened array elements."
+- scalar_text
+- array_field
+doc_semantics: Top occurrences is a documented text aggregate metric that returns the most frequent text values. Local validation shows TEXT_ARRAY aggregation is performed over flattened array elements.
 doc_notes:
-  - "The checked aggregate guide documents text aggregate count plus top occurrences with value and count outputs."
-  - "The checked docs do not fully specify cutoff tie behavior when multiple values share the same frequency around the requested limit."
+- The checked aggregate guide documents text aggregate count plus top occurrences with value and count outputs.
+- The checked docs do not fully specify cutoff tie behavior when multiple values share the same frequency around the requested limit.
 verify_status: edge_validated
-observed_summary: "The local aggregate probe validated TEXT and flattened TEXT_ARRAY count plus top-occurrence results. The main aggregate fuzzer compares `top_occurrences` strictly only when there is no tie at the requested limit cutoff; otherwise it validates count and skips strict ordering to avoid false positives."
+observed_summary: The local aggregate probe validated TEXT and flattened TEXT_ARRAY count plus top-occurrence results. The main aggregate fuzzer compares `top_occurrences` strictly only when there is no tie at the requested limit cutoff; otherwise it validates count and skips strict ordering to avoid false positives.
 oracle_support:
-  - pandas
-  - aggregate
+- pandas
 case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py"
-oracle_mapping: "The oracle computes text count from present scalar values or flattened text-array elements, and it compares `top_occurrences` as a frequency multiset. When a boundary tie exists at the requested limit, the oracle intentionally skips strict `top_occurrences` comparison because the checked docs do not define the cutoff tie rule."
+repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+oracle_mapping: The oracle computes text count from present scalar values or flattened text-array elements, and it compares `top_occurrences` as a frequency multiset. When a boundary tie exists at the requested limit, the oracle intentionally skips strict `top_occurrences` comparison because the checked docs do not define the cutoff tie rule.

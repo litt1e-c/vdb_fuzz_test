@@ -409,6 +409,8 @@ def build_case_command(
             host,
             "--port",
             str(port),
+            "--grpc-port",
+            str(grpc_port),
             "-N",
             str(case.rows),
         ]
@@ -449,6 +451,7 @@ def start_server(
     run_id: str,
     host: str,
     port: int,
+    grpc_port: int,
     ready_timeout: float,
     cov_dir: Path,
     data_dir: Path,
@@ -457,6 +460,15 @@ def start_server(
     env = os.environ.copy()
     env["WEAVIATE_COV_DIR"] = str(cov_dir)
     env["WEAVIATE_DATA_DIR"] = str(data_dir)
+    env["WEAVIATE_HOST"] = "0.0.0.0"
+    env["WEAVIATE_PORT"] = str(port)
+    env["WEAVIATE_GRPC_PORT"] = str(grpc_port)
+    env["WEAVIATE_RAFT_PORT"] = str(port + 220)
+    env["WEAVIATE_RAFT_INTERNAL_RPC_PORT"] = str(port + 221)
+    env["CLUSTER_HOSTNAME"] = f"node-{safe_label(run_id)}"
+    env["CLUSTER_GOSSIP_BIND_PORT"] = str(port + 222)
+    env["CLUSTER_DATA_BIND_PORT"] = str(port + 223)
+    env["CLUSTER_ADVERTISE_PORT"] = str(port + 222)
     server_log_path.parent.mkdir(parents=True, exist_ok=True)
     server_log = server_log_path.open("w", encoding="utf-8")
     process = subprocess.Popen(
@@ -1390,6 +1402,7 @@ def main() -> int:
                 run_id,
                 args.host,
                 args.port,
+                args.grpc_port,
                 args.ready_timeout,
                 cov_dir,
                 data_dir,
@@ -1451,6 +1464,7 @@ def main() -> int:
                     f"{run_id}-{case_label}",
                     args.host,
                     args.port,
+                    args.grpc_port,
                     args.ready_timeout,
                     case_cov_dir,
                     case_data_dir,

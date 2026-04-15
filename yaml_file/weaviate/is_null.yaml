@@ -1,38 +1,34 @@
 operator_id: is_null
-family: null_state
+family: nullability
 syntax_examples:
-  - 'Filter.by_property("optionalText").is_none(True)'
-  - 'Filter.by_property("tagsArray").is_none(False)'
-  - 'where: { path: ["answer"], operator: IsNull, valueBoolean: true }'
+- Filter.by_property("optionalText").is_none(True)
+- Filter.by_property("tagsArray").is_none(False)
+- 'where: { path: ["answer"], operator: IsNull, valueBoolean: true }'
 doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/filters"
-  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
-  - "https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index"
-  - "https://docs.weaviate.io/weaviate/config-refs/datatypes"
+- https://docs.weaviate.io/weaviate/search/filters
+- https://docs.weaviate.io/weaviate/api/graphql/filters
+- https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index
+- https://docs.weaviate.io/weaviate/config-refs/datatypes
 doc_supported_types:
-  - int
-  - number
-  - boolean
-  - text
-  - date
-  - int_array
-  - text_array
-  - number_array
-  - boolean_array
-doc_semantics: "IsNull is a documented where-filter operator that takes a boolean value and matches objects whose property is in the requested null state. The GraphQL reference says it lets users filter for objects where given properties are null, and the null-state documentation says zero-length arrays and empty strings are equivalent to a null value."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+- scalar_datetime
+- array_field
+doc_semantics: IsNull is a documented where-filter operator that takes a boolean value and matches objects whose property is in the requested null state. The GraphQL reference says it lets users filter for objects where given properties are null, and the null-state documentation says zero-length arrays and empty strings are equivalent to a null value.
 doc_notes:
-  - "The checked GraphQL filter reference lists `IsNull` as a where-filter operator and documents `valueBoolean` as its typed input."
-  - "The checked null-state section says zero-length arrays and empty strings are equivalent to a null value."
-  - "The checked inverted-index reference says null-state filtering requires `indexNullState` support to be enabled."
-  - "The checked datatype reference says `object` values are not indexed, so the official docs do not establish `IsNull` support for OBJECT properties."
-  - "The checked docs do not provide an explicit missing-property truth table or a separate explicit-null-versus-omitted truth table for `IsNull`."
+- The checked GraphQL filter reference lists `IsNull` as a where-filter operator and documents `valueBoolean` as its typed input.
+- The checked null-state section says zero-length arrays and empty strings are equivalent to a null value.
+- The checked inverted-index reference says null-state filtering requires `indexNullState` support to be enabled.
+- The checked datatype reference says `object` values are not indexed, so the official docs do not establish `IsNull` support for OBJECT properties.
+- The checked docs do not provide an explicit missing-property truth table or a separate explicit-null-versus-omitted truth table for `IsNull`.
 verify_status: edge_validated
-observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `is_null_operator.py` validated the current main subset for scalar INT/BOOL/DATE, FIELD TEXT, and INT_ARRAY/TEXT_ARRAY null-state filtering. Omitted scalar rows matched the current fuzzer assumption that omitted properties satisfy `is_none(True)`. Empty strings were included by `optionalText.is_none(True)` and excluded by `is_none(False)`. Explicit empty arrays `[]` were included by `is_none(True)` and excluded by `is_none(False)` for both INT_ARRAY and TEXT_ARRAY. OBJECT behavior remained a separate boundary: `metaObj.is_none(True)` returned the null/omitted rows in both the fuzzer-like schema and a property-level `index_null_state=True` variant, but `metaObj.is_none(False)` returned an empty result in every local probe, including an explicit-null-only pair collection, reproducing issue10642 as an unimplemented or unsupported OBJECT non-null path rather than a validated part of the main oracle subset."
+observed_summary: 'On local Weaviate v1.36.5 with weaviate-client 4.20.1, `is_null_operator.py` validated the current main subset for scalar INT/BOOL/DATE, FIELD TEXT, and INT_ARRAY/TEXT_ARRAY null-state filtering. Omitted scalar rows matched the current fuzzer assumption that omitted properties satisfy `is_none(True)`. Empty strings were included by `optionalText.is_none(True)` and excluded by `is_none(False)`. Explicit empty arrays `[]` were included by `is_none(True)` and excluded by `is_none(False)` for both INT_ARRAY and TEXT_ARRAY. OBJECT behavior remained a separate boundary: `metaObj.is_none(True)` returned the null/omitted rows in both the fuzzer-like schema and a property-level `index_null_state=True` variant, but `metaObj.is_none(False)` returned an empty result in every local probe, including an explicit-null-only pair collection, reproducing issue10642 as an unimplemented or unsupported OBJECT non-null path rather than a validated part of the main oracle subset.'
 oracle_support:
-  - pandas
-  - pqs
+- pandas
+- pqs
 case_refs:
-  - issue10642
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/is_null_operator.py"
-oracle_mapping: "Current fuzzer maps scalar, TEXT, and array `is_none(True/False)` to pandas through `_effective_null_mask`. TEXT `\"\"` is treated as effective null, and after the local helper refinement in this round, empty arrays `[]` are also treated as effective null if they are present in the dataframe. The current generator still writes Python `None` by omitting the property and normalizes generated empty arrays to omitted/null-like rows, so explicit-null writes and direct generated `[]` cases are not part of the exercised main-fuzzer subset. PQS currently uses pivot-true `is_none(True)` generation for null-like rows; direct `is_none(False)` is exercised in oracle mode, not as a dedicated PQS primitive. Direct OBJECT `is_none(False)` is excluded, while OBJECT `is_none(True)` remains an observation-backed local subset. This is our oracle assumption, not an official claim."
+- issue10642
+repro_path: /home/caihao/compare_test/operator_test/weaviate/is_null_operator.py
+oracle_mapping: Current fuzzer maps scalar, TEXT, and array `is_none(True/False)` to pandas through `_effective_null_mask`. TEXT `""` is treated as effective null, and after the local helper refinement in this round, empty arrays `[]` are also treated as effective null if they are present in the dataframe. The current generator still writes Python `None` by omitting the property and normalizes generated empty arrays to omitted/null-like rows, so explicit-null writes and direct generated `[]` cases are not part of the exercised main-fuzzer subset. PQS currently uses pivot-true `is_none(True)` generation for null-like rows; direct `is_none(False)` is exercised in oracle mode, not as a dedicated PQS primitive. Direct OBJECT `is_none(False)` is excluded, while OBJECT `is_none(True)` remains an observation-backed local subset. This is our oracle assumption, not an official claim.

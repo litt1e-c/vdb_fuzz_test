@@ -1,27 +1,29 @@
 operator_id: like_boundary
-family: text_pattern
+family: text_search
 syntax_examples:
-  - 'Filter.by_property("textVal").like("*")'
-  - 'Filter.by_property("textVal").like("???")'
-  - 'Filter.by_property("textVal").like("%")'
-  - 'Filter.by_property("textVal").like("_")'
-doc_status: edge_validated
+- Filter.by_property("textVal").like("*")
+- Filter.by_property("textVal").like("???")
+- Filter.by_property("textVal").like("%")
+doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/filters"
-  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+- https://docs.weaviate.io/weaviate/search/filters
+- https://docs.weaviate.io/weaviate/api/graphql/filters
 doc_supported_types:
-  - text
-doc_semantics: "The official docs define `*` as a zero-or-more wildcard and `?` as a single-character wildcard for Like. This YAML records additional local boundary validation for pure wildcard patterns and SQL-like literal characters on FIELD-tokenized text."
+- scalar_text
+doc_semantics: The official filter docs describe `Like` on text with `*` as a zero-or-more wildcard and `?` as a single-character wildcard.
 doc_notes:
-  - "The validated mainline subset here is narrow and explainable: `*`, `**`, `???`, `%`, and `_` on FIELD-tokenized text."
-  - "Local validation showed `%` and `_` are treated as literal characters, not as SQL-like wildcards."
-  - "Local validation also showed `*` and `**` match all present FIELD-text rows, including explicit empty strings."
-  - "The empty pattern `\"\"` and very long all-`*` patterns were kept observation-only to avoid coupling the main oracle to low-value stress cases."
+- 'This entry records a narrow FIELD-tokenized boundary subset: `*`, `**`, `???`, `%`, and `_`.'
+- Local validation showed `%` and `_` behave as literal characters rather than SQL wildcards on the installed stack.
+- Empty-pattern and very-long all-`*` probes are kept observation-only and are not promoted into the main randomized subset.
 verify_status: edge_validated
-observed_summary: "On local Weaviate v1.36.10 with the installed Python client, `like_boundary_operator.py` validated a deterministic FIELD-tokenized Like boundary subset. `like(\"*\")` and `like(\"**\")` matched all present rows, including the explicit empty-string row. `like(\"???\")` matched exactly the 3-character row. `like(\"%\")` and `like(\"_\")` matched only literal `%` and `_` rows, confirming that the local engine did not treat them as SQL wildcards. Observation-only checks showed `like(\"\")` matched the explicit empty-string row and a very long all-`*` pattern behaved like a universal wildcard."
+observed_summary: On local Weaviate v1.36.10 with the installed Python client, `like_boundary_operator.py` validated a deterministic FIELD-tokenized Like boundary subset. `like("*")` and `like("**")` matched all present rows, including the explicit empty-string row. `like("???")` matched exactly the 3-character row. `like("%")` and `like("_")` matched only literal `%` and `_` rows, confirming that the local engine did not treat them as SQL wildcards. Observation-only checks showed `like("")` matched the explicit empty-string row and a very long all-`*` pattern behaved like a universal wildcard.
 oracle_support:
-  - pandas
-  - rest-filter
-case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/like_boundary_operator.py"
-oracle_mapping: "The main Weaviate oracle now includes a low-rate FIELD-text Like boundary subset built on `*`, `**`, `???`, `%`, and `_`. pandas / REST mask evaluation uses literal-regex translation where only `*` and `?` are treated as wildcards. Empty-pattern and very-long-pattern behavior remains outside the main randomized subset and is preserved only as an operator-test observation. This is our validated local oracle subset, not an exhaustive Like corpus."
+- pandas
+case_refs:
+- like_star_matches_all_present
+- like_double_star_matches_all_present
+- like_three_question_exact_length
+- like_percent_is_literal
+- like_underscore_is_literal
+repro_path: operator_test/weaviate/like_boundary_operator.py
+oracle_mapping: The pandas oracle translates the validated `Like` subset into deterministic regex-style masks where only `*` and `?` are treated as wildcards, while `%` and `_` remain literal characters. REST filter mode reuses the same mask semantics, and empty-pattern / very-long-pattern behavior remains outside the randomized mainline.

@@ -1,28 +1,28 @@
 operator_id: by_creation_time
 family: metadata_filter
 syntax_examples:
-  - 'Filter.by_creation_time().greater_than(datetime(2024, 1, 1, tzinfo=timezone.utc))'
-  - 'Filter.by_creation_time().contains_any([created_at_a, created_at_b])'
-  - 'where: { path: ["_creationTimeUnix"], operator: GreaterThan, valueDate: "2024-01-01T00:00:00+00:00" }'
-doc_status: metadata_entry_documented
+- Filter.by_creation_time().greater_than(datetime(2024, 1, 1, tzinfo=timezone.utc))
+- Filter.by_creation_time().contains_any([created_at_a, created_at_b])
+- 'where: { path: ["_creationTimeUnix"], operator: GreaterThan, valueDate: "2024-01-01T00:00:00+00:00" }'
+doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/filters"
-  - "https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index"
-  - "https://weaviate-python-client.readthedocs.io/en/stable/weaviate.collections.classes.html"
+- https://docs.weaviate.io/weaviate/search/filters
+- https://docs.weaviate.io/weaviate/config-refs/indexing/inverted-index
+- https://weaviate-python-client.readthedocs.io/en/stable/weaviate.collections.classes.html
 doc_supported_types:
-  - metadata_timestamp
-doc_semantics: "by_creation_time is a documented metadata-filter entry point for filtering objects by their Weaviate creation timestamp rather than by a user-defined schema property. The checked filters guide documents creation-time metadata filtering through the `_creationTimeUnix` path and Python-client `Filter.by_creation_time()`, and the checked inverted-index reference states that timestamp filtering requires `indexTimestamps` to be enabled."
+- metadata_field
+doc_semantics: by_creation_time is a documented metadata-filter entry point for filtering objects by their Weaviate creation timestamp rather than by a user-defined schema property. The checked filters guide documents creation-time metadata filtering through the `_creationTimeUnix` path and Python-client `Filter.by_creation_time()`, and the checked inverted-index reference states that timestamp filtering requires `indexTimestamps` to be enabled.
 doc_notes:
-  - "The checked filters guide places creation-time filtering under metadata filters and shows Python-client and GraphQL examples for creation-time comparisons."
-  - "The checked inverted-index reference says `indexTimestamps=true` indexes object timestamps and enables filtering by object creation and update timestamps."
-  - "The checked official Python-client API docs expose `Filter.by_creation_time()` as a creation-time metadata filter entry point, with time comparison and membership-style methods inherited from the time-filter helper."
-  - "The checked docs do not provide a creation-time-specific truth table for equality precision, timestamp timezone normalization, valid absent timestamps, or empty timestamp lists."
-  - "This record treats `by_creation_time` as a metadata filter entry point, not as a core scalar property operator."
+- The checked filters guide places creation-time filtering under metadata filters and shows Python-client and GraphQL examples for creation-time comparisons.
+- The checked inverted-index reference says `indexTimestamps=true` indexes object timestamps and enables filtering by object creation and update timestamps.
+- The checked official Python-client API docs expose `Filter.by_creation_time()` as a creation-time metadata filter entry point, with time comparison and membership-style methods inherited from the time-filter helper.
+- The checked docs do not provide a creation-time-specific truth table for equality precision, timestamp timezone normalization, valid absent timestamps, or empty timestamp lists.
+- This record treats `by_creation_time` as a metadata filter entry point, not as a core scalar property operator.
 verify_status: edge_validated
-observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `by_creation_time_operator.py` validated the current subset on a temporary collection with server-returned creation-time metadata. Exact equality, `not_equal`, range comparisons, `contains_any`, and `contains_none` matched the expected sets over UTC-normalized metadata timestamps. Creation-time filtering worked independently of ordinary property `index_filterable` settings and composed cleanly with ordinary property filters. Focused oracle, PQS, and equivalence regressions exercised generated `creation_time` predicates after the fuzzer was updated to sync server-returned creation timestamps before oracle generation. One whole-oracle run still reproduced the pre-existing `within_geo_range(... <= 0.0m)` boundary mismatch, so that failure is not claimed as a `by_creation_time` defect. No standalone `by_creation_time` engine bug was reproduced."
+observed_summary: On local Weaviate v1.36.5 with weaviate-client 4.20.1, `by_creation_time_operator.py` validated the current subset on a temporary collection with server-returned creation-time metadata. Exact equality, `not_equal`, range comparisons, `contains_any`, and `contains_none` matched the expected sets over UTC-normalized metadata timestamps. Creation-time filtering worked independently of ordinary property `index_filterable` settings and composed cleanly with ordinary property filters. Focused oracle, PQS, and equivalence regressions exercised generated `creation_time` predicates after the fuzzer was updated to sync server-returned creation timestamps before oracle generation. One whole-oracle run still reproduced the pre-existing `within_geo_range(... <= 0.0m)` boundary mismatch, so that failure is not claimed as a `by_creation_time` defect. No standalone `by_creation_time` engine bug was reproduced.
 oracle_support:
-  - pandas
-  - pqs
+- pandas
+- pqs
 case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/by_creation_time_operator.py"
-oracle_mapping: "Current fuzzer treats `by_creation_time` as metadata over a synced dataframe `_creation_time` column populated from server-returned object metadata. pandas maps `equal`, `not_equal`, `less_than`, `less_or_equal`, `greater_than`, `greater_or_equal`, `contains_any`, and `contains_none` to UTC-normalized timestamp equality, ordering, membership, and non-membership over that column. PQS uses pivot-true creation-time predicates based on the pivot row's synced timestamp plus absent future timestamps. Oracle and equivalence modes generate the same timestamp subset through the normal atomic filter generator. Locally generated timestamps are valid timezone-aware datetimes; empty timestamp lists, invalid timestamp values, unsynced metadata, GraphQL-path generation, delete semantics, and `by_update_time` behavior are not claimed. This is our oracle assumption, not an official claim."
+repro_path: /home/caihao/compare_test/operator_test/weaviate/by_creation_time_operator.py
+oracle_mapping: Current fuzzer treats `by_creation_time` as metadata over a synced dataframe `_creation_time` column populated from server-returned object metadata. pandas maps `equal`, `not_equal`, `less_than`, `less_or_equal`, `greater_than`, `greater_or_equal`, `contains_any`, and `contains_none` to UTC-normalized timestamp equality, ordering, membership, and non-membership over that column. PQS uses pivot-true creation-time predicates based on the pivot row's synced timestamp plus absent future timestamps. Oracle and equivalence modes generate the same timestamp subset through the normal atomic filter generator. Locally generated timestamps are valid timezone-aware datetimes; empty timestamp lists, invalid timestamp values, unsynced metadata, GraphQL-path generation, delete semantics, and `by_update_time` behavior are not claimed. This is our oracle assumption, not an official claim.

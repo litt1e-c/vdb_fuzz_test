@@ -1,0 +1,30 @@
+operator_id: like_compound
+family: text_search
+syntax_examples:
+- Filter.not_(Filter.by_property("textVal").like("???"))
+- Filter.by_property("textVal").like("Al*") & Filter.by_property("textVal").contains_none(["Alpha"])
+- Filter.by_property("textVal").like("Al*") & Filter.not_(Filter.by_property("textVal").contains_none(["Alpha"]))
+doc_status: family_documented
+doc_source_urls:
+- https://docs.weaviate.io/weaviate/search/filters
+- https://docs.weaviate.io/weaviate/api/graphql/filters
+doc_supported_types:
+- scalar_text
+doc_semantics: The official filter docs describe `Like` wildcard semantics on text and document generic boolean filter composition, but they do not explicitly specify the particular `Like`-compound subset recorded here.
+doc_notes:
+- 'Validated cases intentionally focus on combinations that are both commonly meaningful and implementation-sensitive: `NOT(like(...))`, `like(...) AND contains_none([...])`, `like(...) AND NOT(contains_none([...]))`, and `like("*") OR is_null(true)`.'
+- The local semantics matter for oracle modeling because `Like` itself does not match missing rows, but negating a `Like` filter includes the missing row under the local denylist semantics.
+- This YAML builds on the earlier `like_boundary.yaml`; it does not replace it.
+verify_status: edge_validated
+observed_summary: On local Weaviate v1.36.10, `like_compound_operator.py` validated deeper FIELD-text `Like` compositions. `NOT(like("???"))` excluded only the 3-character row and included the missing-text row. `like("Al*") AND contains_none(["Alpha"])` kept only the non-Alpha `Al*` row, while `like("Al*") AND NOT(contains_none(["Alpha"]))` isolated the Alpha row. `like("*") OR is_null(true)` returned all rows including the missing-text row. `NOT(like("%"))` excluded only the literal-`%` row and included the missing-text row.
+oracle_support:
+- pandas
+- pqs
+case_refs:
+- not_like_three_question_includes_missing
+- like_prefix_and_contains_none_other
+- like_prefix_and_not_contains_none_self
+- like_star_or_null
+- not_like_percent_includes_missing
+repro_path: operator_test/weaviate/like_compound_operator.py
+oracle_mapping: The pandas oracle combines the validated `Like` mask with explicit boolean-mask composition so that positive `like(...)` excludes missing rows while `NOT(like(...))` includes them again on the negated side. PQS only emits pivot-true compounds from this checked subset, and REST mode reuses the same pandas-side truth conditions.

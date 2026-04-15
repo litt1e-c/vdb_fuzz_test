@@ -1,28 +1,30 @@
 operator_id: by_id
 family: metadata_filter
 syntax_examples:
-  - 'Filter.by_id().equal("8f7f4f6d-0000-0000-0000-000000000001")'
-  - 'Filter.by_id().contains_any(["8f7f4f6d-0000-0000-0000-000000000001", "8f7f4f6d-0000-0000-0000-000000000002"])'
-  - 'where: { path: ["id"], operator: Equal, valueText: "8f7f4f6d-0000-0000-0000-000000000001" }'
-doc_status: metadata_entry_documented
+- Filter.by_id().equal("8f7f4f6d-0000-0000-0000-000000000001")
+- Filter.by_id().contains_any(["8f7f4f6d-0000-0000-0000-000000000001", "8f7f4f6d-0000-0000-0000-000000000002"])
+- 'where: { path: ["id"], operator: Equal, valueText: "8f7f4f6d-0000-0000-0000-000000000001" }'
+doc_status: operator_documented
 doc_source_urls:
-  - "https://docs.weaviate.io/weaviate/search/filters"
-  - "https://weaviate-python-client.readthedocs.io/en/stable/weaviate.collections.classes.html"
+- https://docs.weaviate.io/weaviate/search/filters
+- https://weaviate-python-client.readthedocs.io/en/stable/weaviate.collections.classes.html
 doc_supported_types:
-  - metadata_id
-doc_semantics: "by_id is a documented metadata-filter entry point for matching objects by their Weaviate object UUID rather than by a user-defined schema property. The checked filters guide documents object-id filtering through metadata path `id`, and the checked official Python client docs expose `equal`, `not_equal`, `contains_any`, and `contains_none` on `Filter.by_id()`."
+- scalar_uuid
+- metadata_field
+doc_semantics: by_id is a documented metadata-filter entry point for matching objects by their Weaviate object UUID rather than by a user-defined schema property. The checked filters guide documents object-id filtering through metadata path `id`, and the checked official Python client docs expose `equal`, `not_equal`, `contains_any`, and `contains_none` on `Filter.by_id()`.
 doc_notes:
-  - "The checked filters guide documents filtering by object id as metadata, including Python-client `Filter.by_id().equal(...)` and GraphQL `path: [\"id\"]` examples."
-  - "The checked official Python-client API docs list `equal`, `not_equal`, `contains_any`, and `contains_none` for `Filter.by_id()`."
-  - "The checked filters guide documents boolean composition of filters, so metadata-id filters can be combined with `AND`, `OR`, and `NOT`."
-  - "The checked docs do not provide an id-specific null or missing-property truth table; in normal query results every object has a UUID."
-  - "The checked docs do not provide id-specific truth tables for valid-but-absent UUID values or for empty UUID lists."
-  - "This record treats `by_id` as a metadata filter entry point, not as a core scalar property operator."
+- 'The checked filters guide documents filtering by object id as metadata, including Python-client `Filter.by_id().equal(...)` and GraphQL `path: ["id"]` examples.'
+- The checked official Python-client API docs list `equal`, `not_equal`, `contains_any`, and `contains_none` for `Filter.by_id()`.
+- The checked filters guide documents boolean composition of filters, so metadata-id filters can be combined with `AND`, `OR`, and `NOT`.
+- The checked docs do not provide an id-specific null or missing-property truth table; in normal query results every object has a UUID.
+- The checked docs do not provide id-specific truth tables for valid-but-absent UUID values or for empty UUID lists.
+- This record treats `by_id` as a metadata filter entry point, not as a core scalar property operator.
 verify_status: edge_validated
-observed_summary: "On local Weaviate v1.36.5 with weaviate-client 4.20.1, `by_id_operator.py` validated the current query subset on a temporary collection with deterministic UUIDs: `equal(existing_uuid)` returned the single matching row, `equal(absent_uuid)` returned no rows, `contains_any([...])` matched UUID membership and ignored absent-UUID noise, `NOT(by_id.contains_any([existing_uuid]))` returned the complement set, `NOT(by_id.contains_any([absent_uuid]))` returned all rows, `not_equal(existing_uuid)` excluded exactly that row, `not_equal(absent_uuid)` returned all rows, `contains_none([...])` matched UUID non-membership, `contains_none([absent_uuid])` returned all rows, and `by_id` composed cleanly with a normal property filter. Full oracle/PQS runs exercised `id ==`, `id !=`, `id contains_any`, and `id contains_none`. No standalone `by_id` engine bug was reproduced in this round. Two later whole-oracle seeds still exposed pre-existing composite mismatches dominated by `within_geo_range`, so those failures are not claimed as `by_id` defects."
+observed_summary: 'On local Weaviate v1.36.5 with weaviate-client 4.20.1, `by_id_operator.py` validated the current query subset on a temporary collection with deterministic UUIDs: `equal(existing_uuid)` returned the single matching row, `equal(absent_uuid)` returned no rows, `contains_any([...])` matched UUID membership and ignored absent-UUID noise, `NOT(by_id.contains_any([existing_uuid]))` returned the complement set, `NOT(by_id.contains_any([absent_uuid]))` returned all rows, `not_equal(existing_uuid)` excluded exactly that row, `not_equal(absent_uuid)` returned all rows, `contains_none([...])` matched UUID non-membership, `contains_none([absent_uuid])` returned all rows, and `by_id` composed cleanly with a normal property filter. Full oracle/PQS runs exercised `id ==`, `id !=`, `id contains_any`, and `id contains_none`. No standalone `by_id` engine bug was reproduced in this round. Two later whole-oracle seeds still exposed pre-existing composite mismatches dominated by `within_geo_range`,
+  so those failures are not claimed as `by_id` defects.'
 oracle_support:
-  - pandas
-  - pqs
+- pandas
+- pqs
 case_refs: []
-repro_path: "/home/caihao/compare_test/operator_test/weaviate/by_id_operator.py"
-oracle_mapping: "Current fuzzer treats `by_id` as metadata over the dataframe `id` column, not as a schema-property operator. pandas maps `equal` and `not_equal` to UUID equality and inequality, maps `contains_any` and `contains_none` to non-empty UUID-list membership and non-membership, and composes `NOT` through normal boolean mask negation. Generated UUID inputs are valid strings; object ids are assumed present and non-null in the dataframe; valid absent UUIDs are modeled as non-matching for `equal` and `contains_any`, and as harmless noise for `not_equal` and `contains_none`. PQS currently uses pivot-true `equal`, `contains_any`, `not_equal(absent_uuid)`, and `contains_none([absent_uuid])`. Empty UUID lists, invalid UUID syntax, GraphQL-path generation, and delete semantics are not claimed. This is our oracle assumption, not an official claim."
+repro_path: /home/caihao/compare_test/operator_test/weaviate/by_id_operator.py
+oracle_mapping: Current fuzzer treats `by_id` as metadata over the dataframe `id` column, not as a schema-property operator. pandas maps `equal` and `not_equal` to UUID equality and inequality, maps `contains_any` and `contains_none` to non-empty UUID-list membership and non-membership, and composes `NOT` through normal boolean mask negation. Generated UUID inputs are valid strings; object ids are assumed present and non-null in the dataframe; valid absent UUIDs are modeled as non-matching for `equal` and `contains_any`, and as harmless noise for `not_equal` and `contains_none`. PQS currently uses pivot-true `equal`, `contains_any`, `not_equal(absent_uuid)`, and `contains_none([absent_uuid])`. Empty UUID lists, invalid UUID syntax, GraphQL-path generation, and delete semantics are not claimed. This is our oracle assumption, not an official claim.
