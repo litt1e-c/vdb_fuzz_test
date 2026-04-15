@@ -778,6 +778,31 @@ def build_timeline_row(
     }
 
 
+def build_timeline_baseline_row(*, suite_seed: int | None) -> dict:
+    return {
+        "case_index": 0,
+        "cycle": 0,
+        "case_name": "baseline",
+        "mode": "baseline",
+        "seed": suite_seed if suite_seed is not None else "",
+        "rows": 0,
+        "rounds": 0,
+        "passed": True,
+        "case_elapsed_seconds": 0.0,
+        "suite_elapsed_seconds": 0.0,
+        "overall_coverage_percent": 0.0,
+        "overall_covered_statements": 0,
+        "overall_total_statements": 0,
+        "scalar_coverage_percent": 0.0,
+        "scalar_covered_statements": 0,
+        "scalar_total_statements": 0,
+        "snapshot_dir": "",
+        "cov_inputs": "",
+        "coverage_available": False,
+        "coverage_detail": "synthetic zero baseline",
+    }
+
+
 def collect_covdata(
     go_bin: str,
     cov_inputs: str,
@@ -1021,6 +1046,8 @@ def write_summary_markdown(
         lines.append(f"- Snapshots: `{coverage_timeline.get('snapshots', 0)}`")
         lines.append(f"- CSV: `{coverage_timeline.get('csv_path')}`")
         lines.append(f"- JSONL: `{coverage_timeline.get('jsonl_path')}`")
+        lines.append("- Timeline includes a synthetic zero-coverage baseline row before the first completed case.")
+        lines.append("- The first non-baseline point is cumulative coverage after case #1, not an initial empty-server measurement.")
         lines.append(
             "- Note: timeline mode restarts the coverage-enabled server per case so Go coverage counters are flushed "
             "before each cumulative snapshot."
@@ -1347,6 +1374,9 @@ def main() -> int:
     completed_cov_dirs: list[Path] = []
     suite_start = time.time()
     launched_server = False
+
+    if args.coverage_timeline:
+        coverage_timeline_rows.append(build_timeline_baseline_row(suite_seed=args.suite_seed))
 
     try:
         if args.reuse_running_server:

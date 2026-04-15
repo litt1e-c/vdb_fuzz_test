@@ -3488,6 +3488,76 @@ class OracleQueryGenerator:
 
         return series.apply(comp)
 
+    def _scalar_cmp_query_value(self, ftype, value):
+        if ftype == FieldType.INT:
+            return int(value)
+        if ftype == FieldType.NUMBER:
+            return float(value)
+        if ftype == FieldType.BOOL:
+            return bool(value)
+        if ftype == FieldType.TEXT:
+            return str(value)
+        if ftype == FieldType.DATE:
+            ts = to_utc_timestamp(value)
+            return ts.to_pydatetime() if ts is not None else None
+        return value
+
+    def _scalar_cmp_mask(self, series, ftype, op, target):
+        if ftype == FieldType.DATE:
+            mask = self._date_cmp_mask(series, op, target)
+            if op == "!=":
+                return self._normalize_mask(mask) | self._normalize_mask(self._effective_null_mask(series, ftype))
+            return self._normalize_mask(mask)
+
+        def compare(value):
+            if self._is_effectively_null_value(value, ftype):
+                return op == "!="
+            try:
+                left = int(value) if ftype == FieldType.INT else (
+                    float(value) if ftype == FieldType.NUMBER else (
+                        bool(value) if ftype == FieldType.BOOL else str(value)
+                    )
+                )
+                right = int(target) if ftype == FieldType.INT else (
+                    float(target) if ftype == FieldType.NUMBER else (
+                        bool(target) if ftype == FieldType.BOOL else str(target)
+                    )
+                )
+                if op == "==":
+                    return left == right
+                if op == "!=":
+                    return left != right
+                if op == ">":
+                    return left > right
+                if op == "<":
+                    return left < right
+                if op == ">=":
+                    return left >= right
+                if op == "<=":
+                    return left <= right
+            except Exception:
+                return False
+            return False
+
+        return self._normalize_mask(series.apply(compare))
+
+    def _build_scalar_cmp_filter_clause(self, name, ftype, op, target):
+        query_value = self._scalar_cmp_query_value(ftype, target)
+        if ftype == FieldType.DATE and query_value is None:
+            return None, None, None
+        method = {
+            "==": "equal",
+            "!=": "not_equal",
+            ">": "greater_than",
+            "<": "less_than",
+            ">=": "greater_or_equal",
+            "<=": "less_or_equal",
+        }[op]
+        fc = getattr(Filter.by_property(name), method)(query_value)
+        mask = self._scalar_cmp_mask(self.df[name], ftype, op, target)
+        display_value = canonicalize_date_string(target) if ftype == FieldType.DATE else target
+        return fc, mask, f"{name} {op} {display_value}"
+
     def _scalar_contains_expr_value(self, ftype, value):
         if ftype == FieldType.INT:
             return int(value)
@@ -3616,6 +3686,95 @@ class OracleQueryGenerator:
                 [pd.Timedelta(days=7), -pd.Timedelta(days=7), pd.Timedelta(seconds=1), -pd.Timedelta(seconds=1)]
             )
         return None
+
+    def gen_scalar_core_compound_expr(self):
+        candidates = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE)]
+        random.shuffle(candidates)
+        for field in candidates:
+            name, ftype = field["name"], field["type"]
+            series = self.df[name]
+
+            if ftype in (FieldType.INT, FieldType.NUMBER, FieldType.DATE):
+                pivot = self.get_value_for_query(name, ftype)
+                if pivot is None:
+                    continue
+                strategies = ["ge_and_not_lt", "le_and_not_gt", "closed_range"]
+                strategy = random.choice(strategies)
+
+                if strategy == "ge_and_not_lt":
+                    ge_filter, ge_mask, ge_expr = self._build_scalar_cmp_filter_clause(name, ftype, ">=", pivot)
+                    lt_filter, lt_mask, lt_expr = self._build_scalar_cmp_filter_clause(name, ftype, "<", pivot)
+                    if ge_filter is None or lt_filter is None:
+                        continue
+                    return (
+                        ge_filter & Filter.not_(lt_filter),
+                        self._normalize_mask(ge_mask) & self._apply_not_mask(lt_mask),
+                        f"({ge_expr} AND NOT({lt_expr}))",
+                    )
+
+                if strategy == "le_and_not_gt":
+                    le_filter, le_mask, le_expr = self._build_scalar_cmp_filter_clause(name, ftype, "<=", pivot)
+                    gt_filter, gt_mask, gt_expr = self._build_scalar_cmp_filter_clause(name, ftype, ">", pivot)
+                    if le_filter is None or gt_filter is None:
+                        continue
+                    return (
+                        le_filter & Filter.not_(gt_filter),
+                        self._normalize_mask(le_mask) & self._apply_not_mask(gt_mask),
+                        f"({le_expr} AND NOT({gt_expr}))",
+                    )
+
+                other = self.get_value_for_query(name, ftype)
+                if other is None:
+                    continue
+                if ftype == FieldType.INT:
+                    lo, hi = sorted([int(pivot), int(other)])
+                elif ftype == FieldType.NUMBER:
+                    lo, hi = sorted([float(pivot), float(other)])
+                else:
+                    lo_ts = to_utc_timestamp(pivot)
+                    hi_ts = to_utc_timestamp(other)
+                    if lo_ts is None or hi_ts is None:
+                        continue
+                    lo, hi = sorted([lo_ts, hi_ts])
+                ge_filter, ge_mask, ge_expr = self._build_scalar_cmp_filter_clause(name, ftype, ">=", lo)
+                le_filter, le_mask, le_expr = self._build_scalar_cmp_filter_clause(name, ftype, "<=", hi)
+                if ge_filter is None or le_filter is None:
+                    continue
+                return (
+                    ge_filter & le_filter,
+                    self._normalize_mask(ge_mask) & self._normalize_mask(le_mask),
+                    f"({ge_expr} AND {le_expr})",
+                )
+
+            if ftype == FieldType.BOOL:
+                pivot = self.get_value_for_query(name, ftype)
+                if pivot is None:
+                    continue
+                pivot = bool(pivot)
+                eq_filter, eq_mask, eq_expr = self._build_scalar_cmp_filter_clause(name, ftype, "==", pivot)
+                opp_filter, opp_mask, opp_expr = self._build_scalar_cmp_filter_clause(name, ftype, "==", not pivot)
+                if eq_filter is None or opp_filter is None:
+                    continue
+                return (
+                    eq_filter & Filter.not_(opp_filter),
+                    self._normalize_mask(eq_mask) & self._apply_not_mask(opp_mask),
+                    f"({eq_expr} AND NOT({opp_expr}))",
+                )
+
+            pivot = self.get_value_for_query(name, ftype)
+            if pivot is None:
+                continue
+            eq_filter, eq_mask, eq_expr = self._build_scalar_cmp_filter_clause(name, ftype, "==", pivot)
+            neq_filter, neq_mask, neq_expr = self._build_scalar_cmp_filter_clause(name, ftype, "!=", pivot)
+            if eq_filter is None or neq_filter is None:
+                continue
+            return (
+                eq_filter & Filter.not_(neq_filter),
+                self._normalize_mask(eq_mask) & self._apply_not_mask(neq_mask),
+                f"({eq_expr} AND NOT({neq_expr}))",
+            )
+
+        return None, None, None
 
     def gen_scalar_contains_compound_expr(self):
         candidates = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.DATE)]
@@ -4347,6 +4506,130 @@ class OracleQueryGenerator:
             item_type = rest_array_item_type(ftype)
             mask = array_membership_mask(series, item_type, targets, "contains_none")
             return fc, mask, f"{fname} contains_none {targets}"
+
+    def _build_array_contains_filter_clause(self, name, ftype, series, mode, targets):
+        item_type = rest_array_item_type(ftype)
+        if item_type is None:
+            return None, None, None
+
+        expr_targets = [self._convert_to_native(target) for target in targets]
+        if item_type == FieldType.DATE:
+            expr_targets = [canonicalize_date_string(target) or str(target) for target in expr_targets]
+            filter_targets = []
+            for target in expr_targets:
+                ts = pd.Timestamp(target)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                filter_targets.append(ts.to_pydatetime())
+        else:
+            filter_targets = expr_targets
+
+        fc = getattr(Filter.by_property(name), mode)(filter_targets)
+        mask = array_membership_mask(series, item_type, expr_targets, mode)
+        return fc, self._normalize_mask(mask), f"{name} {mode} {expr_targets}"
+
+    def gen_array_contains_compound_expr(self):
+        arr_fields = [
+            f for f in self.schema
+            if f["type"] in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY, FieldType.DATE_ARRAY]
+        ]
+        if not arr_fields:
+            return None, None, None
+
+        field = random.choice(arr_fields)
+        fname, ftype = field["name"], field["type"]
+        series = self.df[fname]
+        arrays = [arr for arr in series.dropna().tolist() if isinstance(arr, list) and len(arr) > 0]
+        if not arrays:
+            return None, None, None
+
+        unique_items = stable_unique_values([item for arr in arrays for item in arr])
+        if not unique_items:
+            return None, None, None
+
+        strategies = ["contains_any_and_not_none_self", "contains_any_or_null"]
+        if len(unique_items) >= 2:
+            strategies.append("contains_any_and_none_other")
+        if any(len(stable_unique_values(arr)) >= 2 for arr in arrays):
+            strategies.append("contains_all_and_not_none_self")
+
+        strategy = random.choice(strategies)
+
+        if strategy == "contains_any_or_null":
+            sample_size = min(len(unique_items), random.choice([1, 1, 2]))
+            targets = random.sample(unique_items, sample_size)
+            contains_any_filter, contains_any_mask, contains_any_expr = self._build_array_contains_filter_clause(
+                fname, ftype, series, "contains_any", targets
+            )
+            if contains_any_filter is None:
+                return None, None, None
+            null_filter = Filter.by_property(fname).is_none(True)
+            null_mask = self._effective_null_mask(series, ftype)
+            return (
+                contains_any_filter | null_filter,
+                self._normalize_mask(contains_any_mask) | self._normalize_mask(null_mask),
+                f"({contains_any_expr} OR {fname} is null)",
+            )
+
+        if strategy == "contains_all_and_not_none_self":
+            candidate_arrays = [
+                arr for arr in arrays
+                if len(stable_unique_values(arr)) >= 2
+            ]
+            if not candidate_arrays:
+                return None, None, None
+            picked = stable_unique_values(random.choice(candidate_arrays))
+            targets = picked[: min(len(picked), random.choice([1, 2]))]
+            contains_all_filter, contains_all_mask, contains_all_expr = self._build_array_contains_filter_clause(
+                fname, ftype, series, "contains_all", targets
+            )
+            contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
+                fname, ftype, series, "contains_none", targets
+            )
+            if contains_all_filter is None or contains_none_filter is None:
+                return None, None, None
+            return (
+                contains_all_filter & Filter.not_(contains_none_filter),
+                self._normalize_mask(contains_all_mask) & self._apply_not_mask(contains_none_mask),
+                f"({contains_all_expr} AND NOT({contains_none_expr}))",
+            )
+
+        sample_size = min(len(unique_items), random.choice([1, 1, 2]))
+        hit_targets = random.sample(unique_items, sample_size)
+        contains_any_filter, contains_any_mask, contains_any_expr = self._build_array_contains_filter_clause(
+            fname, ftype, series, "contains_any", hit_targets
+        )
+        if contains_any_filter is None:
+            return None, None, None
+
+        if strategy == "contains_any_and_not_none_self":
+            contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
+                fname, ftype, series, "contains_none", hit_targets
+            )
+            if contains_none_filter is None:
+                return None, None, None
+            return (
+                contains_any_filter & Filter.not_(contains_none_filter),
+                self._normalize_mask(contains_any_mask) & self._apply_not_mask(contains_none_mask),
+                f"({contains_any_expr} AND NOT({contains_none_expr}))",
+            )
+
+        contrast_pool = [item for item in unique_items if item not in hit_targets]
+        if not contrast_pool:
+            return None, None, None
+        contrast_targets = random.sample(contrast_pool, min(len(contrast_pool), random.choice([1, 1, 2])))
+        contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
+            fname, ftype, series, "contains_none", contrast_targets
+        )
+        if contains_none_filter is None:
+            return None, None, None
+        return (
+            contains_any_filter & contains_none_filter,
+            self._normalize_mask(contains_any_mask) & self._normalize_mask(contains_none_mask),
+            f"({contains_any_expr} AND {contains_none_expr})",
+        )
 
     def gen_geo_expr(self):
         if not self.geo_schema:
@@ -5332,75 +5615,182 @@ class OracleQueryGenerator:
             normalized.apply(lambda x: True if pd.isna(x) else not bool(x))
         )
 
-    def gen_complex_expr(self, depth):
-        leaf_cutoff = 0.12 if self._inverted_profile else 0.20
-        if depth == 0 or random.random() < leaf_cutoff:
+    def _complex_expr_atom_budget(self, depth):
+        depth = max(1, int(depth))
+        if self._inverted_profile:
+            low = max(6, depth + 4)
+            high = max(low, min(28, depth * 2 + 4))
+        else:
+            low = max(4, depth + 2)
+            high = max(low, min(20, depth * 2 + 2))
+        return random.randint(low, high)
+
+    def _complex_expr_leaf(self):
+        for _ in range(10):
             r = random.random()
             if r < 0.08:
                 res = self.gen_like_compound_expr()
                 if res[0] is not None:
-                    return self._finalize_expr(*res)
-            elif r < 0.18:
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            elif r < 0.22:
+                res = self.gen_scalar_core_compound_expr()
+                if res[0] is not None:
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            elif r < 0.32:
                 res = self.gen_scalar_contains_compound_expr()
                 if res[0] is not None:
-                    return self._finalize_expr(*res)
-            elif r < 0.22:
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            elif r < 0.36:
+                res = self.gen_array_contains_compound_expr()
+                if res[0] is not None:
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            elif r < 0.40:
                 res = self.gen_constant_expr()
                 if res[0]:
-                    return self._finalize_expr(*res)
-            elif r < 0.40:
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            elif r < 0.56:
                 res = self.gen_boundary_expr()
                 if res[0] is not None:
-                    return self._finalize_expr(*res)
-            elif r < 0.46 and self.array_schema:
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            elif r < 0.60 and self.array_schema:
                 res = self.gen_multi_array_expr()
                 if res[0] is not None:
-                    return self._finalize_expr(*res)
-            elif r < 0.60:
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            elif r < 0.74:
                 res = self.gen_not_expr()
                 if res[0] is not None:
-                    return self._finalize_expr(*res)
-            elif r < 0.63:
+                    return (*self._finalize_expr(*res), {"depth": 1, "atoms": 1})
+            elif r < 0.78:
                 res = self.gen_nested_object_expr()
                 if res[0] is not None:
-                    return self._finalize_expr(*res)
-            fc, m, e = self.gen_atomic_expr()
-            if fc:
-                return self._finalize_expr(fc, m, e)
-            return self.gen_complex_expr(depth)
+                    return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+            fc, mask, expr = self.gen_atomic_expr()
+            if fc is not None:
+                return (*self._finalize_expr(fc, mask, expr), {"depth": 0, "atoms": 1})
 
-        # Recursive branch: AND (40%), OR (40%), NOT (20%)
-        # gen_complex_expr: random.choices(["and","or","not"], weights=[0.4,0.4,0.2])
-        branch_weights = [0.44, 0.38, 0.18] if self._inverted_profile else [0.4, 0.4, 0.2]
-        op = random.choices(["and", "or", "not"], weights=branch_weights, k=1)[0]
+        res = self.gen_constant_expr()
+        if res[0]:
+            return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
+        return None, None, "EMPTY", {"depth": 0, "atoms": 0}
 
-        if op == "not":
-            # NOT branch: negate one sub-expression
-            # 30% chance: use dedicated gen_not_expr for more targeted NOT patterns
-            if random.random() < 0.3:
-                not_res = self.gen_not_expr()
-                if not_res[0] is not None:
-                    return self._finalize_expr(*not_res)
+    def _split_complex_expr_budget(self, depth, atom_budget):
+        atom_budget = max(2, int(atom_budget))
+        if depth > 4:
+            side_cap = min((4 if self._inverted_profile else 3), atom_budget - 1)
+            side_atoms = random.randint(1, max(1, side_cap))
+            deep_atoms = max(1, atom_budget - side_atoms)
+            if random.random() < 0.5:
+                return deep_atoms, side_atoms
+            return side_atoms, deep_atoms
 
-            # Otherwise: recursively generate and negate
-            fl, ml, el = self.gen_complex_expr(depth - 1)
+        left_atoms = max(1, atom_budget // 2)
+        right_atoms = max(1, atom_budget - left_atoms)
+        if atom_budget >= 5 and random.random() < 0.45:
+            shift_cap = min(atom_budget // 3, max(0, left_atoms - 1))
+            if shift_cap > 0:
+                shift = random.randint(0, shift_cap)
+                left_atoms -= shift
+                right_atoms += shift
+        if random.random() < 0.5:
+            return left_atoms, right_atoms
+        return right_atoms, left_atoms
+
+    def _split_complex_expr_depths(self, depth):
+        depth = max(1, int(depth))
+        if depth <= 1:
+            return 0, 0
+        if depth > 4:
+            side_depth = random.randint(0, min(2, depth - 2))
+            deep_depth = depth - 1
+            if random.random() < 0.5:
+                return deep_depth, side_depth
+            return side_depth, deep_depth
+
+        left_depth = depth - 1
+        right_depth = max(0, depth - 1 - random.choice([0, 0, 1]))
+        if random.random() < 0.5:
+            return left_depth, right_depth
+        return right_depth, left_depth
+
+    def gen_complex_expr(self, depth, *, atom_budget=None, return_meta=False):
+        target_depth = max(0, int(depth))
+        if atom_budget is None:
+            atom_budget = self._complex_expr_atom_budget(target_depth)
+        atom_budget = max(1, int(atom_budget))
+
+        def rec(remaining_depth, remaining_atoms):
+            remaining_depth = max(0, int(remaining_depth))
+            remaining_atoms = max(1, int(remaining_atoms))
+
+            if remaining_depth >= 8:
+                leaf_cutoff = 0.02 if self._inverted_profile else 0.04
+            elif remaining_depth >= 5:
+                leaf_cutoff = 0.05 if self._inverted_profile else 0.08
+            else:
+                leaf_cutoff = 0.14 if self._inverted_profile else 0.20
+            if remaining_depth <= 2:
+                leaf_cutoff += 0.10
+            if remaining_atoms <= 3:
+                leaf_cutoff += 0.16
+
+            if remaining_depth <= 0 or remaining_atoms <= 1 or random.random() < leaf_cutoff:
+                return self._complex_expr_leaf()
+
+            if remaining_depth > 4 or remaining_atoms > 8:
+                branch_weights = [0.34, 0.24, 0.42] if self._inverted_profile else [0.38, 0.28, 0.34]
+            else:
+                branch_weights = [0.44, 0.36, 0.20] if self._inverted_profile else [0.42, 0.38, 0.20]
+            op = random.choices(["and", "or", "not"], weights=branch_weights, k=1)[0]
+
+            if op == "not":
+                if remaining_depth <= 3 and random.random() < 0.25:
+                    not_res = self.gen_not_expr()
+                    if not_res[0] is not None:
+                        fc, mask, expr = self._finalize_expr(*not_res)
+                        return fc, mask, expr, {"depth": 1, "atoms": 1}
+
+                inner_fc, inner_mask, inner_expr, inner_meta = rec(remaining_depth - 1, max(1, remaining_atoms - 1))
+                if not inner_fc:
+                    return self._complex_expr_leaf()
+                fc_not = Filter.not_(inner_fc)
+                mask_not = self._apply_not_mask(inner_mask)
+                depth_meta = 1 + int((inner_meta or {}).get("depth", 0))
+                atom_meta = int((inner_meta or {}).get("atoms", 1))
+                fc_not, mask_not, expr_not = self._finalize_expr(fc_not, mask_not, f"NOT({inner_expr})")
+                return fc_not, mask_not, expr_not, {"depth": depth_meta, "atoms": atom_meta}
+
+            left_depth, right_depth = self._split_complex_expr_depths(remaining_depth)
+            left_atoms, right_atoms = self._split_complex_expr_budget(remaining_depth, remaining_atoms)
+            fl, ml, el, left_meta = rec(left_depth, left_atoms)
+            fr, mr, er, right_meta = rec(right_depth, right_atoms)
             if not fl:
-                return self.gen_complex_expr(depth)
-            fc_not = Filter.not_(fl)
-            mask_not = self._apply_not_mask(ml)
-            return self._finalize_expr(fc_not, mask_not, f"NOT({el})")
-        else:
-            fl, ml, el = self.gen_complex_expr(depth - 1)
-            fr, mr, er = self.gen_complex_expr(depth - 1)
-            if not fl:
-                return self._finalize_expr(fr, mr, er)
+                return fr, mr, er, right_meta
             if not fr:
-                return self._finalize_expr(fl, ml, el)
+                return fl, ml, el, left_meta
+
             ml = self._normalize_mask(ml)
             mr = self._normalize_mask(mr)
+            depth_meta = 1 + max(
+                int((left_meta or {}).get("depth", 0)),
+                int((right_meta or {}).get("depth", 0)),
+            )
+            atom_meta = int((left_meta or {}).get("atoms", 1)) + int((right_meta or {}).get("atoms", 1))
             if op == "and":
-                return self._finalize_expr(fl & fr, ml & mr, f"({el} AND {er})")
-            return self._finalize_expr(fl | fr, ml | mr, f"({el} OR {er})")
+                fc, mask, expr = self._finalize_expr(fl & fr, ml & mr, f"({el} AND {er})")
+            else:
+                fc, mask, expr = self._finalize_expr(fl | fr, ml | mr, f"({el} OR {er})")
+            return fc, mask, expr, {"depth": depth_meta, "atoms": atom_meta}
+
+        fc, mask, expr, meta = rec(target_depth, atom_budget)
+        meta = dict(meta or {})
+        meta.setdefault("depth", 0)
+        meta.setdefault("atoms", 0 if fc is None else 1)
+        meta["target_depth"] = target_depth
+        meta["target_atoms"] = atom_budget
+
+        if return_meta:
+            return fc, mask, expr, meta
+        return fc, mask, expr
 
 
 def rest_array_item_type(ftype):
@@ -6556,6 +6946,7 @@ GRAPHQL_PROBE_PROPERTIES = [
     Property(name="bucket", data_type=DataType.INT, index_filterable=True, index_range_filters=True),
     Property(name="flag", data_type=DataType.BOOL, index_filterable=True),
     Property(name="score", data_type=DataType.NUMBER, index_filterable=True, index_range_filters=True),
+    Property(name="eventTs", data_type=DataType.DATE, index_filterable=True, index_range_filters=True),
     Property(
         name="body",
         data_type=DataType.TEXT,
@@ -6572,6 +6963,7 @@ GRAPHQL_PROBE_FIXTURE = [
         "bucket": 0,
         "flag": True,
         "score": 1.0,
+        "eventTs": "2024-01-01T00:00:00Z",
         "body": "nebula anchor apple red",
         "nullableText": "red",
         "textArr": ["red", "alpha"],
@@ -6582,6 +6974,7 @@ GRAPHQL_PROBE_FIXTURE = [
         "bucket": 1,
         "flag": False,
         "score": 2.5,
+        "eventTs": "2024-01-02T00:00:00Z",
         "body": "nebula orange blue",
         "nullableText": None,
         "textArr": ["blue", "beta"],
@@ -6592,6 +6985,7 @@ GRAPHQL_PROBE_FIXTURE = [
         "bucket": 2,
         "flag": True,
         "score": 3.5,
+        "eventTs": "2024-01-03T00:00:00Z",
         "body": "anchor grape green",
         "nullableText": "green",
         "textArr": ["green", "gamma"],
@@ -6602,6 +6996,7 @@ GRAPHQL_PROBE_FIXTURE = [
         "bucket": 1,
         "flag": True,
         "score": -1.0,
+        "eventTs": "2024-01-04T00:00:00Z",
         "body": "delta red marker",
         "nullableText": "red",
         "textArr": ["red", "delta"],
@@ -6612,6 +7007,7 @@ GRAPHQL_PROBE_FIXTURE = [
         "bucket": 2,
         "flag": False,
         "score": 0.0,
+        "eventTs": "2024-01-05T00:00:00Z",
         "body": "epsilon neutral yellow",
         "nullableText": "yellow",
         "textArr": ["yellow", "epsilon"],
@@ -6622,6 +7018,7 @@ GRAPHQL_PROBE_FIXTURE = [
         "bucket": 3,
         "flag": True,
         "score": 10.0,
+        "eventTs": "2024-01-06T00:00:00Z",
         "body": "zeta comet tail",
         "textArr": ["tail", "zeta"],
         "vector": [0.6, 0.0, 0.8, 0.0],
@@ -7039,34 +7436,50 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                     except Exception as e:
                         flog(f"[Reconfig] Failed: {e}")
 
-                depth_lo, depth_hi = (5, 22) if is_inverted_profile() else (2, 18)
+                depth_lo, depth_hi = (6, 14) if is_inverted_profile() else (2, 10)
                 depth = random.randint(depth_lo, depth_hi)
                 fo = None
                 rest_where = None
                 filter_source = "grpc"
+                filter_meta = None
+                build_ms = 0.0
                 for _ in range(10):
                     if random.random() < ORACLE_REST_CROSSCHECK_RATE:
                         try:
+                            build_t0 = time.time()
                             rest_candidate, pm_candidate, es_candidate, rest_meta = generate_rest_filter(qg)
+                            build_ms = (time.time() - build_t0) * 1000.0
                             if rest_candidate is not None:
                                 fo_candidate = rest_where_to_filter(rest_candidate)
                                 fo, pm, es = fo_candidate, pm_candidate, es_candidate
                                 rest_where = rest_candidate
                                 filter_source = "grpc+rest"
                                 depth = max(depth, int((rest_meta or {}).get("target_depth", depth)))
+                                filter_meta = dict(rest_meta or {})
+                                filter_meta.setdefault("target_atoms", filter_meta.get("atoms", 0))
                                 break
                         except Exception:
                             pass
-                    fo, pm, es = qg.gen_complex_expr(depth)
+                    build_t0 = time.time()
+                    fo, pm, es, filter_meta = qg.gen_complex_expr(depth, return_meta=True)
+                    build_ms = (time.time() - build_t0) * 1000.0
                     if fo:
                         break
                 if not fo:
                     stats.record_skip()
                     continue
 
+                expr_depth = int((filter_meta or {}).get("depth", 0))
+                expr_atoms = int((filter_meta or {}).get("atoms", 0))
+                target_depth = int((filter_meta or {}).get("target_depth", depth))
+                target_atoms = int((filter_meta or {}).get("target_atoms", expr_atoms))
                 flog(f"\n[T{i}] {es}")
                 flog(f"  Source={filter_source}")
                 flog(f"  CL={cl}")
+                flog(
+                    f"  FilterMeta: depth={expr_depth} target={target_depth} "
+                    f"atoms={expr_atoms}/{target_atoms} build_ms={build_ms:.1f}"
+                )
                 if rest_where is not None:
                     flog(f"  RestWhere={json.dumps(rest_where, ensure_ascii=False, sort_keys=True)}")
                 pm = qg._normalize_mask(pm)
@@ -7184,9 +7597,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                     raise
 
                     if round_failed:
-                        stats.record(False, ms, depth, "mismatch")
+                        stats.record(False, ms, expr_depth, "mismatch")
                     else:
-                        stats.record(True, ms, depth)
+                        stats.record(True, ms, expr_depth)
 
                     if exp and random.random() < VECTOR_CHECK_RATIO:
                         try:
@@ -7298,7 +7711,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                         cat = "connection"
                     else:
                         cat = "query_error"
-                    stats.record(False, 0, depth, cat)
+                    stats.record(False, 0, expr_depth, cat)
                     fails.append({"id": i, "expr": es, "detail": str(e)})
 
         print("\n" + "="*60)
@@ -7337,9 +7750,345 @@ def run_graphql_probe_mode(rounds=12, seed=None):
     )
     collection_name = graphql_probe_collection_name(current_seed)
 
+    where_range = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
+            {"path": ["bucket"], "operator": "LessThanEqual", "valueInt": 2},
+        ],
+    })
+    where_int_ge_not_lt = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
+            {
+                "operator": "Not",
+                "operands": [
+                    {"path": ["bucket"], "operator": "LessThan", "valueInt": 1},
+                ],
+            },
+        ],
+    })
+    where_score_le_not_gt = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["score"], "operator": "LessThanEqual", "valueNumber": 2.5},
+            {
+                "operator": "Not",
+                "operands": [
+                    {"path": ["score"], "operator": "GreaterThan", "valueNumber": 2.5},
+                ],
+            },
+        ],
+    })
+    where_bool_true_not_false = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
+            {
+                "operator": "Not",
+                "operands": [
+                    {"path": ["flag"], "operator": "Equal", "valueBoolean": False},
+                ],
+            },
+        ],
+    })
+    where_date_ge_not_lt = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["eventTs"], "operator": "GreaterThanEqual", "valueDate": "2024-01-02T00:00:00Z"},
+            {
+                "operator": "Not",
+                "operands": [
+                    {"path": ["eventTs"], "operator": "LessThan", "valueDate": "2024-01-02T00:00:00Z"},
+                ],
+            },
+        ],
+    })
+    where_text_eq_not_ne = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["nullableText"], "operator": "Equal", "valueText": "red"},
+            {
+                "operator": "Not",
+                "operands": [
+                    {"path": ["nullableText"], "operator": "NotEqual", "valueText": "red"},
+                ],
+            },
+        ],
+    })
+    where_compound = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
+            {
+                "operator": "Or",
+                "operands": [
+                    {"path": ["tag"], "operator": "Like", "valueText": "a*"},
+                    {"path": ["textArr"], "operator": "ContainsAny", "valueText": ["delta"]},
+                ],
+            },
+        ],
+    })
+    where_nested_common = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
+            {"path": ["bucket"], "operator": "LessThanEqual", "valueInt": 2},
+            {
+                "operator": "Or",
+                "operands": [
+                    {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
+                    {"path": ["nullableText"], "operator": "IsNull", "valueBoolean": True},
+                ],
+            },
+        ],
+    })
+    agg_where = graphql_with_enum_operators({
+        "operator": "And",
+        "operands": [
+            {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
+            {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
+        ],
+    })
+
+    expected_where_range = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: 1 <= int(props["bucket"]) <= 2,
+    )
+    expected_where_int_ge_not_lt = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: int(props["bucket"]) >= 1,
+    )
+    expected_where_score_le_not_gt = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: float(props["score"]) <= 2.5,
+    )
+    expected_where_bool_true_not_false = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: bool(props["flag"]),
+    )
+    expected_where_date_ge_not_lt = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: str(props["eventTs"]) >= "2024-01-02T00:00:00Z",
+    )
+    expected_where_text_eq_not_ne = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: props.get("nullableText") == "red",
+    )
+    expected_where_compound = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: bool(props["flag"]) and (
+            str(props["tag"]).startswith("a") or "delta" in (props.get("textArr") or [])
+        ),
+    )
+    expected_where_nested_common = graphql_probe_expected_tags(
+        current_seed,
+        lambda props: 1 <= int(props["bucket"]) <= 2 and (bool(props["flag"]) or props.get("nullableText") is None),
+    )
+    expected_agg_where = [
+        row["properties"]
+        for row in graphql_probe_rows(current_seed)
+        if int(row["properties"]["bucket"]) >= 1 and bool(row["properties"]["flag"])
+    ]
+    expected_group_counts = graphql_probe_expected_group_counts(current_seed, "bucket")
+
+    cases = [
+        (
+            "get-where-range",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_range)}, limit:20) "
+                "{ tag _additional { id } } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_range,
+                f"expected={expected_where_range} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-where-int-ge-not-lt",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_int_ge_not_lt)}, limit:20) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_int_ge_not_lt,
+                f"expected={expected_where_int_ge_not_lt} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-where-score-le-not-gt",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_score_le_not_gt)}, limit:20) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_score_le_not_gt,
+                f"expected={expected_where_score_le_not_gt} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-where-bool-true-not-false",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_bool_true_not_false)}, limit:20) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_bool_true_not_false,
+                f"expected={expected_where_bool_true_not_false} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-where-date-ge-not-lt",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_date_ge_not_lt)}, limit:20) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_date_ge_not_lt,
+                f"expected={expected_where_date_ge_not_lt} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-where-text-eq-not-ne",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_text_eq_not_ne)}, limit:20) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_text_eq_not_ne,
+                f"expected={expected_where_text_eq_not_ne} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-where-compound",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_compound)}, limit:20) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_compound,
+                f"expected={expected_where_compound} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-where-range-or-null",
+            (
+                "{ Get { "
+                f"{collection_name}(where:{graphql_input_literal(where_nested_common)}, limit:20) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == expected_where_nested_common,
+                f"expected={expected_where_nested_common} observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-bm25-and",
+            (
+                "{ Get { "
+                f"{collection_name}(bm25:{graphql_input_literal({'query': 'nebula anchor', 'properties': ['body'], 'searchOperator': {'operator': GraphQLEnum('And')}})}, limit:5) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                sorted(graphql_get_tags(result, collection_name)) == ["alpha"],
+                f"expected=['alpha'] observed={sorted(graphql_get_tags(result, collection_name))}",
+            ),
+        ),
+        (
+            "get-hybrid-top1",
+            (
+                "{ Get { "
+                f"{collection_name}(hybrid:{graphql_input_literal({'query': 'nebula anchor', 'alpha': 0.2, 'vector': [1.0, 0.0, 0.0, 0.0], 'properties': ['body'], 'bm25SearchOperator': {'operator': GraphQLEnum('And')}})}, limit:3) "
+                "{ tag } } }"
+            ),
+            lambda result: (
+                bool(graphql_get_tags(result, collection_name))
+                and graphql_get_tags(result, collection_name)[0] == "alpha",
+                f"top_tags={graphql_get_tags(result, collection_name)}",
+            ),
+        ),
+        (
+            "aggregate-where-score",
+            (
+                "{ Aggregate { "
+                f"{collection_name}(where:{graphql_input_literal(agg_where)}) "
+                "{ meta { count } score { count minimum maximum sum mean } } } }"
+            ),
+            lambda result: (
+                (lambda groups: (
+                    len(groups) == 1
+                    and int((groups[0].get("meta") or {}).get("count") or 0) == len(expected_agg_where)
+                    and int((groups[0].get("score") or {}).get("count") or 0) == len(expected_agg_where)
+                    and _floats_match(float((groups[0].get("score") or {}).get("minimum") or 0.0), min(float(row["score"]) for row in expected_agg_where))
+                    and _floats_match(float((groups[0].get("score") or {}).get("maximum") or 0.0), max(float(row["score"]) for row in expected_agg_where))
+                    and _floats_match(float((groups[0].get("score") or {}).get("sum") or 0.0), sum(float(row["score"]) for row in expected_agg_where))
+                    and _floats_match(float((groups[0].get("score") or {}).get("mean") or 0.0), sum(float(row["score"]) for row in expected_agg_where) / len(expected_agg_where))
+                ))(graphql_aggregate_groups(result, collection_name)),
+                f"observed={graphql_aggregate_groups(result, collection_name)}",
+            ),
+        ),
+        (
+            "aggregate-groupby-bucket",
+            (
+                "{ Aggregate { "
+                f"{collection_name}(groupBy:[\"bucket\"]) "
+                "{ meta { count } groupedBy { path value } } } }"
+            ),
+            lambda result: (
+                (lambda groups: (
+                    {str((group.get('groupedBy') or {}).get('value')): int((group.get('meta') or {}).get('count') or 0) for group in groups} == expected_group_counts
+                    and all((group.get("groupedBy") or {}).get("path") == ["bucket"] for group in groups)
+                ))(graphql_aggregate_groups(result, collection_name)),
+                f"expected={expected_group_counts} observed={graphql_aggregate_groups(result, collection_name)}",
+            ),
+        ),
+        (
+            "aggregate-near-vector-local-boundary",
+            (
+                "{ Aggregate { "
+                f"{collection_name}(objectLimit:1 nearVector:{graphql_input_literal({'vector': [1.0, 0.0, 0.0, 0.0], 'distance': 0.0002})}) "
+                "{ meta { count } score { count minimum maximum } } } }"
+            ),
+            lambda result: (
+                (lambda groups: (
+                    len(groups) == 1
+                    and int((groups[0].get("meta") or {}).get("count") or 0) == 0
+                    and int((groups[0].get("score") or {}).get("count") or 0) == 0
+                ))(graphql_aggregate_groups(result, collection_name)),
+                f"local-boundary observed={graphql_aggregate_groups(result, collection_name)}",
+            ),
+        ),
+        (
+            "aggregate-hybrid-object-limit",
+            (
+                "{ Aggregate { "
+                f"{collection_name}(objectLimit:1 hybrid:{graphql_input_literal({'query': 'nebula anchor', 'alpha': 0.0, 'properties': ['body'], 'bm25SearchOperator': {'operator': GraphQLEnum('And')}})}) "
+                "{ meta { count } score { count minimum maximum } } } }"
+            ),
+            lambda result: (
+                (lambda groups: (
+                    len(groups) == 1
+                    and int((groups[0].get("meta") or {}).get("count") or 0) == 1
+                    and int((groups[0].get("score") or {}).get("count") or 0) == 1
+                    and _floats_match(float((groups[0].get("score") or {}).get("minimum") or 0.0), 1.0)
+                    and _floats_match(float((groups[0].get("score") or {}).get("maximum") or 0.0), 1.0)
+                ))(graphql_aggregate_groups(result, collection_name)),
+                f"observed={graphql_aggregate_groups(result, collection_name)}",
+            ),
+        ),
+    ]
+
     print(
         f"\n GraphQL Probe Mode | Seed: {current_seed} | Class: {collection_name} | "
-        f"Cases/Loop: 8"
+        f"Cases/Loop: {len(cases)}"
     )
     print(f"📄 Log: {display_path(logf)}")
     print(f"🔁 Reproduce: {repro_cmd}")
@@ -7350,172 +8099,6 @@ def run_graphql_probe_mode(rounds=12, seed=None):
         reset_graphql_probe_collection(wm.client, collection_name, current_seed)
         stats = FuzzStats()
         failures = []
-
-        where_range = graphql_with_enum_operators({
-            "operator": "And",
-            "operands": [
-                {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
-                {"path": ["bucket"], "operator": "LessThanEqual", "valueInt": 2},
-            ],
-        })
-        where_compound = graphql_with_enum_operators({
-            "operator": "And",
-            "operands": [
-                {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
-                {
-                    "operator": "Or",
-                    "operands": [
-                        {"path": ["tag"], "operator": "Like", "valueText": "a*"},
-                        {"path": ["textArr"], "operator": "ContainsAny", "valueText": ["delta"]},
-                    ],
-                },
-            ],
-        })
-        agg_where = graphql_with_enum_operators({
-            "operator": "And",
-            "operands": [
-                {"path": ["bucket"], "operator": "GreaterThanEqual", "valueInt": 1},
-                {"path": ["flag"], "operator": "Equal", "valueBoolean": True},
-            ],
-        })
-
-        expected_where_range = graphql_probe_expected_tags(
-            current_seed,
-            lambda props: 1 <= int(props["bucket"]) <= 2,
-        )
-        expected_where_compound = graphql_probe_expected_tags(
-            current_seed,
-            lambda props: bool(props["flag"]) and (
-                str(props["tag"]).startswith("a") or "delta" in (props.get("textArr") or [])
-            ),
-        )
-        expected_agg_where = [
-            row["properties"]
-            for row in graphql_probe_rows(current_seed)
-            if int(row["properties"]["bucket"]) >= 1 and bool(row["properties"]["flag"])
-        ]
-        expected_group_counts = graphql_probe_expected_group_counts(current_seed, "bucket")
-
-        cases = [
-            (
-                "get-where-range",
-                (
-                    "{ Get { "
-                    f"{collection_name}(where:{graphql_input_literal(where_range)}, limit:20) "
-                    "{ tag _additional { id } } } }"
-                ),
-                lambda result: (
-                    sorted(graphql_get_tags(result, collection_name)) == expected_where_range,
-                    f"expected={expected_where_range} observed={sorted(graphql_get_tags(result, collection_name))}",
-                ),
-            ),
-            (
-                "get-where-compound",
-                (
-                    "{ Get { "
-                    f"{collection_name}(where:{graphql_input_literal(where_compound)}, limit:20) "
-                    "{ tag } } }"
-                ),
-                lambda result: (
-                    sorted(graphql_get_tags(result, collection_name)) == expected_where_compound,
-                    f"expected={expected_where_compound} observed={sorted(graphql_get_tags(result, collection_name))}",
-                ),
-            ),
-            (
-                "get-bm25-and",
-                (
-                    "{ Get { "
-                    f"{collection_name}(bm25:{graphql_input_literal({'query': 'nebula anchor', 'properties': ['body'], 'searchOperator': {'operator': GraphQLEnum('And')}})}, limit:5) "
-                    "{ tag } } }"
-                ),
-                lambda result: (
-                    sorted(graphql_get_tags(result, collection_name)) == ["alpha"],
-                    f"expected=['alpha'] observed={sorted(graphql_get_tags(result, collection_name))}",
-                ),
-            ),
-            (
-                "get-hybrid-top1",
-                (
-                    "{ Get { "
-                    f"{collection_name}(hybrid:{graphql_input_literal({'query': 'nebula anchor', 'alpha': 0.2, 'vector': [1.0, 0.0, 0.0, 0.0], 'properties': ['body'], 'bm25SearchOperator': {'operator': GraphQLEnum('And')}})}, limit:3) "
-                    "{ tag } } }"
-                ),
-                lambda result: (
-                    bool(graphql_get_tags(result, collection_name))
-                    and graphql_get_tags(result, collection_name)[0] == "alpha",
-                    f"top_tags={graphql_get_tags(result, collection_name)}",
-                ),
-            ),
-            (
-                "aggregate-where-score",
-                (
-                    "{ Aggregate { "
-                    f"{collection_name}(where:{graphql_input_literal(agg_where)}) "
-                    "{ meta { count } score { count minimum maximum sum mean } } } }"
-                ),
-                lambda result: (
-                    (lambda groups: (
-                        len(groups) == 1
-                        and int((groups[0].get("meta") or {}).get("count") or 0) == len(expected_agg_where)
-                        and int((groups[0].get("score") or {}).get("count") or 0) == len(expected_agg_where)
-                        and _floats_match(float((groups[0].get("score") or {}).get("minimum") or 0.0), min(float(row["score"]) for row in expected_agg_where))
-                        and _floats_match(float((groups[0].get("score") or {}).get("maximum") or 0.0), max(float(row["score"]) for row in expected_agg_where))
-                        and _floats_match(float((groups[0].get("score") or {}).get("sum") or 0.0), sum(float(row["score"]) for row in expected_agg_where))
-                        and _floats_match(float((groups[0].get("score") or {}).get("mean") or 0.0), sum(float(row["score"]) for row in expected_agg_where) / len(expected_agg_where))
-                    ))(graphql_aggregate_groups(result, collection_name)),
-                    f"observed={graphql_aggregate_groups(result, collection_name)}",
-                ),
-            ),
-            (
-                "aggregate-groupby-bucket",
-                (
-                    "{ Aggregate { "
-                    f"{collection_name}(groupBy:[\"bucket\"]) "
-                    "{ meta { count } groupedBy { path value } } } }"
-                ),
-                lambda result: (
-                    (lambda groups: (
-                        {str((group.get('groupedBy') or {}).get('value')): int((group.get('meta') or {}).get('count') or 0) for group in groups} == expected_group_counts
-                        and all((group.get("groupedBy") or {}).get("path") == ["bucket"] for group in groups)
-                    ))(graphql_aggregate_groups(result, collection_name)),
-                    f"expected={expected_group_counts} observed={graphql_aggregate_groups(result, collection_name)}",
-                ),
-            ),
-            (
-                "aggregate-near-vector-local-boundary",
-                (
-                    "{ Aggregate { "
-                    f"{collection_name}(objectLimit:1 nearVector:{graphql_input_literal({'vector': [1.0, 0.0, 0.0, 0.0], 'distance': 0.0002})}) "
-                    "{ meta { count } score { count minimum maximum } } } }"
-                ),
-                lambda result: (
-                    (lambda groups: (
-                        len(groups) == 1
-                        and int((groups[0].get("meta") or {}).get("count") or 0) == 0
-                        and int((groups[0].get("score") or {}).get("count") or 0) == 0
-                    ))(graphql_aggregate_groups(result, collection_name)),
-                    f"local-boundary observed={graphql_aggregate_groups(result, collection_name)}",
-                ),
-            ),
-            (
-                "aggregate-hybrid-object-limit",
-                (
-                    "{ Aggregate { "
-                    f"{collection_name}(objectLimit:1 hybrid:{graphql_input_literal({'query': 'nebula anchor', 'alpha': 0.0, 'properties': ['body'], 'bm25SearchOperator': {'operator': GraphQLEnum('And')}})}) "
-                    "{ meta { count } score { count minimum maximum } } } }"
-                ),
-                lambda result: (
-                    (lambda groups: (
-                        len(groups) == 1
-                        and int((groups[0].get("meta") or {}).get("count") or 0) == 1
-                        and int((groups[0].get("score") or {}).get("count") or 0) == 1
-                        and _floats_match(float((groups[0].get("score") or {}).get("minimum") or 0.0), 1.0)
-                        and _floats_match(float((groups[0].get("score") or {}).get("maximum") or 0.0), 1.0)
-                    ))(graphql_aggregate_groups(result, collection_name)),
-                    f"observed={graphql_aggregate_groups(result, collection_name)}",
-                ),
-            ),
-        ]
 
         offset = graphql_probe_case_order(current_seed, len(cases))
         with open(logf, "w", encoding="utf-8") as f:

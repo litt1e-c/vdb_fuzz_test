@@ -1,0 +1,32 @@
+operator_id: scalar_core_compound
+family: comparison
+syntax_examples:
+  - 'Filter.by_property("intVal").greater_or_equal(2) & Filter.not_(Filter.by_property("intVal").less_than(2))'
+  - 'Filter.by_property("intVal").greater_or_equal(2) & Filter.by_property("intVal").less_or_equal(3)'
+  - 'Filter.by_property("textVal").equal("Alpha") & Filter.not_(Filter.by_property("textVal").not_equal("Alpha"))'
+doc_status: family_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - scalar_numeric
+  - scalar_text
+  - scalar_bool
+  - scalar_datetime
+doc_semantics: "The official filter docs describe ordinary comparison operators and boolean composition, but they do not explicitly document the same-field self-consistency compounds recorded here."
+doc_notes:
+  - "Validated subsets cover INT closed ranges, NUMBER upper-bound duals, DATE lower-bound duals, BOOL positive-and-negated-opposite, and exact FIELD-tokenized TEXT equality under a negated opposite predicate."
+  - "This entry is intentionally restricted to the directly checked compounds used as explainable deep scalar fuzz seeds."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.10, `scalar_core_compound_operator.py` validated common deeper scalar compounds: `int >= 2 AND NOT(int < 2)` matched the same rows as the lower-bound INT predicate, `int >= 2 AND int <= 3` preserved inclusive range semantics, `num <= 2.5 AND NOT(num > 2.5)` preserved the expected NUMBER upper-bound subset, `date >= 2024-01-02 AND NOT(date < 2024-01-02)` preserved the expected DATE lower-bound subset, `flag == true AND NOT(flag == false)` isolated the true rows, and `text == \"Alpha\" AND NOT(text != \"Alpha\")` remained stable on FIELD-tokenized exact text equality."
+oracle_support:
+  - pandas
+case_refs:
+  - int_ge_and_not_lt_same_pivot
+  - int_closed_range
+  - number_le_and_not_gt_same_pivot
+  - date_ge_and_not_lt_same_pivot
+  - bool_true_and_not_false
+  - text_equal_and_not_not_equal_same_value
+repro_path: "operator_test/weaviate/scalar_core_compound_operator.py"
+oracle_mapping: "The pandas oracle maps these compounds to explicit boolean-mask conjunctions over validated scalar comparison masks and the observed Weaviate `NOT` null behavior. The main fuzzer only emits the directly validated same-field subset so that deeper scalar coverage stays reproducible and semantically explainable."

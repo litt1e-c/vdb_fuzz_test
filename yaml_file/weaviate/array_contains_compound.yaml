@@ -1,0 +1,28 @@
+operator_id: array_contains_compound
+family: array_membership
+syntax_examples:
+  - 'Filter.by_property("tagsArray").contains_any([2]) & Filter.not_(Filter.by_property("tagsArray").contains_none([2]))'
+  - 'Filter.by_property("labelsArray").contains_any(["Alpha"]) | Filter.by_property("labelsArray").is_none(True)'
+  - 'Filter.by_property("scoresArray").contains_any([2.0, 4.0]) & Filter.by_property("scoresArray").contains_none([1.0])'
+doc_status: family_documented
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - array_field
+doc_semantics: "The official filter docs describe `ContainsAny`, `ContainsAll`, and `ContainsNone` for array/text filtering plus ordinary boolean composition, but they do not spell out the compound array identities recorded here."
+doc_notes:
+  - "Validated compound subsets cover INT_ARRAY, TEXT_ARRAY, NUMBER_ARRAY, BOOL_ARRAY, and DATE_ARRAY."
+  - "This entry records only the directly checked same-field compounds; it does not claim full algebraic equivalence for all null/missing combinations."
+verify_status: edge_validated
+observed_summary: "On local Weaviate v1.36.10, `array_contains_compound_operator.py` validated deeper same-field array compounds: `tagsArray contains_any [2] AND NOT(tagsArray contains_none [2])` isolated the rows containing 2, `labelsArray contains_any [\"Alpha\"] OR is_null(true)` kept the exact-match row plus the missing-array row, `flagsArray contains_all [True, False] OR is_null(true)` kept the full-bool row plus the missing-array row, `scoresArray contains_any [2.0, 4.0] AND scoresArray contains_none [1.0]` isolated the rows matching the positive set while excluding the row carrying 1.0, and `datesArray contains_any [2024-01-02] AND NOT(datesArray contains_none [2024-01-02])` remained stable on the matching UTC date-array rows."
+oracle_support:
+  - pandas
+case_refs:
+  - int_array_contains_any_and_not_none_self
+  - text_array_contains_any_or_null
+  - bool_array_contains_all_or_null
+  - number_array_contains_any_and_none_other
+  - date_array_contains_any_and_not_none_self
+repro_path: "operator_test/weaviate/array_contains_compound_operator.py"
+oracle_mapping: "The pandas oracle reuses the validated array membership masks and composes them with explicit boolean-mask operators, preserving the observed local null/missing behavior of array `contains_*` plus `NOT`/`is_null`. The main fuzzer only emits the directly checked compound subset so that deeper array coverage remains explainable and reproducible."
