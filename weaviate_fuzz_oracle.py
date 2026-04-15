@@ -3832,6 +3832,185 @@ class OracleQueryGenerator:
             )
         return None, None, None
 
+    def _text_contains_mask(self, series, targets, mode):
+        expr_targets = tuple(stable_unique_values(str(target) for target in targets))
+        if mode == "contains_all":
+            expr_targets = expr_targets[:1]
+        target_set = set(expr_targets)
+        if mode == "contains_any":
+            return series.apply(
+                lambda value, vals=target_set: str(value) in vals
+                if value is not None and not (isinstance(value, float) and np.isnan(value))
+                else False
+            )
+        if mode == "contains_none":
+            return series.apply(
+                lambda value, vals=target_set: str(value) not in vals
+                if value is not None and not (isinstance(value, float) and np.isnan(value))
+                else True
+            )
+        return series.apply(
+            lambda value, vals=expr_targets: all(str(value) == target for target in vals)
+            if value is not None and not (isinstance(value, float) and np.isnan(value))
+            else False
+        )
+
+    def _build_text_contains_filter_clause(self, name, series, mode, targets):
+        expr_targets = stable_unique_values(str(target) for target in targets)
+        if mode == "contains_all":
+            expr_targets = expr_targets[:1]
+        filter_builder = getattr(Filter.by_property(name), mode)
+        mask = self._text_contains_mask(series, expr_targets, mode)
+        return filter_builder(expr_targets), self._normalize_mask(mask), f'{name} {mode} {expr_targets}'
+
+    def _build_text_contains_rest_clause(self, name, series, mode, targets):
+        rest_operator = {
+            "contains_any": "ContainsAny",
+            "contains_all": "ContainsAll",
+            "contains_none": "ContainsNone",
+        }[mode]
+        expr_targets = stable_unique_values(str(target) for target in targets)
+        if mode == "contains_all":
+            expr_targets = expr_targets[:1]
+        mask = self._text_contains_mask(series, expr_targets, mode)
+        return build_rest_where([name], rest_operator, ftype=FieldType.TEXT, value=expr_targets), self._normalize_mask(mask), f'{name} {mode} {expr_targets}'
+
+    def _like_pattern_variants(self, value, *, allow_boundary=False):
+        sv = str(value)
+        variants = []
+        if allow_boundary:
+            variants.extend([("*", "all"), ("**", "all2")])
+        if len(sv) == 3:
+            variants.append(("???", "three_q"))
+        if sv in {"%", "_"}:
+            variants.append((sv, "literal_boundary"))
+        if len(sv) >= 1:
+            k = random.randint(1, min(4, len(sv)))
+            prefix = "".join(ch for ch in sv[:k] if ch.isalnum()) or sv[:1] or "a"
+            variants.append((f"{prefix}*", "prefix"))
+        if len(sv) >= 2:
+            k = random.randint(1, min(4, len(sv)))
+            suffix = "".join(ch for ch in sv[-k:] if ch.isalnum()) or sv[-1:] or "z"
+            variants.append((f"*{suffix}", "suffix"))
+            pos = random.randint(0, len(sv) - 1)
+            variants.append((sv[:pos] + "?" + sv[pos + 1 :], "single_q"))
+        if len(sv) >= 3:
+            i = random.randint(0, len(sv) - 2)
+            j = random.randint(i + 1, min(i + 5, len(sv)))
+            sub = "".join(ch for ch in sv[i:j] if ch.isalnum()) or sv[i:j] or "x"
+            variants.append((f"*{sub}*", "contains"))
+        if not variants:
+            variants.append(("*", "fallback"))
+        return stable_unique_values(variants)
+
+    def gen_like_compound_expr(self):
+        text_fields = self.like_text_schema[:]
+        random.shuffle(text_fields)
+        for field in text_fields:
+            name = field["name"]
+            series = self.df[name]
+            value = self.get_value_for_query(name, FieldType.TEXT)
+            if value is None:
+                continue
+            sv = str(value)
+            pattern, _ = random.choice(self._like_pattern_variants(sv, allow_boundary=True))
+            like_filter = Filter.by_property(name).like(pattern)
+            like_mask = rest_like_mask(series, pattern)
+            null_mask = self._effective_null_mask(series, FieldType.TEXT)
+            candidates = stable_unique_values(str(item) for item in self._field_values.get(name, []) if str(item) != sv)
+            contrast = random.choice(candidates) if candidates else self._random_string(6, 12)
+            strategy = random.choice(["not_like", "like_or_null", "like_and_not_contains_none_self", "like_and_contains_none_other"])
+            if strategy == "not_like":
+                return Filter.not_(like_filter), self._apply_not_mask(like_mask), f'NOT({name} like "{pattern}")'
+            if strategy == "like_or_null":
+                return like_filter | Filter.by_property(name).is_none(True), self._normalize_mask(like_mask) | self._normalize_mask(null_mask), f'({name} like "{pattern}" OR {name} is null)'
+            if strategy == "like_and_not_contains_none_self":
+                contains_none_filter, contains_none_mask, contains_none_expr = self._build_text_contains_filter_clause(
+                    name, series, "contains_none", [sv]
+                )
+                return (
+                    like_filter & Filter.not_(contains_none_filter),
+                    self._normalize_mask(like_mask) & self._apply_not_mask(contains_none_mask),
+                    f'({name} like "{pattern}" AND NOT({contains_none_expr}))',
+                )
+            contains_none_filter, contains_none_mask, contains_none_expr = self._build_text_contains_filter_clause(
+                name, series, "contains_none", [contrast]
+            )
+            return (
+                like_filter & contains_none_filter,
+                self._normalize_mask(like_mask) & self._normalize_mask(contains_none_mask),
+                f'({name} like "{pattern}" AND {contains_none_expr})',
+            )
+        return None, None, None
+
+    def gen_like_compound_rest_expr(self):
+        text_fields = self.like_text_schema[:]
+        random.shuffle(text_fields)
+        for field in text_fields:
+            name = field["name"]
+            series = self.df[name]
+            value = self.get_value_for_query(name, FieldType.TEXT)
+            if value is None:
+                continue
+            sv = str(value)
+            pattern, _ = random.choice(self._like_pattern_variants(sv, allow_boundary=True))
+            like_where = build_rest_where([name], "Like", ftype=FieldType.TEXT, value=pattern)
+            like_mask = rest_like_mask(series, pattern)
+            null_mask = self._effective_null_mask(series, FieldType.TEXT)
+            candidates = stable_unique_values(str(item) for item in self._field_values.get(name, []) if str(item) != sv)
+            contrast = random.choice(candidates) if candidates else self._random_string(6, 12)
+            strategy = random.choice(["not_like", "like_or_null", "like_and_not_contains_none_self", "like_and_contains_none_other"])
+            if strategy == "not_like":
+                return build_rest_compound("Not", [like_where]), self._apply_not_mask(like_mask), f'NOT({name} like "{pattern}")'
+            if strategy == "like_or_null":
+                return (
+                    build_rest_compound("Or", [like_where, build_rest_where([name], "IsNull", raw_key="valueBoolean", value=True)]),
+                    self._normalize_mask(like_mask) | self._normalize_mask(null_mask),
+                    f'({name} like "{pattern}" OR {name} is null)',
+                )
+            if strategy == "like_and_not_contains_none_self":
+                contains_none_where, contains_none_mask, contains_none_expr = self._build_text_contains_rest_clause(
+                    name, series, "contains_none", [sv]
+                )
+                return (
+                    build_rest_compound("And", [like_where, build_rest_compound("Not", [contains_none_where])]),
+                    self._normalize_mask(like_mask) & self._apply_not_mask(contains_none_mask),
+                    f'({name} like "{pattern}" AND NOT({contains_none_expr}))',
+                )
+            contains_none_where, contains_none_mask, contains_none_expr = self._build_text_contains_rest_clause(
+                name, series, "contains_none", [contrast]
+            )
+            return (
+                build_rest_compound("And", [like_where, contains_none_where]),
+                self._normalize_mask(like_mask) & self._normalize_mask(contains_none_mask),
+                f'({name} like "{pattern}" AND {contains_none_expr})',
+            )
+        return None, None, None
+
+    def gen_true_like_compound(self, row):
+        text_fields = self.like_text_schema[:]
+        random.shuffle(text_fields)
+        for field in text_fields:
+            name = field["name"]
+            value = row.get(name)
+            if self._is_effectively_null_value(value, FieldType.TEXT):
+                continue
+            series = self.df[name]
+            sv = str(value)
+            pattern, _ = random.choice(self._like_pattern_variants(sv, allow_boundary=True))
+            strategy = random.choice(["like_or_null", "like_and_not_contains_none_self"])
+            if strategy == "like_or_null":
+                return (
+                    Filter.by_property(name).like(pattern) | Filter.by_property(name).is_none(True),
+                    f'({name} like "{pattern}" OR {name} is null)',
+                )
+            contains_none_filter, _, contains_none_expr = self._build_text_contains_filter_clause(name, series, "contains_none", [sv])
+            return (
+                Filter.by_property(name).like(pattern) & Filter.not_(contains_none_filter),
+                f'({name} like "{pattern}" AND NOT({contains_none_expr}))',
+            )
+        return None, None
+
     def gen_true_scalar_contains_compound(self, row):
         fields = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.DATE)]
         random.shuffle(fields)
@@ -5157,27 +5336,31 @@ class OracleQueryGenerator:
         leaf_cutoff = 0.12 if self._inverted_profile else 0.20
         if depth == 0 or random.random() < leaf_cutoff:
             r = random.random()
-            if r < 0.10:
+            if r < 0.08:
+                res = self.gen_like_compound_expr()
+                if res[0] is not None:
+                    return self._finalize_expr(*res)
+            elif r < 0.18:
                 res = self.gen_scalar_contains_compound_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
-            elif r < 0.14:
+            elif r < 0.22:
                 res = self.gen_constant_expr()
                 if res[0]:
                     return self._finalize_expr(*res)
-            elif r < 0.32:
+            elif r < 0.40:
                 res = self.gen_boundary_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
-            elif r < 0.38 and self.array_schema:
+            elif r < 0.46 and self.array_schema:
                 res = self.gen_multi_array_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
-            elif r < 0.52:
+            elif r < 0.60:
                 res = self.gen_not_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
-            elif r < 0.55:
+            elif r < 0.63:
                 res = self.gen_nested_object_expr()
                 if res[0] is not None:
                     return self._finalize_expr(*res)
@@ -5618,6 +5801,10 @@ def generate_rest_filter(qg):
     base_index = qg.df.index
 
     def leaf():
+        if random.random() < 0.12:
+            where_filter, mask, expr = qg.gen_like_compound_rest_expr()
+            if where_filter is not None:
+                return where_filter, _normalize_bool_mask(mask, base_index), expr, {"depth": 1, "atoms": 2}
         if random.random() < 0.18:
             where_filter, mask, expr = qg.gen_scalar_contains_compound_rest_expr()
             if where_filter is not None:
@@ -6103,6 +6290,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
                 if strat == "greater_or_equal":
                     return Filter.by_update_time().greater_or_equal(update_time.to_pydatetime()), f"update_time >= {update_time.isoformat()}"
                 return Filter.by_update_time().less_or_equal(update_time.to_pydatetime()), f"update_time <= {update_time.isoformat()}"
+
+        if random.random() < 0.16:
+            compound_filter, compound_expr = self.gen_true_like_compound(row)
+            if compound_filter is not None:
+                return compound_filter, compound_expr
 
         if random.random() < 0.18:
             compound_filter, compound_expr = self.gen_true_scalar_contains_compound(row)
