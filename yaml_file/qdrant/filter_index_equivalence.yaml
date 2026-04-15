@@ -1,0 +1,34 @@
+operator_id: filter_index_equivalence
+family: other
+syntax_examples:
+  - 'scroll(filter=Filter(must=[{"key":"tenant_kw","match":{"value":"alpha"}}])) before create_payload_index(...)'
+  - 'repeat the same filter after create_payload_index(field_name="num_lookup", field_schema={"type":"integer","lookup":true,"range":false,"on_disk":true})'
+  - 'delete_payload_index(...), recreate it, and rerun the same filter/count/query_points checks'
+
+doc_status: derived
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/indexing/
+  - https://qdrant.tech/documentation/concepts/filtering/
+  - https://qdrant.tech/documentation/concepts/payload/
+doc_supported_types:
+  - scalar_numeric
+  - scalar_text
+  - scalar_bool
+  - scalar_datetime
+  - array_field
+doc_semantics: "Official Qdrant documentation describes payload indexes as an acceleration mechanism for payload filtering and documents the same scalar filter conditions independently of whether a field is explicitly indexed."
+doc_notes:
+  - "This is a derived validation target rather than a native Qdrant operator name."
+  - "This oracle targets the high-value bug surface where the optimizer switches from plain payload scanning to payload-index-backed filtering."
+  - "The validated profile set covers keyword tenant, integer lookup-only, integer range-only principal, float principal, bool on-disk, datetime principal, uuid tenant, and integer-array lookup+range indexing."
+  - "The validated integer lookup-only and range-only profiles justify the main fuzzer's conservative generation of split integer payload index configurations."
+  - "The local Qdrant source shows that integer payload schemas may split into separate lookup and range indexes; this operator intentionally checks both single-field and multi-condition filters against that split path."
+  - "This file validates one-process semantic equivalence across no-index, indexed, and rebuilt-index states; restart persistence remains covered separately by `persistent_index.yaml`."
+
+verify_status: edge_validated
+observed_summary: "On the local validated setup, REST and gRPC both returned the same deterministic answers for keyword, integer, float, bool, datetime, uuid, integer-array, and composite scalar filters before indexing, after explicit payload index creation, and after deleting/recreating those indexes; `scroll`, `count`, and exact `query_points` agreed on the same fixture."
+oracle_support: []
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/filter_index_equivalence_operator.py
+
+oracle_mapping: "`filter_index_equivalence` does not use the generic pandas/PQS oracle. It uses a deterministic fixed-fixture oracle with precomputed expected ID sets and checks that `scroll`, exact `count`, and exact `query_points` stay unchanged across no-index, indexed, and rebuilt-index states. The scope is intentionally limited to documented scalar/filter behavior, not undocumented storage internals."

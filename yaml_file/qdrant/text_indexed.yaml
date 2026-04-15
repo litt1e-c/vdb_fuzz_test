@@ -1,0 +1,25 @@
+operator_id: text_indexed
+family: text_search
+syntax_examples:
+  - '{"key":"title","match":{"text":"brown"}} with TextIndexParams(tokenizer=WORD, lowercase=true, phrase_matching=true)'
+  - '{"key":"title","match":{"phrase":"quick brown"}} with TextIndexParams(tokenizer=WORD, lowercase=true, phrase_matching=true)'
+
+doc_status: family_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/indexing/
+  - https://qdrant.tech/documentation/concepts/filtering/
+doc_supported_types:
+  - scalar_text
+doc_semantics: "Official Qdrant documentation describes full-text payload indexes and `text` / `phrase` filtering over indexed text payload fields, with behavior controlled by `TextIndexParams`."
+doc_notes:
+  - "This YAML entry groups a documented indexed-text filter family under one conservative validation target."
+  - "This is intentionally separate from `text` and `phrase` no-full-text-index substring oracle files."
+  - "The validated subset avoids multi-token text-query operator ambiguity and focuses on single-token MatchText plus contiguous MatchPhrase."
+
+verify_status: edge_validated
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1/v1.17-compatible API surface, REST and gRPC both matched single WORD tokens, did not match partial tokens, and matched contiguous phrases when phrase_matching=true."
+oracle_support: []
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/text_indexed_operator.py
+
+oracle_mapping: "`text_indexed` does not use the generic pandas/PQS oracle. It uses a deterministic token oracle over lowercase WORD tokens plus contiguous phrase token sequences, with the sound subset limited to the indexed-text cases validated here."

@@ -16,7 +16,7 @@ doc_notes:
   - "The checked docs say `has_id` is not supported inside nested."
 
 verify_status: mismatch_observed
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST and gRPC matched same-element semantics for nested with inner must/should/must_not and excluded missing/null/[] parent fields from ordinary nested predicates; however, inner `has_id` was accepted and returned an empty result on both transports instead of being rejected as the checked docs state."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST and gRPC matched same-element semantics for nested with inner must/should/min_should/must_not, clearly differed from projected `items[].field` semantics by rejecting a cross-element score+label conjunction that the projected form accepted, excluded missing/null/[] parent fields from ordinary nested predicates, and respected top-level must_not wrapped around a nested+min_should formula; however, inner `has_id` was accepted and returned an empty result on both transports instead of being rejected as the checked docs state."
 oracle_support:
   - same-element nested matching over generated ARRAY_OBJECT fields
   - inner must/should/must_not subset over score/label/active child fields
@@ -24,4 +24,4 @@ oracle_support:
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/qdrant/nested_operator.py
 
-oracle_mapping: "`nested` is mapped to pandas/PQS by iterating the array-of-object field and evaluating the inner filter against each element, with the parent row matching iff at least one element satisfies the inner filter; missing/null/[] parent fields are treated as non-matches for ordinary nested predicates, and current fuzzer coverage is limited to generated `items_nested` with inner `must`/`should`/`must_not` over `score`, `label`, and `active` without generating `has_id` inside nested. This is our oracle assumption, not an official claim."
+oracle_mapping: "`nested` is mapped to pandas/PQS by iterating the array-of-object field and evaluating the inner filter against each element, with the parent row matching iff at least one element satisfies that inner filter; missing/null/[] parent fields are treated as non-matches for ordinary nested predicates, and the validated subset now includes the documented same-element contrast against projected `items[].field` filtering, plus inner `must`/`should`/`min_should`/`must_not` over `score`, `label`, and `active`, and top-level `must_not` around nested formulas, without generating `has_id` inside nested. This is our oracle assumption, not an official claim."

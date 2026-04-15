@@ -11,6 +11,7 @@ venv/
 *.txt
 *.csv
 *.json
+figures/
 weaviate_log/
 qdrant_log/
 milvus_log/
@@ -21,6 +22,7 @@ milvus_log/
 *_result*.log
 .cov/
 data/
+_qdrant_timeline_smoke/
 
 # ===== Databases / runtime data =====
 *.db

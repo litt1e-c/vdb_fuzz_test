@@ -1,33 +1,32 @@
 operator_id: range
-family: range_condition
+family: range
 syntax_examples:
-  - '{"key":"price","range":{"gte":100.0,"lte":450.0}}'
-  - '{"key":"count","range":{"gt":10}}'
-  - '{"key":"sizes","range":{"gte":35,"lte":38}}'
+  - 'FieldCondition(key="price", range=Range(gte=100.0, lte=450.0))'
+  - 'FieldCondition(key="count", range=Range(gt=10))'
+  - 'FieldCondition(key="sizes", range=Range(gte=35, lte=38))'
 
 doc_status: operator_documented
 doc_source_urls:
   - https://qdrant.tech/documentation/concepts/filtering/
   - https://qdrant.tech/documentation/concepts/payload/
 doc_supported_types:
-  - integer
-  - float
-doc_semantics: "`range` constrains numeric payload values with `gt`, `gte`, `lt`, and `lte`; multiple bounds are conjunctive, integer and float payloads are documented, and array payloads satisfy the condition if at least one element meets the range."
+  - scalar_numeric
+  - array_field
+doc_semantics: "Official Qdrant documentation states that `range` constrains numeric payload values with `gt`, `gte`, `lt`, and `lte`; integer and float payloads are documented, and array payloads satisfy the condition when at least one stored value fits the filtering condition."
 doc_notes:
+  - "This operator validates a conservative numeric subset: scalar integers/floats, numeric arrays, mixed open/closed two-sided bounds, exact closed intervals, and cross-zero closed intervals."
   - "The checked payload docs state that a filter is not satisfied when the stored value type does not fit the filtering condition."
-  - "The checked docs document datetime range separately from numeric `Range`."
+  - "Datetime range is documented separately from numeric `Range` and therefore remains outside this YAML entry."
   - "The checked docs do not specify precision or transport behavior at extreme numeric boundaries."
 
 verify_status: mismatch_observed
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, the safe non-extreme subset passed on REST and gRPC for integer/float scalar ranges, conjunctive bounds, array any-element matching, missing/null exclusion, and tested string type mismatch; local historical range repros document mismatches near int64 extreme values and ±float32 maximum finite values."
+observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, the safe non-extreme subset passed on REST and gRPC for integer/float scalar ranges, conjunctive two-sided bounds, mixed open/closed intervals, exact closed intervals, cross-zero closed intervals, array any-element matching, missing/null exclusion, and tested string type mismatch; local historical repros still document mismatches near int64 extreme values and ±float32 maximum finite values."
 oracle_support:
-  - integer Range predicates outside default-excluded int64 extremes
-  - float scalar and array Range predicates with ±float32 maximum finite literals retained and tagged as known-boundary candidates
-  - default exclusion of known unstable int64 extremes
-  - known-boundary tagging for ±float32 maximum finite literals
+  - pandas
+  - pqs
 case_refs:
   - poc_qdrant_issue8538_int64_float_precision_loss
   - poc_qdrant_issue8617_float32_min_boundary_filtering
 repro_path: /home/caihao/compare_test/operator_test/qdrant/range_operator.py
 
-oracle_mapping: "`range` is mapped to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds, scalar rows matching direct comparison and array rows matching when any numeric element satisfies the range; missing/null and tested type-mismatched rows are treated as non-matches, current fuzzer coverage excludes known unstable int64 extreme values by default, keeps ±float32 maximum finite values available with known-boundary mismatch tagging, and excludes official datetime ranges modeled separately by `datetime_range`. This is our oracle assumption, not an official claim."
+oracle_mapping: "`range` maps to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds. Scalar rows match by direct comparison, array rows match when any numeric element satisfies the range, and missing/null or tested type-mismatched rows are treated as non-matches. The default random fuzzer excludes known unstable int64 extremes, keeps historically interesting float boundary literals separately tagged as boundary candidates, and models official datetime ranges under the separate `datetime_range` operator."

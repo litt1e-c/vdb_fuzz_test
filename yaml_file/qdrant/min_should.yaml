@@ -1,0 +1,24 @@
+operator_id: min_should
+family: logical
+syntax_examples:
+  - '{"min_should":{"conditions":[{"key":"city","match":{"value":"London"}},{"key":"color","match":{"value":"red"}}],"min_count":1}}'
+  - '{"must":[{"key":"city","match":{"value":"London"}}],"min_should":{"conditions":[{"key":"color","match":{"value":"red"}},{"key":"score","range":{"gt":7}}],"min_count":2}}'
+  - '{"min_should":{"conditions":[{"must":[{"key":"city","match":{"value":"Berlin"}},{"key":"color","match":{"value":"red"}}]},{"key":"score","range":{"gt":0}}],"min_count":1}}'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/search/filtering/
+doc_supported_types:
+  - unknown
+doc_semantics: "`min_should` is true when at least `min_count` conditions from its condition list are satisfied; it is checked alongside top-level `must`, `should`, and `must_not` clauses."
+doc_notes:
+  - "Local Qdrant source confirms that the checker counts matching min_should conditions and compares that count to min_count."
+  - "The validated local behavior also includes edge cases: min_count=0 is vacuously true, an empty condition list is treated as a no-op even with positive min_count, while min_count greater than a non-empty condition count is false."
+
+verify_status: edge_validated
+observed_summary: "On the validated local setup, REST and gRPC agreed that min_count=1 behaves like OR for ordinary predicates, min_count=2/3 enforce at-least-N semantics, min_count equal to the child count behaves like MUST, min_count=0 is vacuously true even for the tested empty-condition list, an empty condition list with positive min_count is treated as a no-op/true, min_count greater than a non-empty child count is false, top-level must/should/must_not combine conjunctively with min_should, nested Filter children participate as min_should conditions, and missing/null payloads do not satisfy ordinary range predicates inside min_should."
+oracle_support: []
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/min_should_operator.py
+
+oracle_mapping: "`min_should` currently uses a deterministic at-least-N truth-count oracle over validated non-empty child conditions rather than the generic pandas/PQS random generator. The sound random-fuzzer subset avoids empty condition lists; the operator root records the local API edge behavior that empty lists are treated as no-op/true, while `min_count=0` is vacuously true and `min_count > len(non_empty_conditions)` is false, plus conjunction with top-level `must`/`should`/`must_not` and nested Filter children."

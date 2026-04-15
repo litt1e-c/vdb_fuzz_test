@@ -1,0 +1,30 @@
+operator_id: scroll_pagination
+family: other
+syntax_examples:
+  - 'client.scroll(collection_name, scroll_filter=deep_filter, limit=2, offset=next_page_offset)'
+  - 'client.scroll(collection_name, scroll_filter=red_filter, order_by=OrderBy(key="price", direction=Direction.ASC))'
+  - 'client.scroll(collection_name, scroll_filter=deep_filter, with_payload=["group","price"])'
+
+doc_status: family_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/points/
+  - https://qdrant.tech/documentation/concepts/filtering/
+doc_supported_types:
+  - scalar_numeric
+  - scalar_text
+  - scalar_bool
+doc_semantics: "Official Qdrant documentation describes scrolling with filters, pagination via offsets, payload projection, and ordered scroll over indexed payload keys."
+doc_notes:
+  - "This YAML entry groups a documented family of scroll behaviors under one deterministic validation target."
+  - "The random scalar fuzzer often uses scroll with a large limit to retrieve the whole result set. This operator covers the lower-level pagination path separately."
+  - "The deep filter combines `must`, `should`, and `must_not` with range and match predicates so that shallow boolean-filter behavior is exercised inside a non-trivial expression."
+  - "Observed on the validated setup: `next_page_offset` is the first ID of the next page, and an explicit `offset=<id>` includes that ID in the returned page."
+  - "Ordered scroll intentionally checks that Qdrant returns no `next_page_offset` for `order_by`, matching the server-side collection point_ops behavior."
+
+verify_status: edge_validated
+observed_summary: "The operator is designed to validate deterministic page boundaries, absence of duplicate IDs across pages, ascending/descending ordered scalar scroll, and payload projection across REST and gRPC."
+oracle_support: []
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/scroll_pagination_operator.py
+
+oracle_mapping: "`scroll_pagination` does not use the generic pandas/PQS oracle. It uses a deterministic page-boundary oracle with fixed expected ID sequences and ordered results, complementing the main random fuzzer's full-result scroll checks."

@@ -5,13 +5,15 @@ This script validates a conservative subset:
 1. Nested matches when at least one array element satisfies the inner filter.
 2. Same-element semantics hold for inner `must`.
 3. Inner `should` works per nested element.
-4. Inner `must_not` works per nested element.
-5. Missing/null/[] parent fields do not satisfy ordinary nested predicates.
-6. `has_id` inside nested is rejected locally, matching the checked docs.
+4. Inner `min_should` is evaluated per nested element, not across siblings.
+5. Inner `must_not` works per nested element.
+6. Missing/null/[] parent fields do not satisfy ordinary nested predicates.
+7. `has_id` inside nested is rejected locally, matching the checked docs.
 """
 
 from __future__ import annotations
 
+import argparse
 import random
 import time
 import urllib.request
@@ -25,6 +27,7 @@ from qdrant_client.http.models import (
     Filter,
     HasIdCondition,
     MatchValue,
+    MinShould,
     Nested,
     NestedCondition,
     PointStruct,
@@ -36,10 +39,25 @@ from qdrant_client.http.models import (
 HOST = "127.0.0.1"
 PORT = 6333
 GRPC_PORT = 6334
+RUN_ID: str | None = None
+_COLLECTION_COUNTER = 0
+
+
+def slugify(value: object, max_len: int = 48) -> str:
+    text = str(value).strip().lower()
+    pieces = [ch if ch.isalnum() else "-" for ch in text]
+    collapsed = "".join(pieces).strip("-")
+    while "--" in collapsed:
+        collapsed = collapsed.replace("--", "-")
+    return (collapsed or "x")[:max_len]
 
 
 def unique_collection_name(prefer_grpc: bool) -> str:
+    global _COLLECTION_COUNTER
     transport = "grpc" if prefer_grpc else "rest"
+    if RUN_ID:
+        _COLLECTION_COUNTER += 1
+        return f"nested_operator_{slugify(RUN_ID, max_len=36)}_{transport}_{_COLLECTION_COUNTER:02d}"
     return f"nested_operator_{transport}_{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
 
 
@@ -131,6 +149,16 @@ def scroll_ids(client: QdrantClient, collection_name: str, scroll_filter: Filter
     return sorted(int(point.id) for point in points)
 
 
+def count_total(client: QdrantClient, collection_name: str, count_filter: Filter) -> int:
+    return int(
+        client.count(
+            collection_name=collection_name,
+            count_filter=count_filter,
+            exact=True,
+        ).count
+    )
+
+
 def run_transport(prefer_grpc: bool) -> bool:
     transport = "gRPC" if prefer_grpc else "REST"
     collection_name = unique_collection_name(prefer_grpc)
@@ -174,6 +202,37 @@ def run_transport(prefer_grpc: bool) -> bool:
             "Inner must should require the same element to satisfy both predicates.",
         ),
         (
+            "projected_array_object_cross_element_and",
+            Filter(
+                must=[
+                    FieldCondition(key="items[].score", range=Range(gte=5)),
+                    FieldCondition(key="items[].label", match=MatchValue(value="beta")),
+                ]
+            ),
+            [2],
+            "Projected array-object key paths accumulate across sibling elements, so one element may satisfy the score bound while another satisfies the label test.",
+        ),
+        (
+            "nested_same_formula_rejects_cross_element_projection",
+            Filter(
+                must=[
+                    NestedCondition(
+                        nested=Nested(
+                            key="items",
+                            filter=Filter(
+                                must=[
+                                    FieldCondition(key="score", range=Range(gte=5)),
+                                    FieldCondition(key="label", match=MatchValue(value="beta")),
+                                ]
+                            ),
+                        )
+                    )
+                ]
+            ),
+            [],
+            "Nested keeps same-element semantics for the same formula, so the projected cross-element hit above must disappear here.",
+        ),
+        (
             "nested_inner_should",
             Filter(
                 must=[
@@ -192,6 +251,80 @@ def run_transport(prefer_grpc: bool) -> bool:
             ),
             [2, 3],
             "Inner should should work per nested element.",
+        ),
+        (
+            "nested_inner_min_should_two_of_three",
+            Filter(
+                must=[
+                    NestedCondition(
+                        nested=Nested(
+                            key="items",
+                            filter=Filter(
+                                min_should=MinShould(
+                                    conditions=[
+                                        FieldCondition(key="score", range=Range(gte=5)),
+                                        FieldCondition(key="label", match=MatchValue(value="epsilon")),
+                                        FieldCondition(key="active", match=MatchValue(value=True)),
+                                    ],
+                                    min_count=2,
+                                )
+                            ),
+                        )
+                    )
+                ]
+            ),
+            [2, 3],
+            "Inner min_should counts matches within a single nested object, so rows 2 and 3 match via one qualifying element each.",
+        ),
+        (
+            "nested_inner_min_should_same_element_only",
+            Filter(
+                must=[
+                    NestedCondition(
+                        nested=Nested(
+                            key="items",
+                            filter=Filter(
+                                min_should=MinShould(
+                                    conditions=[
+                                        FieldCondition(key="label", match=MatchValue(value="beta")),
+                                        FieldCondition(key="active", match=MatchValue(value=True)),
+                                    ],
+                                    min_count=2,
+                                )
+                            ),
+                        )
+                    )
+                ]
+            ),
+            [],
+            "Inner min_should must be satisfied by one nested object; cross-element accumulation would incorrectly match rows 1 and 2 here.",
+        ),
+        (
+            "nested_inner_min_should_under_top_level_must_not",
+            Filter(
+                must_not=[
+                    Filter(
+                        must=[
+                            NestedCondition(
+                                nested=Nested(
+                                    key="items",
+                                    filter=Filter(
+                                        min_should=MinShould(
+                                            conditions=[
+                                                FieldCondition(key="score", range=Range(gte=5)),
+                                                FieldCondition(key="active", match=MatchValue(value=True)),
+                                            ],
+                                            min_count=2,
+                                        )
+                                    ),
+                                )
+                            )
+                        ]
+                    )
+                ]
+            ),
+            [1, 4, 5, 6, 7],
+            "Top-level must_not should exclude parents that have some nested element satisfying the inner min_should formula; the tested missing-child-field row survives because its element does not satisfy all required inner votes.",
         ),
         (
             "nested_inner_must_not",
@@ -240,12 +373,14 @@ def run_transport(prefer_grpc: bool) -> bool:
         print(f"collection={collection_name}")
         for name, scroll_filter, expected_ids, note in tests:
             actual_ids = scroll_ids(client, collection_name, scroll_filter)
-            passed = actual_ids == expected_ids
+            actual_count = count_total(client, collection_name, scroll_filter)
+            passed = actual_ids == expected_ids and actual_count == len(expected_ids)
             if not passed:
                 all_passed = False
             status = "PASS" if passed else "FAIL"
             print(
-                f"{name}: {status} | expected={expected_ids} | actual={actual_ids} | note={note}"
+                f"{name}: {status} | expected={expected_ids} | actual={actual_ids} | "
+                f"expected_count={len(expected_ids)} | actual_count={actual_count} | note={note}"
             )
 
         has_id_filter = Filter(
@@ -282,7 +417,21 @@ def run_transport(prefer_grpc: bool) -> bool:
     return all_passed
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    global HOST, PORT, GRPC_PORT, RUN_ID
+
+    parser = argparse.ArgumentParser(description="Validate Qdrant nested filter semantics")
+    parser.add_argument("--host", default=HOST, help="Qdrant REST host")
+    parser.add_argument("--port", type=int, default=PORT, help="Qdrant REST port")
+    parser.add_argument("--grpc-port", type=int, default=GRPC_PORT, dest="grpc_port", help="Qdrant gRPC port")
+    parser.add_argument("--run-id", default=None, help="Optional deterministic run id for collection naming")
+    args = parser.parse_args(argv)
+
+    HOST = args.host
+    PORT = int(args.port)
+    GRPC_PORT = int(args.grpc_port)
+    RUN_ID = args.run_id
+
     try:
         server_info = fetch_server_info()
     except Exception as exc:

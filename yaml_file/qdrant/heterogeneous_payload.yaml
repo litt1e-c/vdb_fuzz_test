@@ -1,0 +1,33 @@
+operator_id: heterogeneous_payload
+family: other
+syntax_examples:
+  - 'FieldCondition(key="mixed_num", range=Range(gte=0)) on rows where the same payload key also appears as string/bool/null/[]/missing/object'
+  - 'FieldCondition(key="mixed_kw", match=MatchValue(value="alpha")) on rows where the same payload key also appears as int/bool/null/[]/missing/object'
+  - 'delete/create payload index after `set_payload` / `overwrite_payload` / `clear_payload` / `delete_payload`, then rerun `is_empty` / `is_null` / range / exact-match checks'
+
+doc_status: derived
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/payload/
+  - https://qdrant.tech/documentation/concepts/filtering/
+  - https://qdrant.tech/documentation/concepts/indexing/
+doc_supported_types:
+  - scalar_numeric
+  - scalar_text
+  - scalar_bool
+  - array_field
+  - json_field
+  - dynamic_field
+doc_semantics: "Official Qdrant documentation states that a payload filter is not satisfied when the stored value does not fit the filtering condition, and separately documents `is_null`, `is_empty`, payload mutation APIs, and explicit payload indexing."
+doc_notes:
+  - "This is a derived validation target rather than a native Qdrant operator name."
+  - "The intended scope is a conservative, deterministic subset of heterogeneous same-key behavior under scalar filters."
+  - "The operator focuses on integer range, keyword exact match, `is_null`, and `is_empty`, because those are explainable and can be mapped to a fixed-fixture oracle."
+  - "The validated subset now covers baseline, indexed, mutated, and rebuilt-index phases over the same mixed-type keys on both REST and gRPC."
+
+verify_status: edge_validated
+observed_summary: "On the validated local setup, REST and gRPC agreed that integer range filters only match the tested numeric rows, keyword exact match only matches the tested scalar string rows, `is_null` keeps explicit-null-only semantics, and `is_empty` keeps missing/null/[] semantics even when sibling rows use strings, bools, arrays, or objects under the same key; these results stayed stable before indexing, after indexing, after payload mutation, and after index rebuild."
+oracle_support: []
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/qdrant/heterogeneous_payload_operator.py
+
+oracle_mapping: "`heterogeneous_payload` does not use the generic pandas/PQS oracle. It uses a deterministic fixed fixture where the same payload key appears with mixed runtime types, then checks a sound subset of scalar filters before indexing, after indexing, after payload mutation, and after index rebuild. The validated subset is now stable enough to ship in the default scalar operator suite, while still avoiding undocumented broad heterogeneous semantics."

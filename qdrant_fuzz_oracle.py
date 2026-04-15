@@ -21,6 +21,7 @@ import pandas as pd
 import json
 import sys
 import argparse
+import shlex
 from datetime import datetime, timedelta, timezone
 from qdrant_client import QdrantClient
 from qdrant_client.http import models
@@ -32,8 +33,16 @@ from qdrant_client.http.models import (
     HasIdCondition, PointIdsList,
     GeoPoint, GeoBoundingBox, GeoRadius,
     PayloadSchemaType,
+    KeywordIndexParams, KeywordIndexType,
+    IntegerIndexParams, IntegerIndexType,
+    FloatIndexParams, FloatIndexType,
+    GeoIndexParams, GeoIndexType,
+    BoolIndexParams, BoolIndexType,
+    DatetimeIndexParams, DatetimeIndexType,
+    UuidIndexParams, UuidIndexType,
     SearchParams,
     NestedCondition, Nested,
+    MinShould,
 )
 
 # --- Configuration (User Specified) ---
@@ -42,6 +51,7 @@ PORT = 6333                # REST port
 GRPC_PORT = 6334           # gRPC port
 PREFER_GRPC = False        # 默认使用 REST，按需可切到 gRPC
 COLLECTION_NAME = "fuzz_oracle_v1"
+FORCED_COLLECTION_NAME = None
 N = 5000                   # 数据量
 DIM = 128                  # 向量维度
 BATCH_SIZE = 500           # 批次大小
@@ -53,7 +63,14 @@ ALL_WRITE_ORDERING_LEVELS = ["weak", "medium", "strong"]
 
 # 全局度量类型列表（延迟初始化，在 run() 内种子设置后随机选取）
 ALL_DISTANCE_TYPES = [Distance.EUCLID, Distance.COSINE, Distance.DOT, Distance.MANHATTAN]
+DISTANCE_NAME_MAP = {
+    "euclid": Distance.EUCLID,
+    "cosine": Distance.COSINE,
+    "dot": Distance.DOT,
+    "manhattan": Distance.MANHATTAN,
+}
 DISTANCE_TYPE = None  # 延迟初始化
+FORCED_DISTANCE_TYPE = None
 
 # 随机化配置（延迟初始化，在 run() 内种子设置后赋值，确保可复现）
 INDEX_TYPE = "hnsw"  # Qdrant 主要使用 HNSW
@@ -68,12 +85,20 @@ def _init_vector_check_config():
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LOG_DIR = os.path.join(SCRIPT_DIR, "qdrant_log")
+DEFAULT_ARTIFACT_ROOT = os.environ.get(
+    "QDRANT_EXPERIMENT_ROOT",
+    os.path.join(os.path.expanduser("~"), "qdrant_artifacts"),
+)
+DEFAULT_LOG_DIR = os.path.join(DEFAULT_ARTIFACT_ROOT, "qdrant_log")
+LOG_DIR = DEFAULT_LOG_DIR
+RUN_ID = None
+DISTANCE_ARG = "random"
+SCROLL_MODE = "mixed"
 
 
 def ensure_log_dir():
-    os.makedirs(DEFAULT_LOG_DIR, exist_ok=True)
-    return DEFAULT_LOG_DIR
+    os.makedirs(LOG_DIR, exist_ok=True)
+    return LOG_DIR
 
 
 def make_log_path(filename: str) -> str:
@@ -85,6 +110,245 @@ def display_path(path: str) -> str:
         return os.path.relpath(path, start=os.getcwd())
     except Exception:
         return path
+
+
+def slugify(value: object, max_len: int = 96) -> str:
+    text = str(value).strip().lower()
+    pieces = [ch if ch.isalnum() else "-" for ch in text]
+    collapsed = "".join(pieces).strip("-")
+    while "--" in collapsed:
+        collapsed = collapsed.replace("--", "-")
+    return (collapsed or "x")[:max_len]
+
+
+def sample_ids(values, limit: int = 10) -> list:
+    try:
+        return sorted(values)[:limit]
+    except TypeError:
+        return sorted(values, key=lambda item: str(item))[:limit]
+
+
+def choose_scroll_strategy(total_rows: int) -> dict[str, object]:
+    total_rows = max(1, int(total_rows))
+    if SCROLL_MODE == "bulk":
+        return {"mode": "bulk", "limit": total_rows + 1000}
+    if SCROLL_MODE == "paged":
+        divisor = random.choice([6, 8, 12, 16, 24, 32])
+        return {"mode": "paged", "page_size": max(8, min(256, total_rows // divisor))}
+    if random.random() < 0.35:
+        divisor = random.choice([6, 8, 12, 16, 24, 32])
+        return {"mode": "paged", "page_size": max(8, min(256, total_rows // divisor))}
+    return {"mode": "bulk", "limit": total_rows + 1000}
+
+
+def format_scroll_plan(plan: dict[str, object]) -> str:
+    mode = str(plan.get("mode", "bulk"))
+    if mode == "paged":
+        parts = [f"mode=paged page_size={plan.get('page_size')}"]
+        if "pages" in plan:
+            parts.append(f"pages={plan.get('pages')}")
+        if "duplicates" in plan:
+            parts.append(f"duplicates={plan.get('duplicates')}")
+        if "last_offset" in plan:
+            parts.append(f"last_offset={plan.get('last_offset')}")
+        return " ".join(parts)
+    return f"mode=bulk limit={plan.get('limit')}"
+
+
+def execute_scroll_query(
+    qm,
+    collection_name: str,
+    scroll_filter,
+    total_rows: int,
+    *,
+    with_payload=False,
+    with_vectors=False,
+):
+    plan = choose_scroll_strategy(total_rows)
+    if plan["mode"] == "bulk":
+        points, next_offset = qm.scroll(
+            collection_name=collection_name,
+            scroll_filter=scroll_filter,
+            limit=int(plan["limit"]),
+            with_payload=with_payload,
+            with_vectors=with_vectors,
+        )
+        plan["pages"] = 1
+        plan["duplicates"] = 0
+        plan["last_offset"] = next_offset
+        return list(points), plan
+
+    page_size = int(plan["page_size"])
+    max_pages = max(8, min(256, (max(1, total_rows) // max(1, page_size)) + 32))
+    offset = None
+    pages = 0
+    all_points = []
+    seen_ids = set()
+    duplicate_ids = set()
+
+    while True:
+        points, next_offset = qm.scroll(
+            collection_name=collection_name,
+            scroll_filter=scroll_filter,
+            limit=page_size,
+            offset=offset,
+            with_payload=with_payload,
+            with_vectors=with_vectors,
+        )
+        pages += 1
+        page_ids = [point.id for point in points]
+        for pid in page_ids:
+            if pid in seen_ids:
+                duplicate_ids.add(pid)
+            seen_ids.add(pid)
+        all_points.extend(points)
+        if next_offset is None:
+            plan["pages"] = pages
+            plan["duplicates"] = len(duplicate_ids)
+            plan["last_offset"] = None
+            return all_points, plan
+        if pages >= max_pages:
+            raise RuntimeError(
+                f"Paged scroll exceeded safety bound: pages={pages}, page_size={page_size}, last_offset={next_offset!r}"
+            )
+        if next_offset == offset:
+            raise RuntimeError(f"Paged scroll did not advance: offset={offset!r}")
+        offset = next_offset
+
+
+def should_run_count_cross_check(scroll_plan: dict[str, object]) -> bool:
+    if str(scroll_plan.get("mode")) == "paged":
+        return True
+    return random.random() < 0.2
+
+
+def make_run_label(mode: str, seed) -> str:
+    if RUN_ID:
+        return slugify(RUN_ID)
+    seed_label = f"seed{seed}" if seed is not None else "seed-random"
+    return slugify(f"{mode}-{seed_label}")
+
+
+def make_mode_log_path(mode: str, seed) -> str:
+    return make_log_path(f"qdrant_{slugify(mode, max_len=32)}_{make_run_label(mode, seed)}.log")
+
+
+def make_collection_name(mode: str, seed) -> str:
+    if FORCED_COLLECTION_NAME:
+        return str(FORCED_COLLECTION_NAME)
+    mode_part = slugify(mode, max_len=24)
+    label_part = slugify(make_run_label(mode, seed), max_len=56)
+    return f"qdrant_{mode_part}_{label_part}"
+
+
+def set_collection_name(mode: str, seed) -> str:
+    global COLLECTION_NAME
+    COLLECTION_NAME = make_collection_name(mode, seed)
+    return COLLECTION_NAME
+
+
+def build_reproduce_command(mode: str, seed, rounds: int, enable_dynamic_ops: bool) -> str:
+    mode_flag = {
+        "oracle": "--oracle",
+        "equiv": "--equiv",
+        "pqs": "--pqs",
+        "group": "--group",
+    }.get(mode, "--oracle")
+    cmd = [
+        "python",
+        "qdrant_fuzz_oracle.py",
+        mode_flag,
+        "--seed",
+        str(seed),
+    ]
+    if mode == "pqs":
+        cmd += ["--pqs-rounds", str(rounds)]
+    else:
+        cmd += ["--rounds", str(rounds)]
+    cmd += [
+        "-N",
+        str(N),
+        "--dim",
+        str(DIM),
+        "--batch-size",
+        str(BATCH_SIZE),
+        "--sleep-interval",
+        str(SLEEP_INTERVAL),
+        "--scroll-mode",
+        SCROLL_MODE,
+        "--distance",
+        DISTANCE_ARG,
+        "--host",
+        HOST,
+        "--port",
+        str(PORT),
+        "--grpc-port",
+        str(GRPC_PORT),
+        "--collection-name",
+        COLLECTION_NAME,
+        "--read-consistency",
+        str(READ_CONSISTENCY),
+        "--write-ordering",
+        str(WRITE_ORDERING),
+        "--log-dir",
+        LOG_DIR,
+    ]
+    if PREFER_GRPC:
+        cmd.append("--prefer-grpc")
+    if enable_dynamic_ops:
+        cmd.append("--dynamic")
+    if PAYLOAD_MUTATIONS_ENABLED:
+        cmd.append("--payload-mutations")
+    if CHAOS_RATE > 0:
+        cmd += ["--chaos-rate", str(CHAOS_RATE)]
+    if SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC:
+        cmd.append("--evo-null-sync")
+    if INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES:
+        cmd.append("--include-known-int64-boundaries")
+    if RUN_ID:
+        cmd += ["--run-id", RUN_ID]
+    return shlex.join(cmd)
+
+
+def write_run_manifest(
+    log_filename: str,
+    mode: str,
+    seed,
+    rounds: int,
+    reproduce_command: str,
+    enable_dynamic_ops: bool,
+    schema_config=None,
+) -> str:
+    manifest_path = os.path.splitext(log_filename)[0] + ".manifest.json"
+    payload = {
+        "mode": mode,
+        "seed": seed,
+        "rounds": rounds,
+        "run_id": RUN_ID,
+        "log_path": log_filename,
+        "reproduce_command": reproduce_command,
+        "host": HOST,
+        "port": PORT,
+        "grpc_port": GRPC_PORT,
+        "prefer_grpc": PREFER_GRPC,
+        "collection_name": COLLECTION_NAME,
+        "rows": N,
+        "dim": DIM,
+        "batch_size": BATCH_SIZE,
+        "sleep_interval": SLEEP_INTERVAL,
+        "scroll_mode": SCROLL_MODE,
+        "distance_arg": DISTANCE_ARG,
+        "read_consistency": READ_CONSISTENCY,
+        "write_ordering": WRITE_ORDERING,
+        "dynamic": bool(enable_dynamic_ops),
+        "payload_mutations": bool(PAYLOAD_MUTATIONS_ENABLED),
+        "chaos_rate": CHAOS_RATE,
+        "schema_config": copy.deepcopy(schema_config) if schema_config is not None else None,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as fout:
+        json.dump(payload, fout, indent=2, ensure_ascii=False)
+        fout.write("\n")
+    return manifest_path
 
 
 def is_qdrant_format_error(exc):
@@ -101,6 +365,9 @@ MAX_EVOLVED_FIELDS = 5
 # Schema Evolution: 是否为未回填行显式回写 NULL
 # 默认关闭：演进字段查询统一走 is_empty 语义，避免对全量点逐条 upsert 导致性能/一致性漂移。
 SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = False
+
+# Dynamic payload mutation 子路径（默认关闭；通过 --payload-mutations 显式开启）。
+PAYLOAD_MUTATIONS_ENABLED = False
 
 # 已知 Qdrant v1.17.0 在 int64 极值附近的 range 比较存在异常。
 # 通用 fuzz 默认不注入这些值，避免把已知 server bug 误判成新的逻辑错误。
@@ -197,6 +464,100 @@ class FieldType:
     GEO = "GEO"
     ARRAY_OBJECT = "ARRAY_OBJECT"
 
+
+SAFE_INDEX_PROFILES = {
+    FieldType.INT: [
+        "integer_default",
+        "integer_principal",
+        "integer_on_disk",
+        "integer_lookup_only_on_disk",
+        "integer_range_only_principal_on_disk",
+    ],
+    FieldType.FLOAT: ["float_default", "float_principal", "float_on_disk"],
+    FieldType.BOOL: ["bool_default", "bool_on_disk"],
+    FieldType.STRING: ["keyword_default", "keyword_tenant", "keyword_on_disk"],
+    FieldType.UUID: ["uuid_default", "uuid_tenant", "uuid_on_disk"],
+    FieldType.DATETIME: ["datetime_default", "datetime_principal", "datetime_on_disk"],
+    FieldType.GEO: ["geo_default", "geo_on_disk"],
+    FieldType.ARRAY_INT: ["integer_default", "integer_on_disk"],
+    FieldType.ARRAY_STR: ["keyword_default", "keyword_on_disk"],
+    FieldType.ARRAY_FLOAT: ["float_default", "float_on_disk"],
+}
+
+
+def choose_index_profile(ftype):
+    choices = SAFE_INDEX_PROFILES.get(ftype)
+    if not choices:
+        return None
+    return random.choice(choices)
+
+
+def field_config_to_payload_schema(field_config):
+    ftype = field_config.get("type")
+    profile = field_config.get("index_profile")
+
+    if ftype in (FieldType.STRING, FieldType.ARRAY_STR):
+        if profile == "keyword_tenant":
+            return KeywordIndexParams(type=KeywordIndexType.KEYWORD, is_tenant=True)
+        if profile == "keyword_on_disk":
+            return KeywordIndexParams(type=KeywordIndexType.KEYWORD, on_disk=True)
+        return PayloadSchemaType.KEYWORD
+
+    if ftype in (FieldType.INT, FieldType.ARRAY_INT):
+        if profile == "integer_lookup_only_on_disk":
+            return IntegerIndexParams(
+                type=IntegerIndexType.INTEGER,
+                lookup=True,
+                range=False,
+                on_disk=True,
+            )
+        if profile == "integer_range_only_principal_on_disk":
+            return IntegerIndexParams(
+                type=IntegerIndexType.INTEGER,
+                lookup=False,
+                range=True,
+                is_principal=True,
+                on_disk=True,
+            )
+        if profile == "integer_principal":
+            return IntegerIndexParams(type=IntegerIndexType.INTEGER, is_principal=True)
+        if profile == "integer_on_disk":
+            return IntegerIndexParams(type=IntegerIndexType.INTEGER, on_disk=True)
+        return PayloadSchemaType.INTEGER
+
+    if ftype in (FieldType.FLOAT, FieldType.ARRAY_FLOAT):
+        if profile == "float_principal":
+            return FloatIndexParams(type=FloatIndexType.FLOAT, is_principal=True)
+        if profile == "float_on_disk":
+            return FloatIndexParams(type=FloatIndexType.FLOAT, on_disk=True)
+        return PayloadSchemaType.FLOAT
+
+    if ftype == FieldType.UUID:
+        if profile == "uuid_tenant":
+            return UuidIndexParams(type=UuidIndexType.UUID, is_tenant=True)
+        if profile == "uuid_on_disk":
+            return UuidIndexParams(type=UuidIndexType.UUID, on_disk=True)
+        return PayloadSchemaType.UUID
+
+    if ftype == FieldType.BOOL:
+        if profile == "bool_on_disk":
+            return BoolIndexParams(type=BoolIndexType.BOOL, on_disk=True)
+        return PayloadSchemaType.BOOL
+
+    if ftype == FieldType.DATETIME:
+        if profile == "datetime_principal":
+            return DatetimeIndexParams(type=DatetimeIndexType.DATETIME, is_principal=True)
+        if profile == "datetime_on_disk":
+            return DatetimeIndexParams(type=DatetimeIndexType.DATETIME, on_disk=True)
+        return PayloadSchemaType.DATETIME
+
+    if ftype == FieldType.GEO:
+        if profile == "geo_on_disk":
+            return GeoIndexParams(type=GeoIndexType.GEO, on_disk=True)
+        return PayloadSchemaType.GEO
+
+    return None
+
 def get_type_name(dtype):
     """Map field type to string"""
     return dtype
@@ -208,6 +569,7 @@ class DataManager:
         self.df = None
         self.vectors = None
         self.schema_config = []
+        self.payload_presence = None
         self.INT64_MIN = -(2 ** 63)
         self.INT64_MAX = (2 ** 63) - 1
         if data_seed is None:
@@ -631,6 +993,101 @@ class DataManager:
             return
         self.df = self.coerce_dataframe_types(self.df)
 
+    def schema_field_names(self):
+        return [field["name"] for field in self.schema_config]
+
+    def initialize_payload_presence(self, present: bool = True):
+        """
+        Track whether a payload key is physically present for each row.
+
+        Pandas stores both missing payload keys and explicit JSON null as
+        None/NA. Qdrant's `is_null` distinguishes them, so payload mutation
+        tests need a side-channel to keep the oracle precise.
+        """
+        if self.df is None:
+            return
+        self.payload_presence = pd.DataFrame(
+            bool(present),
+            index=self.df.index,
+            columns=self.schema_field_names(),
+            dtype=bool,
+        )
+
+    def ensure_payload_presence(self):
+        if self.df is None:
+            return
+        field_names = self.schema_field_names()
+        if self.payload_presence is None:
+            self.initialize_payload_presence(present=True)
+            return
+
+        self.payload_presence = self.payload_presence.reindex(index=self.df.index)
+        for field_name in field_names:
+            if field_name not in self.payload_presence.columns:
+                self.payload_presence[field_name] = True
+        extra_columns = [col for col in self.payload_presence.columns if col not in field_names]
+        if extra_columns:
+            self.payload_presence = self.payload_presence.drop(columns=extra_columns)
+        self.payload_presence = self.payload_presence[field_names].fillna(True).astype(bool)
+
+    def add_payload_presence_field(self, field_name: str, present: bool = False):
+        if self.df is None:
+            return
+        self.ensure_payload_presence()
+        self.payload_presence[field_name] = bool(present)
+
+    def set_payload_presence_by_indices(self, indices, field_names, present: bool):
+        if self.df is None:
+            return
+        self.ensure_payload_presence()
+        if isinstance(field_names, str):
+            field_names = [field_names]
+        clean_indices = [int(idx) for idx in indices if int(idx) in self.df.index]
+        clean_fields = [field for field in field_names if field in self.payload_presence.columns]
+        if clean_indices and clean_fields:
+            self.payload_presence.loc[clean_indices, clean_fields] = bool(present)
+
+    def append_payload_presence_rows(self, count: int, present: bool = True):
+        if count <= 0:
+            return
+        self.ensure_payload_presence()
+        start = len(self.payload_presence)
+        new_index = range(start, start + count)
+        new_presence = pd.DataFrame(
+            bool(present),
+            index=new_index,
+            columns=self.schema_field_names(),
+            dtype=bool,
+        )
+        self.payload_presence = pd.concat([self.payload_presence, new_presence], axis=0)
+
+    def drop_payload_presence_indices(self, indices):
+        self.ensure_payload_presence()
+        clean_indices = [int(idx) for idx in indices if int(idx) in self.payload_presence.index]
+        if clean_indices:
+            self.payload_presence = self.payload_presence.drop(clean_indices).reset_index(drop=True)
+
+    def _missing_value_for_field(self, field_name: str):
+        field_type = next((field["type"] for field in self.schema_config if field["name"] == field_name), None)
+        if field_type in (FieldType.INT, FieldType.BOOL):
+            return pd.NA
+        return None
+
+    def mark_payload_fields_missing(self, indices, field_names):
+        if isinstance(field_names, str):
+            field_names = [field_names]
+        clean_indices = [int(idx) for idx in indices if int(idx) in self.df.index]
+        clean_fields = [field for field in field_names if field in self.df.columns]
+        if not clean_indices or not clean_fields:
+            return
+        for field_name in clean_fields:
+            self.df.loc[clean_indices, field_name] = self._missing_value_for_field(field_name)
+        self.set_payload_presence_by_indices(clean_indices, clean_fields, False)
+        self.normalize_dataframe_types()
+
+    def mark_payload_fields_present(self, indices, field_names):
+        self.set_payload_presence_by_indices(indices, field_names, True)
+
     def _gen_random_json_structure(self, rng, depth=3):
         """递归生成随机 JSON 结构"""
         if depth == 0 or rng.random() < 0.3:
@@ -743,11 +1200,18 @@ class DataManager:
             ]
         })
 
+        for field in self.schema_config:
+            field["index_profile"] = choose_index_profile(field["type"])
+
         print(f"   -> Generated {len(self.schema_config)} dynamic fields (plus id & vector).")
         print("   -> Schema Structure:")
         for f in self.schema_config:
             t_name = get_type_name(f["type"])
-            print(f"      - {f['name']:<15} : {t_name}")
+            profile = f.get("index_profile")
+            if profile:
+                print(f"      - {f['name']:<15} : {t_name} | index={profile}")
+            else:
+                print(f"      - {f['name']:<15} : {t_name}")
 
     def generate_data(self):
         print(f"🌊 2. Generating {N} rows (Vector Dim={DIM})...")
@@ -870,6 +1334,7 @@ class DataManager:
 
         self.df = pd.DataFrame(data)
         self.normalize_dataframe_types()
+        self.initialize_payload_presence(present=True)
         print("✅ Data Generation Complete.")
 
     def _apply_nulls(self, values, rng):
@@ -1046,6 +1511,7 @@ class DataManager:
             self.df[field_name] = pd.Series([pd.NA] * len(self.df), dtype="boolean")
         else:
             self.df[field_name] = None
+        self.add_payload_presence_field(field_name, present=False)
         self.normalize_dataframe_types()
 
         return field_config
@@ -1082,6 +1548,7 @@ class DataManager:
             # 同步更新 pandas DataFrame
             self.df.at[idx, field_name] = value
 
+        self.mark_payload_fields_present(fill_indices, field_name)
         self.normalize_dataframe_types()
         return backfill_data
 
@@ -1176,6 +1643,18 @@ class QdrantManager:
         kwargs.setdefault("consistency", self._pick_read_consistency())
         return self.client.query_points_groups(**kwargs)
 
+    def count(self, **kwargs):
+        consistency = kwargs.pop("consistency", None)
+        if consistency is None:
+            consistency = self._pick_read_consistency()
+        try:
+            return self.client.count(consistency=consistency, **kwargs)
+        except Exception as exc:
+            msg = str(exc)
+            if "Unknown arguments: ['consistency']" not in msg and "unexpected keyword argument 'consistency'" not in msg:
+                raise
+            return self.client.count(**kwargs)
+
     def upsert(self, **kwargs):
         kwargs.setdefault("ordering", self._pick_write_ordering())
         return self.client.upsert(**kwargs)
@@ -1183,6 +1662,18 @@ class QdrantManager:
     def set_payload(self, **kwargs):
         kwargs.setdefault("ordering", self._pick_write_ordering())
         return self.client.set_payload(**kwargs)
+
+    def overwrite_payload(self, **kwargs):
+        kwargs.setdefault("ordering", self._pick_write_ordering())
+        return self.client.overwrite_payload(**kwargs)
+
+    def delete_payload(self, **kwargs):
+        kwargs.setdefault("ordering", self._pick_write_ordering())
+        return self.client.delete_payload(**kwargs)
+
+    def clear_payload(self, **kwargs):
+        kwargs.setdefault("ordering", self._pick_write_ordering())
+        return self.client.clear_payload(**kwargs)
 
     def create_payload_index(self, **kwargs):
         kwargs.setdefault("ordering", self._pick_write_ordering())
@@ -1195,7 +1686,9 @@ class QdrantManager:
     def reset_collection(self, schema_config):
         global DISTANCE_TYPE
         # 延迟初始化距离度量（在种子设置后随机选取）
-        if DISTANCE_TYPE is None:
+        if FORCED_DISTANCE_TYPE is not None:
+            DISTANCE_TYPE = FORCED_DISTANCE_TYPE
+        elif DISTANCE_TYPE is None:
             DISTANCE_TYPE = random.choice(ALL_DISTANCE_TYPES)
         print(f"📐 Distance Metric: {DISTANCE_TYPE}")
 
@@ -1310,50 +1803,15 @@ class QdrantManager:
         print("🔨 Creating payload indexes...")
         for field in dm.schema_config:
             fname = field["name"]
-            ftype = field["type"]
+            field_schema = field_config_to_payload_schema(field)
+            if field_schema is None:
+                continue
             try:
-                if ftype == FieldType.INT:
-                    self.create_payload_index(
-                        collection_name=COLLECTION_NAME,
-                        field_name=fname,
-                        field_schema=PayloadSchemaType.INTEGER
-                    )
-                elif ftype == FieldType.FLOAT:
-                    self.create_payload_index(
-                        collection_name=COLLECTION_NAME,
-                        field_name=fname,
-                        field_schema=PayloadSchemaType.FLOAT
-                    )
-                elif ftype == FieldType.STRING:
-                    self.create_payload_index(
-                        collection_name=COLLECTION_NAME,
-                        field_name=fname,
-                        field_schema=PayloadSchemaType.KEYWORD
-                    )
-                elif ftype == FieldType.UUID:
-                    self.create_payload_index(
-                        collection_name=COLLECTION_NAME,
-                        field_name=fname,
-                        field_schema=PayloadSchemaType.UUID
-                    )
-                elif ftype == FieldType.BOOL:
-                    self.create_payload_index(
-                        collection_name=COLLECTION_NAME,
-                        field_name=fname,
-                        field_schema=PayloadSchemaType.BOOL
-                    )
-                elif ftype == FieldType.DATETIME:
-                    self.create_payload_index(
-                        collection_name=COLLECTION_NAME,
-                        field_name=fname,
-                        field_schema=PayloadSchemaType.DATETIME
-                    )
-                elif ftype == FieldType.GEO:
-                    self.create_payload_index(
-                        collection_name=COLLECTION_NAME,
-                        field_name=fname,
-                        field_schema=PayloadSchemaType.GEO
-                    )
+                self.create_payload_index(
+                    collection_name=COLLECTION_NAME,
+                    field_name=fname,
+                    field_schema=field_schema
+                )
             except Exception as e:
                 # 索引创建失败不是致命错误
                 pass
@@ -1460,18 +1918,10 @@ class QdrantManager:
     def create_evolved_field_index(self, field_config):
         """为演进字段创建 payload 索引"""
         fname = field_config["name"]
-        ftype = field_config["type"]
-        type_to_schema = {
-            FieldType.INT: PayloadSchemaType.INTEGER,
-            FieldType.FLOAT: PayloadSchemaType.FLOAT,
-            FieldType.STRING: PayloadSchemaType.KEYWORD,
-            FieldType.UUID: PayloadSchemaType.UUID,
-            FieldType.BOOL: PayloadSchemaType.BOOL,
-            FieldType.DATETIME: PayloadSchemaType.DATETIME,
-            FieldType.GEO: PayloadSchemaType.GEO,
-        }
-        schema_type = type_to_schema.get(ftype)
-        if schema_type:
+        schema_cfg = dict(field_config)
+        schema_cfg.setdefault("index_profile", choose_index_profile(schema_cfg.get("type")))
+        schema_type = field_config_to_payload_schema(schema_cfg)
+        if schema_type is not None:
             try:
                 self.create_payload_index(
                     collection_name=COLLECTION_NAME,
@@ -1544,7 +1994,8 @@ class QdrantManager:
         """
         indexable = [f for f in schema_config if f["type"] in (
             FieldType.INT, FieldType.FLOAT, FieldType.STRING, FieldType.UUID,
-            FieldType.BOOL, FieldType.DATETIME, FieldType.GEO
+            FieldType.BOOL, FieldType.DATETIME, FieldType.GEO,
+            FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT,
         )]
         if not indexable:
             return []
@@ -1553,19 +2004,11 @@ class QdrantManager:
         fields_to_rebuild = random.sample(indexable, n_rebuild)
         rebuilt = []
 
-        type_to_schema = {
-            FieldType.INT: PayloadSchemaType.INTEGER,
-            FieldType.FLOAT: PayloadSchemaType.FLOAT,
-            FieldType.STRING: PayloadSchemaType.KEYWORD,
-            FieldType.UUID: PayloadSchemaType.UUID,
-            FieldType.BOOL: PayloadSchemaType.BOOL,
-            FieldType.DATETIME: PayloadSchemaType.DATETIME,
-            FieldType.GEO: PayloadSchemaType.GEO,
-        }
-
         for field in fields_to_rebuild:
             fname = field["name"]
-            ftype = field["type"]
+            field_schema = field_config_to_payload_schema(field)
+            if field_schema is None:
+                continue
             try:
                 # 删除索引
                 self.delete_payload_index(
@@ -1578,7 +2021,7 @@ class QdrantManager:
                 self.create_payload_index(
                     collection_name=COLLECTION_NAME,
                     field_name=fname,
-                    field_schema=type_to_schema.get(ftype, PayloadSchemaType.KEYWORD),
+                    field_schema=field_schema,
                     wait=True
                 )
                 rebuilt.append(fname)
@@ -1722,18 +2165,33 @@ class OracleQueryGenerator:
         """
         return series.astype(object).apply(fn)
 
-    def _series_is_null(self, series):
-        return self._safe_apply(series, self._is_na_like)
+    def _field_presence(self, name):
+        presence = getattr(self._dm, "payload_presence", None)
+        if presence is None or name not in presence.columns:
+            return pd.Series(True, index=self.df.index, dtype=bool)
+        field_presence = presence[name]
+        if not field_presence.index.equals(self.df.index):
+            field_presence = field_presence.reindex(self.df.index, fill_value=True)
+        return field_presence.fillna(False).astype(bool)
 
-    def _series_not_null(self, series):
-        return ~self._series_is_null(series)
+    def _series_is_null(self, series, name=None):
+        null_mask = self._safe_apply(series, self._is_na_like).astype(bool)
+        if name is None:
+            return null_mask
+        return self._field_presence(name) & null_mask
 
-    def _series_is_empty(self, series):
+    def _series_not_null(self, series, name=None):
+        return ~self._series_is_null(series, name)
+
+    def _series_is_empty(self, series, name=None):
         # 对齐 Qdrant IsEmpty：missing/null/[]。在 pandas 中 missing 映射为 None/NaN。
-        return self._safe_apply(series, lambda x: self._is_na_like(x) or (isinstance(x, list) and len(x) == 0))
+        empty_mask = self._safe_apply(series, lambda x: self._is_na_like(x) or (isinstance(x, list) and len(x) == 0)).astype(bool)
+        if name is None:
+            return empty_mask
+        return (~self._field_presence(name)) | empty_mask
 
-    def _series_not_empty(self, series):
-        return ~self._series_is_empty(series)
+    def _series_not_empty(self, series, name=None):
+        return ~self._series_is_empty(series, name)
 
     def _uses_empty_semantics(self, name):
         """演进字段默认无法区分 missing 与显式 null，统一按 IsEmpty 语义处理。"""
@@ -1741,13 +2199,39 @@ class OracleQueryGenerator:
 
     def _series_qdrant_nullish(self, name, series):
         if self._uses_empty_semantics(name):
-            return self._series_is_empty(series)
-        return self._series_is_null(series)
+            return self._series_is_empty(series, name)
+        return self._series_is_null(series, name)
 
     def _series_qdrant_not_nullish(self, name, series):
         if self._uses_empty_semantics(name):
-            return self._series_not_empty(series)
-        return self._series_not_null(series)
+            return self._series_not_empty(series, name)
+        return self._series_not_null(series, name)
+
+    def _series_values_count(self, name, series, cmp_op, threshold):
+        present_mask = self._field_presence(name)
+
+        def _count_match(idx, value):
+            if not bool(present_mask.loc[idx]):
+                return False
+            if isinstance(value, list):
+                cnt = len(value)
+            elif self._is_na_like(value):
+                cnt = 0
+            else:
+                cnt = 1
+            if cmp_op == "gt":
+                return cnt > threshold
+            if cmp_op == "gte":
+                return cnt >= threshold
+            if cmp_op == "lt":
+                return cnt < threshold
+            return cnt <= threshold
+
+        return pd.Series(
+            [_count_match(idx, value) for idx, value in series.astype(object).items()],
+            index=series.index,
+            dtype=bool,
+        )
 
     def _nullish_expr(self, name):
         return f"{name} is empty" if self._uses_empty_semantics(name) else f"{name} is null"
@@ -1847,6 +2331,165 @@ class OracleQueryGenerator:
             else:
                 out.append(val)
         return out
+
+    def _iter_array_object_items(self, obj):
+        if not isinstance(obj, list):
+            return []
+        return [item for item in obj if isinstance(item, dict)]
+
+    def _array_object_leaf_values(self, obj, leaf_key):
+        out = []
+        for item in self._iter_array_object_items(obj):
+            value = item.get(leaf_key)
+            if value is not None:
+                out.append(value)
+        return out
+
+    def _array_object_projected_path(self, name, leaf_key):
+        return f"{name}[].{leaf_key}"
+
+    def gen_array_object_projected_expr(self, name, series):
+        """
+        生成 ARRAY_OBJECT 的 projected-path 查询，例如 items[].score / items[].label。
+        多个顶层字段条件在 Qdrant 中各自对投影值求值，因此允许 sibling 元素跨元素累积满足。
+        """
+        candidate_rows = []
+        score_values = []
+        label_values = []
+        active_values = []
+        cross_score_label_pairs = []
+
+        for raw in series.dropna():
+            items = self._iter_array_object_items(raw)
+            if not items:
+                continue
+            candidate_rows.append(items)
+            row_pairs = {
+                (int(item["score"]), str(item["label"]))
+                for item in items
+                if item.get("score") is not None and item.get("label") is not None
+            }
+            for item in items:
+                if item.get("score") is not None:
+                    score_values.append(int(item["score"]))
+                if item.get("label") is not None:
+                    label_values.append(str(item["label"]))
+                if item.get("active") is not None:
+                    active_values.append(bool(item["active"]))
+            if len(items) >= 2:
+                for left in items:
+                    left_score = left.get("score")
+                    if left_score is None:
+                        continue
+                    for right in items:
+                        if right is left:
+                            continue
+                        right_label = right.get("label")
+                        if right_label is None:
+                            continue
+                        pair = (int(left_score), str(right_label))
+                        if pair not in row_pairs:
+                            cross_score_label_pairs.append(pair)
+
+        if not candidate_rows:
+            return self._qdrant_is_empty_filter(name), self._series_is_empty(series, name), f"{name} is empty"
+
+        score_list = sorted(dict.fromkeys(score_values))
+        label_list = sorted(dict.fromkeys(label_values))
+        active_list = sorted(dict.fromkeys(active_values))
+        cross_score_label_pairs = list(dict.fromkeys(cross_score_label_pairs))
+
+        strategies = []
+        if score_list:
+            strategies.extend(["score_exact", "score_range"])
+        if label_list:
+            strategies.append("label_exact")
+        if active_list:
+            strategies.append("active_exact")
+        if cross_score_label_pairs:
+            strategies.append("cross_element_score_label_and")
+
+        if not strategies:
+            return self._qdrant_not_empty_filter(name), self._series_not_empty(series, name), f"{name} is not empty"
+
+        strategy = random.choice(strategies)
+
+        if strategy == "score_exact":
+            score_val = random.choice(score_list)
+            path = self._array_object_projected_path(name, "score")
+            filter_obj = FieldCondition(key=path, match=MatchValue(value=score_val))
+            mask = self._safe_apply(
+                series,
+                lambda x, target=score_val: any(v == target for v in self._array_object_leaf_values(x, "score")),
+            )
+            return filter_obj, mask, f"{path} == {score_val} (projected)"
+
+        if strategy == "score_range":
+            score_val = random.choice(score_list)
+            cmp_op = random.choice(["gt", "lt", "gte", "lte"])
+            path = self._array_object_projected_path(name, "score")
+            filter_obj = FieldCondition(key=path, range=Range(**{cmp_op: score_val}))
+
+            def _score_matches(values, op=cmp_op, target=score_val):
+                for value in values:
+                    if op == "gt" and value > target:
+                        return True
+                    if op == "lt" and value < target:
+                        return True
+                    if op == "gte" and value >= target:
+                        return True
+                    if op == "lte" and value <= target:
+                        return True
+                return False
+
+            mask = self._safe_apply(
+                series,
+                lambda x: _score_matches(self._array_object_leaf_values(x, "score")),
+            )
+            op_symbol = {"gt": ">", "lt": "<", "gte": ">=", "lte": "<="}[cmp_op]
+            return filter_obj, mask, f"{path} {op_symbol} {score_val} (projected)"
+
+        if strategy == "label_exact":
+            label_val = random.choice(label_list)
+            path = self._array_object_projected_path(name, "label")
+            filter_obj = FieldCondition(key=path, match=MatchValue(value=label_val))
+            mask = self._safe_apply(
+                series,
+                lambda x, target=label_val: any(v == target for v in self._array_object_leaf_values(x, "label")),
+            )
+            return filter_obj, mask, f'{path} == "{label_val}" (projected)'
+
+        if strategy == "active_exact":
+            active_val = random.choice(active_list)
+            path = self._array_object_projected_path(name, "active")
+            filter_obj = FieldCondition(key=path, match=MatchValue(value=active_val))
+            mask = self._safe_apply(
+                series,
+                lambda x, target=active_val: any(v == target for v in self._array_object_leaf_values(x, "active")),
+            )
+            return filter_obj, mask, f"{path} == {active_val} (projected)"
+
+        score_val, label_val = random.choice(cross_score_label_pairs)
+        score_path = self._array_object_projected_path(name, "score")
+        label_path = self._array_object_projected_path(name, "label")
+        filter_obj = Filter(
+            must=[
+                FieldCondition(key=score_path, match=MatchValue(value=score_val)),
+                FieldCondition(key=label_path, match=MatchValue(value=label_val)),
+            ]
+        )
+        mask = self._safe_apply(
+            series,
+            lambda x, score_target=score_val, label_target=label_val: (
+                any(v == score_target for v in self._array_object_leaf_values(x, "score"))
+                and any(v == label_target for v in self._array_object_leaf_values(x, "label"))
+            ),
+        )
+        expr = (
+            f"{score_path} == {score_val} AND {label_path} == \"{label_val}\" "
+            f"(projected cross-element)"
+        )
+        return filter_obj, mask, expr
 
     def get_value_for_query(self, fname, ftype):
         """获取用于查询的值"""
@@ -1949,33 +2592,33 @@ class OracleQueryGenerator:
             if self._is_evolved_field(name):
                 if evolved_field_use_empty_semantics():
                     if random.random() < 0.5:
-                        return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
-                    return (self._qdrant_not_empty_filter(name), self._series_not_empty(series), f"{name} is not empty")
+                        return (self._qdrant_is_empty_filter(name), self._series_is_empty(series, name), f"{name} is empty")
+                    return (self._qdrant_not_empty_filter(name), self._series_not_empty(series, name), f"{name} is not empty")
                 if random.random() < 0.5:
-                    return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
-                return (self._qdrant_not_null_filter(name), self._series_not_null(series), f"{name} is not null")
+                    return (self._qdrant_is_null_filter(name), self._series_is_null(series, name), f"{name} is null")
+                return (self._qdrant_not_null_filter(name), self._series_not_null(series, name), f"{name} is not null")
 
             if ftype in [FieldType.ARRAY_INT, FieldType.ARRAY_STR, FieldType.ARRAY_FLOAT, FieldType.ARRAY_OBJECT]:
                 op = random.choice(["is_null", "is_not_null", "is_empty", "is_not_empty"])
                 if op == "is_null":
-                    return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
+                    return (self._qdrant_is_null_filter(name), self._series_is_null(series, name), f"{name} is null")
                 if op == "is_not_null":
-                    return (self._qdrant_not_null_filter(name), self._series_not_null(series), f"{name} is not null")
+                    return (self._qdrant_not_null_filter(name), self._series_not_null(series, name), f"{name} is not null")
                 if op == "is_empty":
-                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
-                return (self._qdrant_not_empty_filter(name), self._series_not_empty(series), f"{name} is not empty")
+                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series, name), f"{name} is empty")
+                return (self._qdrant_not_empty_filter(name), self._series_not_empty(series, name), f"{name} is not empty")
 
             if random.random() < 0.5:
-                return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
-            return (self._qdrant_not_null_filter(name), self._series_not_null(series), f"{name} is not null")
+                return (self._qdrant_is_null_filter(name), self._series_is_null(series, name), f"{name} is null")
+            return (self._qdrant_not_null_filter(name), self._series_not_null(series, name), f"{name} is not null")
 
         val = self.get_value_for_query(name, ftype)
         if val is None:
             if self._is_evolved_field(name):
                 if evolved_field_use_empty_semantics():
-                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series), f"{name} is empty")
-                return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
-            return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
+                    return (self._qdrant_is_empty_filter(name), self._series_is_empty(series, name), f"{name} is empty")
+                return (self._qdrant_is_null_filter(name), self._series_is_null(series, name), f"{name} is null")
+            return (self._qdrant_is_null_filter(name), self._series_is_null(series, name), f"{name} is null")
 
         # 安全比较函数 - 处理 None 和 NaN
         def safe_compare_scalar(op, target_val):
@@ -2228,27 +2871,8 @@ class OracleQueryGenerator:
                     values_count=models.ValuesCount(**{cmp_op: threshold})
                 )
 
-                def _count_match(x, _op=cmp_op, _t=threshold):
-                    # Qdrant 语义：
-                    # - array: count=len(array)
-                    # - null:  count=0
-                    # - scalar(non-array): count=1
-                    if isinstance(x, list):
-                        cnt = len(x)
-                    elif self._is_na_like(x):
-                        cnt = 0
-                    else:
-                        cnt = 1
-                    if _op == "gt":
-                        return cnt > _t
-                    if _op == "gte":
-                        return cnt >= _t
-                    if _op == "lt":
-                        return cnt < _t
-                    return cnt <= _t
-
                 op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
-                mask = self._safe_apply(series, _count_match)
+                mask = self._series_values_count(name, series, cmp_op, threshold)
                 expr_str = f"{name} values_count {op_map[cmp_op]} {threshold}"
             elif array_op == "contains" and unique_items:
                 target = random.choice(unique_items)
@@ -2281,7 +2905,7 @@ class OracleQueryGenerator:
                 expr_str = f'{name} has element not in {excl_vals}'
             else:
                 filter_cond = self._qdrant_not_empty_filter(name)
-                mask = self._series_not_empty(series)
+                mask = self._series_not_empty(series, name)
                 expr_str = f'{name} is not empty'
 
         elif ftype == FieldType.ARRAY_FLOAT:
@@ -2303,27 +2927,8 @@ class OracleQueryGenerator:
                     values_count=models.ValuesCount(**{cmp_op: threshold})
                 )
 
-                def _count_match_float(x, _op=cmp_op, _t=threshold):
-                    # Qdrant 语义：
-                    # - array: count=len(array)
-                    # - null:  count=0
-                    # - scalar(non-array): count=1
-                    if isinstance(x, list):
-                        cnt = len(x)
-                    elif self._is_na_like(x):
-                        cnt = 0
-                    else:
-                        cnt = 1
-                    if _op == "gt":
-                        return cnt > _t
-                    if _op == "gte":
-                        return cnt >= _t
-                    if _op == "lt":
-                        return cnt < _t
-                    return cnt <= _t
-
                 op_map = {"gt": ">", "gte": ">=", "lt": "<", "lte": "<="}
-                mask = self._safe_apply(series, _count_match_float)
+                mask = self._series_values_count(name, series, cmp_op, threshold)
                 expr_str = f"{name} values_count {op_map[cmp_op]} {threshold}"
             elif array_op == "element_range" and all_items:
                 target = random.choice(all_items)
@@ -2335,13 +2940,13 @@ class OracleQueryGenerator:
                 expr_str = f'{name} has element ~= {target_f}'
             else:
                 filter_cond = self._qdrant_not_empty_filter(name)
-                mask = self._series_not_empty(series)
+                mask = self._series_not_empty(series, name)
                 expr_str = f'{name} is not empty'
 
         elif ftype == FieldType.DATETIME:
             target_ts = self._normalize_datetime_scalar(val)
             if target_ts is None:
-                return (self._qdrant_is_null_filter(name), self._series_is_null(series), f"{name} is null")
+                return (self._qdrant_is_null_filter(name), self._series_is_null(series, name), f"{name} is null")
             val_dt = self._format_datetime_utc(target_ts)
             op = random.choice([">", "<", ">=", "<="])
             if op == ">":
@@ -2450,8 +3055,10 @@ class OracleQueryGenerator:
                 expr_str = f"{name} in radius({center_lat:.2f},{center_lon:.2f}, r={radius_m:.0f}m)"
 
         elif ftype == FieldType.ARRAY_OBJECT:
-            # Nested object filter：使用 NestedCondition 进行对象数组内部过滤
-            return self.gen_nested_expr(name, series)
+            # ARRAY_OBJECT 同时覆盖 nested 同元素语义和 items[].field 投影路径语义。
+            if random.random() < 0.6:
+                return self.gen_nested_expr(name, series)
+            return self.gen_array_object_projected_expr(name, series)
 
         if filter_cond is not None and mask is not None:
             # 由各分支自行定义 null 语义，这里不再统一追加 notnull 截断。
@@ -2669,27 +3276,25 @@ class OracleQueryGenerator:
         Qdrant nested 语义：payload 中对象数组至少有一个元素同时满足所有条件。
         返回: (Filter, pandas_mask, expr_str)
         """
-        # 从 DataFrame 中收集实际存在的值，用于构造有意义的查询
+        # 从 DataFrame 中收集实际存在的值，用于构造有意义的查询；排序避免 set/hash 顺序引入不可复现性。
         valid_series = series.dropna()
-        all_scores = set()
-        all_labels = set()
+        candidate_items = []
+        score_values = []
+        label_values = []
+        active_values = []
         for arr in valid_series:
-            if isinstance(arr, list):
-                for item in arr:
-                    if isinstance(item, dict):
-                        if "score" in item and item["score"] is not None:
-                            all_scores.add(int(item["score"]))
-                        if "label" in item and item["label"] is not None:
-                            all_labels.add(str(item["label"]))
+            for item in self._iter_array_object_items(arr):
+                candidate_items.append(item)
+                if item.get("score") is not None:
+                    score_values.append(int(item["score"]))
+                if item.get("label") is not None:
+                    label_values.append(str(item["label"]))
+                if item.get("active") is not None:
+                    active_values.append(bool(item["active"]))
 
-        # 确保有足够的候选值
-        if not all_scores:
-            all_scores = {0, 10, -10, 50, -50}
-        if not all_labels:
-            all_labels = {"alpha", "beta", "gamma"}
-
-        score_list = list(all_scores)
-        label_list = list(all_labels)
+        score_list = sorted(dict.fromkeys(score_values)) or [-50, -10, 0, 10, 50]
+        label_list = sorted(dict.fromkeys(label_values)) or ["alpha", "beta", "gamma"]
+        active_list = sorted(dict.fromkeys(active_values)) or [False, True]
 
         strategy = random.choice([
             "single_match",   # 单字段精确匹配
@@ -2697,7 +3302,63 @@ class OracleQueryGenerator:
             "multi_and",      # 多字段 AND
             "should_or",      # should (OR) 内嵌
             "must_not",       # must_not 内嵌
+            "inner_min_should",
+            "top_level_must_not_min_should",
         ])
+
+        def _score_cmp(value, op, target):
+            if value is None:
+                return False
+            if op == "gt":
+                return value > target
+            if op == "lt":
+                return value < target
+            if op == "gte":
+                return value >= target
+            if op == "lte":
+                return value <= target
+            return False
+
+        def _build_inner_min_should_bundle():
+            chosen = random.choice(candidate_items) if candidate_items else {
+                "score": random.choice(score_list),
+                "label": random.choice(label_list),
+                "active": random.choice(active_list),
+            }
+            raw_score = chosen.get("score")
+            raw_label = chosen.get("label")
+            raw_active = chosen.get("active")
+            score_val = int(raw_score) if raw_score is not None else random.choice(score_list)
+            label_val = str(raw_label) if raw_label is not None else random.choice(label_list)
+            active_val = bool(raw_active) if raw_active is not None else random.choice(active_list)
+            conditions = [
+                FieldCondition(key="score", range=Range(gte=score_val)),
+                FieldCondition(key="label", match=MatchValue(value=label_val)),
+                FieldCondition(key="active", match=MatchValue(value=active_val)),
+            ]
+            min_count = random.choice([1, 2, len(conditions)])
+
+            def _item_hits(item):
+                if not isinstance(item, dict):
+                    return False
+                hits = 0
+                if _score_cmp(item.get("score"), "gte", score_val):
+                    hits += 1
+                if item.get("label") == label_val:
+                    hits += 1
+                if item.get("active") == active_val:
+                    hits += 1
+                return hits >= min_count
+
+            def _nested_positive_mask(x):
+                return any(_item_hits(item) for item in self._iter_array_object_items(x))
+
+            inner = Filter(min_should=MinShould(conditions=conditions, min_count=min_count))
+            expr = (
+                f'{name} nested(AT_LEAST_{min_count}(score >= {score_val}; '
+                f'label == "{label_val}"; active == {active_val}))'
+            )
+            return inner, _nested_positive_mask, expr
 
         # --- 策略 1: 单字段精确匹配 ---
         if strategy == "single_match":
@@ -2726,10 +3387,10 @@ class OracleQueryGenerator:
                     return any(
                         isinstance(item, dict) and item.get("label") == _v
                         for item in x
-                    )
+                )
                 expr_str = f'{name} nested(label == "{val}")'
             else:  # active
-                val = random.choice([True, False])
+                val = random.choice(active_list)
                 inner_filter = Filter(must=[
                     FieldCondition(key="active", match=MatchValue(value=val))
                 ])
@@ -2801,7 +3462,7 @@ class OracleQueryGenerator:
                     return False
                 expr_str = f'{name} nested(score {score_op_sym} {score_val} AND label == "{label_val}")'
             else:  # active
-                active_val = random.choice([True, False])
+                active_val = random.choice(active_list)
                 inner_filter = Filter(must=[
                     FieldCondition(key="score", range=Range(**{score_op: score_val})),
                     FieldCondition(key="active", match=MatchValue(value=active_val)),
@@ -2851,26 +3512,34 @@ class OracleQueryGenerator:
             expr_str = f"{name} nested(score == {v1} OR score == {v2})"
 
         # --- 策略 5: must_not 内嵌 ---
-        else:  # must_not
+        elif strategy == "must_not":
             # 至少一个元素不满足 active==True（即 active 不为 True）
-            active_val = random.choice([True, False])
+            active_val = random.choice(active_list)
             inner_filter = Filter(must_not=[
                 FieldCondition(key="active", match=MatchValue(value=active_val)),
             ])
             def _mask(x, _av=active_val):
                 if not isinstance(x, list) or not x:
                     return False
-                # Qdrant nested + must_not: 至少一个元素使 must_not 条件生效
-                # 即至少一个元素的 active 字段不等于 _av（或缺失/null → 也不匹配，所以 must_not 保留）
+                # Qdrant nested + must_not: 只对 object 元素做检查；任一 object 未匹配被禁止条件即可命中。
                 for item in x:
                     if not isinstance(item, dict):
-                        # 非 dict 元素不匹配 active==_av → must_not 保留
-                        return True
+                        continue
                     a = item.get("active")
                     if a != _av:
                         return True
                 return False
             expr_str = f"{name} nested(NOT active == {active_val})"
+        elif strategy == "inner_min_should":
+            inner_filter, _mask, expr_str = _build_inner_min_should_bundle()
+        else:  # top_level_must_not_min_should
+            inner_filter, positive_mask_fn, inner_expr = _build_inner_min_should_bundle()
+            nested_cond = NestedCondition(
+                nested=Nested(key=name, filter=inner_filter)
+            )
+            filter_obj = Filter(must_not=[Filter(must=[nested_cond])])
+            positive_mask = self._safe_apply(series, positive_mask_fn).fillna(False)
+            return filter_obj, ~positive_mask, f"NOT ({inner_expr})"
 
         # 构造最终 NestedCondition + Filter
         nested_cond = NestedCondition(
@@ -3291,7 +3960,11 @@ class OracleQueryGenerator:
         filter_l, mask_l, expr_l = self.gen_complex_expr(depth - 1, _retry=0)
         if not filter_l: return self.gen_complex_expr(depth, _retry=_retry + 1)
 
-        op = random.choice(["and", "or", "not"])
+        op = random.choices(
+            ["and", "or", "not", "min_should"],
+            weights=[0.34, 0.30, 0.26, 0.10],
+            k=1,
+        )[0]
 
         if op == "not":
             # NOT 逻辑：取反子表达式
@@ -3301,6 +3974,32 @@ class OracleQueryGenerator:
             mask_lb = self._as_bool_mask(mask_l)
             not_mask = ~mask_lb.fillna(False)
             return not_filter, not_mask, f"NOT ({expr_l})"
+
+        if op == "min_should":
+            children = [(filter_l, mask_l, expr_l)]
+            for _ in range(random.choice([1, 2])):
+                child_filter, child_mask, child_expr = self.gen_complex_expr(depth - 1, _retry=0)
+                if child_filter is not None:
+                    children.append((child_filter, child_mask, child_expr))
+
+            if len(children) < 2:
+                return filter_l, mask_l, expr_l
+
+            edge_counts = [1, len(children)]
+            if len(children) > 1:
+                edge_counts.append(max(1, len(children) - 1))
+            min_count = random.choice(edge_counts)
+            hit_count = pd.Series(0, index=self.df.index, dtype="int64")
+            child_exprs = []
+            child_filters = []
+            for child_filter, child_mask, child_expr in children:
+                child_filters.append(child_filter)
+                child_exprs.append(child_expr)
+                hit_count = hit_count + self._as_bool_mask(child_mask).fillna(False).astype("int64")
+            combined_filter = Filter(
+                min_should=MinShould(conditions=child_filters, min_count=min_count)
+            )
+            return combined_filter, (hit_count >= min_count), f"AT_LEAST_{min_count}({'; '.join(child_exprs)})"
 
         # AND/OR 需要第二个子表达式
         filter_r, mask_r, expr_r = self.gen_complex_expr(depth - 1)
@@ -3602,7 +4301,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 new_must = [new_cond if c is cond else c for c in conditions]
                 mutations.append({
                     "type": "IntRangeShift_gt_to_gte",
-                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should, min_should=base_filter.min_should),
                     "expr": f"{base_expr} [gt={int(rng.gt)} → gte={shifted_val}]"
                 })
                 break
@@ -3616,7 +4315,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 new_must = [new_cond if c is cond else c for c in conditions]
                 mutations.append({
                     "type": "IntRangeShift_lt_to_lte",
-                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should, min_should=base_filter.min_should),
                     "expr": f"{base_expr} [lt={int(rng.lt)} → lte={shifted_val}]"
                 })
                 break
@@ -3630,7 +4329,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 new_must = [new_cond if c is cond else c for c in conditions]
                 mutations.append({
                     "type": "IntRangeShift_gte_to_gt",
-                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should, min_should=base_filter.min_should),
                     "expr": f"{base_expr} [gte={int(rng.gte)} → gt={shifted_val}]"
                 })
                 break
@@ -3644,7 +4343,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 new_must = [new_cond if c is cond else c for c in conditions]
                 mutations.append({
                     "type": "IntRangeShift_lte_to_lt",
-                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should),
+                    "filter": Filter(must=new_must, must_not=base_filter.must_not, should=base_filter.should, min_should=base_filter.min_should),
                     "expr": f"{base_expr} [lte={int(rng.lte)} → lt={shifted_val}]"
                 })
                 break
@@ -3680,7 +4379,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                     if replacement is not None:
                         new_must = list(filter_obj.must)
                         new_must[i] = replacement
-                        return Filter(must=new_must, must_not=filter_obj.must_not, should=filter_obj.should)
+                        return Filter(must=new_must, must_not=filter_obj.must_not, should=filter_obj.should, min_should=filter_obj.min_should)
             # 遍历 should
             if filter_obj.should:
                 for i, cond in enumerate(filter_obj.should):
@@ -3688,7 +4387,7 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                     if replacement is not None:
                         new_should = list(filter_obj.should)
                         new_should[i] = replacement
-                        return Filter(must=filter_obj.must, must_not=filter_obj.must_not, should=new_should)
+                        return Filter(must=filter_obj.must, must_not=filter_obj.must_not, should=new_should, min_should=filter_obj.min_should)
             # 遍历 must_not
             if filter_obj.must_not:
                 for i, cond in enumerate(filter_obj.must_not):
@@ -3696,7 +4395,19 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                     if replacement is not None:
                         new_must_not = list(filter_obj.must_not)
                         new_must_not[i] = replacement
-                        return Filter(must=filter_obj.must, must_not=new_must_not, should=filter_obj.should)
+                        return Filter(must=filter_obj.must, must_not=new_must_not, should=filter_obj.should, min_should=filter_obj.min_should)
+            # 遍历 min_should
+            if filter_obj.min_should:
+                for i, cond in enumerate(filter_obj.min_should.conditions):
+                    replacement = _find_and_replace(cond)
+                    if replacement is not None:
+                        new_conditions = list(filter_obj.min_should.conditions)
+                        new_conditions[i] = replacement
+                        new_min_should = MinShould(
+                            conditions=new_conditions,
+                            min_count=filter_obj.min_should.min_count,
+                        )
+                        return Filter(must=filter_obj.must, must_not=filter_obj.must_not, should=filter_obj.should, min_should=new_min_should)
             return None
 
         result = _find_and_replace(base_filter)
@@ -4240,7 +4951,7 @@ class PQSQueryGenerator(OracleQueryGenerator):
             if not isinstance(val, list) or len(val) == 0:
                 return self._qdrant_is_empty_filter(fname), f"{fname} is empty"
             # 从数组中选一个有效的子对象
-            valid_items = [item for item in val if isinstance(item, dict)]
+            valid_items = self._iter_array_object_items(val)
             if not valid_items:
                 return self._qdrant_is_empty_filter(fname), f"{fname} is empty"
             chosen = random.choice(valid_items)
@@ -4319,6 +5030,60 @@ class PQSQueryGenerator(OracleQueryGenerator):
                     )]),
                     f"{fname} nested(NOT active == {forbidden})"
                 ))
+            # 策略7: inner min_should（同一 nested object 内至少两个子谓词成立）
+            if (
+                "score" in chosen and chosen["score"] is not None
+                and "label" in chosen and chosen["label"] is not None
+                and "active" in chosen and chosen["active"] is not None
+            ):
+                sv = int(chosen["score"])
+                lv = str(chosen["label"])
+                av = bool(chosen["active"])
+                strategies.append((
+                    Filter(must=[NestedCondition(
+                        nested=Nested(key=fname, filter=Filter(min_should=MinShould(
+                            conditions=[
+                                FieldCondition(key="score", range=Range(gte=sv)),
+                                FieldCondition(key="label", match=MatchValue(value=lv)),
+                                FieldCondition(key="active", match=MatchValue(value=av)),
+                            ],
+                            min_count=2,
+                        )))
+                    )]),
+                    f'{fname} nested(AT_LEAST_2(score >= {sv}; label == "{lv}"; active == {av}))'
+                ))
+            # 策略8: projected key-path 跨 sibling 元素累积命中（与 nested 同元素语义形成对照）
+            if len(valid_items) >= 2:
+                pair_added = False
+                row_pairs = {
+                    (int(item["score"]), str(item["label"]))
+                    for item in valid_items
+                    if item.get("score") is not None and item.get("label") is not None
+                }
+                for left in valid_items:
+                    left_score = left.get("score")
+                    if left_score is None:
+                        continue
+                    for right in valid_items:
+                        if right is left:
+                            continue
+                        right_label = right.get("label")
+                        if right_label is None:
+                            continue
+                        pair = (int(left_score), str(right_label))
+                        if pair in row_pairs:
+                            continue
+                        strategies.append((
+                            Filter(must=[
+                                FieldCondition(key=f"{fname}[].score", match=MatchValue(value=pair[0])),
+                                FieldCondition(key=f"{fname}[].label", match=MatchValue(value=pair[1])),
+                            ]),
+                            f'{fname}[].score == {pair[0]} AND {fname}[].label == "{pair[1]}" (projected cross-element)'
+                        ))
+                        pair_added = True
+                        break
+                    if pair_added:
+                        break
             if strategies:
                 return random.choice(strategies)
             return self._qdrant_not_null_filter(fname), self._not_nullish_expr(fname)
@@ -4629,13 +5394,17 @@ def print_diff_evidence(dm, qm, diff_ids, label, expr_str, file_log):
     if not diff_ids:
         return
 
-    sample_ids = list(diff_ids)[:5]
-    file_log(f"\n  === {label} Evidence (up to {len(sample_ids)} IDs) ===")
+    evidence_ids = sample_ids(diff_ids, 5)
+    file_log(f"\n  === {label} Evidence (up to {len(evidence_ids)} IDs) ===")
+    file_log(f"  Collection: {COLLECTION_NAME}")
 
     # 获取 Qdrant 实际数据
-    qdrant_data = query_qdrant_rows(qm, sample_ids, limit=5)
+    qdrant_data = query_qdrant_rows(qm, evidence_ids, limit=5)
+    retrieved_ids = sample_ids(qdrant_data.keys(), 5)
+    if retrieved_ids and retrieved_ids != evidence_ids[:len(retrieved_ids)]:
+        file_log(f"  Retrieved IDs: {retrieved_ids}")
 
-    for sid in sample_ids:
+    for sid in evidence_ids:
         file_log(f"  --- ID: {sid} ---")
 
         # Pandas 侧数据
@@ -4709,6 +5478,8 @@ def _do_schema_evolution(dm, qm, file_log):
             unfilled_ids = list(all_ids - backfilled_ids)
             if unfilled_ids:
                 null_count = qm.set_null_for_points(field_name, unfilled_ids)
+                unfilled_indices = dm.df.index[dm.df["id"].isin(unfilled_ids)].tolist()
+                dm.mark_payload_fields_present(unfilled_indices, field_name)
                 file_log(
                     f"[SchemaEvolution] Explicitly set NULL for {null_count}/{len(unfilled_ids)} rows on '{field_name}'"
                 )
@@ -4729,11 +5500,172 @@ def _do_schema_evolution(dm, qm, file_log):
         print(f"   ⚠️ Schema Evolution failed: {e}")
         return False
 
+
+PAYLOAD_MUTATION_FIELD_TYPES = {
+    FieldType.INT,
+    FieldType.FLOAT,
+    FieldType.BOOL,
+    FieldType.STRING,
+    FieldType.UUID,
+    FieldType.DATETIME,
+    FieldType.GEO,
+    FieldType.JSON,
+    FieldType.ARRAY_INT,
+    FieldType.ARRAY_STR,
+    FieldType.ARRAY_FLOAT,
+    FieldType.ARRAY_OBJECT,
+}
+
+
+def _payload_json_preview(payload, max_len=500):
+    try:
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    except Exception:
+        text = repr(payload)
+    if len(text) > max_len:
+        return text[:max_len] + "...<truncated>"
+    return text
+
+
+def _pick_payload_mutation_targets(dm, max_points=4):
+    if dm.df is None or dm.df.empty:
+        return [], []
+    count = min(random.randint(1, max_points), len(dm.df))
+    indices = random.sample(list(dm.df.index), count)
+    ids = _to_native_point_ids(dm.df.loc[indices, "id"].tolist())
+    return indices, ids
+
+
+def _pick_payload_mutation_fields(dm, max_fields=3):
+    candidates = [
+        field for field in dm.schema_config
+        if field["type"] in PAYLOAD_MUTATION_FIELD_TYPES
+    ]
+    if not candidates:
+        return []
+    count = min(random.randint(1, max_fields), len(candidates))
+    return random.sample(candidates, count)
+
+
+def _build_payload_mutation_payload(dm, fields):
+    payload = {}
+    for field in fields:
+        field_name = field["name"]
+        field_type = field["type"]
+        value = dm.generate_field_value(field)
+        value = dm._normalize_scalar_for_field(value, field_type)
+        if value is None:
+            # set_payload(None) does not reliably create explicit null in Qdrant;
+            # explicit-null behavior remains covered by upsert/schema-evolution
+            # paths and dedicated operator tests.
+            continue
+        payload[field_name] = value
+    return payload
+
+
+def _apply_payload_values_to_df(dm, indices, payload):
+    if not payload:
+        return
+    for idx in indices:
+        for field_name, value in payload.items():
+            if field_name in dm.df.columns:
+                dm.df.at[int(idx), field_name] = copy.deepcopy(value)
+    dm.mark_payload_fields_present(indices, list(payload.keys()))
+    dm.normalize_dataframe_types()
+
+
+def _do_payload_mutation_op(dm, qm, file_log):
+    """
+    执行一次 payload mutation 子操作，并同步 pandas oracle 状态。
+
+    该路径只在 --payload-mutations 下开启。它依赖 payload_presence
+    区分“字段缺失”和“显式 null”，避免 delete/clear/overwrite 后把
+    Qdrant 的 missing-key 语义误当成 null。
+    """
+    indices, point_ids = _pick_payload_mutation_targets(dm)
+    if not point_ids:
+        return False
+
+    op = random.choices(
+        ["set_payload", "delete_payload", "overwrite_payload", "clear_payload"],
+        weights=[0.45, 0.25, 0.20, 0.10],
+        k=1,
+    )[0]
+
+    fields = _pick_payload_mutation_fields(dm)
+    if op != "clear_payload" and not fields:
+        return False
+
+    field_names = [field["name"] for field in fields]
+    try:
+        if op == "set_payload":
+            payload = _build_payload_mutation_payload(dm, fields)
+            if not payload:
+                return False
+            qm.set_payload(
+                collection_name=COLLECTION_NAME,
+                payload=payload,
+                points=point_ids,
+                wait=True,
+            )
+            _apply_payload_values_to_df(dm, indices, payload)
+            file_log(
+                f"[DynamicPayload] set_payload ids={point_ids} "
+                f"fields={list(payload.keys())} payload={_payload_json_preview(payload)}"
+            )
+            return True
+
+        if op == "delete_payload":
+            qm.delete_payload(
+                collection_name=COLLECTION_NAME,
+                keys=field_names,
+                points=point_ids,
+                wait=True,
+            )
+            dm.mark_payload_fields_missing(indices, field_names)
+            file_log(f"[DynamicPayload] delete_payload ids={point_ids} fields={field_names}")
+            return True
+
+        if op == "overwrite_payload":
+            payload = _build_payload_mutation_payload(dm, fields)
+            if not payload:
+                return False
+            qm.overwrite_payload(
+                collection_name=COLLECTION_NAME,
+                payload=payload,
+                points=point_ids,
+                wait=True,
+            )
+            dm.mark_payload_fields_missing(indices, dm.schema_field_names())
+            _apply_payload_values_to_df(dm, indices, payload)
+            file_log(
+                f"[DynamicPayload] overwrite_payload ids={point_ids} "
+                f"fields={list(payload.keys())} payload={_payload_json_preview(payload)}"
+            )
+            return True
+
+        qm.clear_payload(
+            collection_name=COLLECTION_NAME,
+            points_selector=point_ids,
+            wait=True,
+        )
+        dm.mark_payload_fields_missing(indices, dm.schema_field_names())
+        file_log(f"[DynamicPayload] clear_payload ids={point_ids}")
+        return True
+    except Exception as e:
+        file_log(f"[DynamicPayload] {op} failed: {e}")
+        return False
+
+
 def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
     """
     执行一次随机动态数据操作（insert/delete/upsert）。
     同时同步 dm.df 和 dm.vectors。
     """
+    if PAYLOAD_MUTATIONS_ENABLED and random.random() < 0.40:
+        if _do_payload_mutation_op(dm, qm, file_log):
+            return
+
     op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
     batch_count = random.randint(1, 5)
 
@@ -4781,6 +5713,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
             new_df = pd.DataFrame(new_rows, dtype=object)
             new_df = dm.coerce_dataframe_types(new_df)
             new_df = new_df.dropna(axis=1, how='all')  # 避免全NA列的 FutureWarning
+            dm.append_payload_presence_rows(len(new_rows), present=True)
             dm.df = pd.concat([dm.df, new_df], ignore_index=True)
             dm.vectors = np.vstack([dm.vectors, np.array(new_vecs)])
             dm.normalize_dataframe_types()
@@ -4801,6 +5734,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                     wait=True
                 )
                 idx = dm.df[dm.df["id"].isin(del_ids)].index.to_numpy()
+                dm.drop_payload_presence_indices(idx)
                 dm.df = dm.df.drop(idx).reset_index(drop=True)
                 dm.vectors = np.delete(dm.vectors, idx, axis=0)
                 dm.normalize_dataframe_types()
@@ -4854,6 +5788,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                     idx = match_idx[0]
                     for k, v in row.items():
                         dm.df.at[idx, k] = v
+                    dm.mark_payload_fields_present([idx], dm.schema_field_names())
                     dm.vectors[idx] = vec
                 else:
                     new_rows.append(row)
@@ -4863,6 +5798,7 @@ def _do_dynamic_op(dm, qm, file_log, delete_min_rows=100):
                 new_df = pd.DataFrame(new_rows, dtype=object)
                 new_df = dm.coerce_dataframe_types(new_df)
                 new_df = new_df.dropna(axis=1, how='all')  # 避免全NA列的 FutureWarning
+                dm.append_payload_presence_rows(len(new_rows), present=True)
                 dm.df = pd.concat([dm.df, new_df], ignore_index=True)
                 dm.vectors = np.vstack([dm.vectors, np.array(new_vectors)])
             dm.normalize_dataframe_types()
@@ -4939,6 +5875,8 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
         random.seed(seed)
         np.random.seed(seed)
 
+    collection_name = set_collection_name("oracle", current_seed)
+
     # 1. 初始化随机化配置（种子已设置，确保可复现）
     _init_vector_check_config()
 
@@ -4955,10 +5893,21 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
         print(f"🔧 Synced FLOAT payloads from Qdrant for oracle alignment: {synced} rows.")
 
     # 2. 日志设置
-    timestamp = int(time.time())
-    log_filename = make_log_path(f"qdrant_fuzz_test_{timestamp}.log")
+    log_filename = make_mode_log_path("oracle", current_seed)
+    reproduce_command = build_reproduce_command("oracle", current_seed, rounds, enable_dynamic_ops)
+    manifest_path = write_run_manifest(
+        log_filename,
+        "oracle",
+        current_seed,
+        rounds,
+        reproduce_command,
+        enable_dynamic_ops,
+        schema_config=dm.schema_config,
+    )
     print(f"\n📝 详细日志将写入: {display_path(log_filename)}")
-    print(f"   🔑 如需复现此次测试，运行: python qdrant_fuzz_oracle.py --seed {current_seed}")
+    print(f"   Manifest: {display_path(manifest_path)}")
+    print(f"   Collection: {collection_name}")
+    print(f"   🔑 如需复现此次测试，运行: {reproduce_command}")
     print(f"🚀 开始测试 (控制台仅显示失败案例)...")
 
     qg = OracleQueryGenerator(dm)
@@ -4974,7 +5923,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
         def sample_rows(id_set, limit=5):
             if not id_set:
                 return []
-            subset = dm.df[dm.df["id"].isin(list(id_set))]
+            subset = dm.df[dm.df["id"].isin(list(id_set))].sort_values("id", kind="stable")
             rows = []
             for ridx in range(min(limit, len(subset))):
                 raw = dataframe_row_to_dict(subset, ridx)
@@ -4982,6 +5931,9 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
             return rows
 
         file_log(f"Start Testing: {total_test} rounds | Seed: {current_seed}")
+        file_log(f"Reproduce: {reproduce_command}")
+        file_log(f"Manifest: {manifest_path}")
+        file_log(f"Collection: {collection_name}")
         file_log(_format_transport_line(qm))
         tw = _transport_warning_line()
         if tw:
@@ -5024,39 +5976,97 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                 start_t = time.time()
 
                 # Qdrant 查询
-                scroll_limit = len(dm.df) + 1000  # 动态数据量自适应
-                scroll_result = qm.scroll(
-                    collection_name=COLLECTION_NAME,
-                    scroll_filter=filter_obj,
-                    limit=scroll_limit,
+                scroll_result, scroll_plan = execute_scroll_query(
+                    qm,
+                    COLLECTION_NAME,
+                    filter_obj,
+                    len(dm.df),
                     with_payload=False,
-                    with_vectors=False
+                    with_vectors=False,
                 )
 
                 actual_ids = set()
-                for point in scroll_result[0]:
+                for point in scroll_result:
                     actual_ids.add(point.id)
 
                 cost = (time.time() - start_t) * 1000
 
                 file_log(f"  Pandas: {len(expected_ids)} | Qdrant: {len(actual_ids)} | Time: {cost:.1f}ms")
+                file_log(f"  Scroll: {format_scroll_plan(scroll_plan)}")
+                scroll_matches_oracle = expected_ids == actual_ids
 
-                if expected_ids == actual_ids:
+                if should_run_count_cross_check(scroll_plan):
+                    try:
+                        count_result = qm.count(
+                            collection_name=COLLECTION_NAME,
+                            count_filter=filter_obj,
+                            exact=True,
+                        )
+                        count_hits = int(count_result.count)
+                        file_log(
+                            f"  CountCheck: count={count_hits} | scroll={len(actual_ids)} | pandas={len(expected_ids)}"
+                        )
+                        if count_hits != len(actual_ids):
+                            detail = (
+                                f"Count/scroll mismatch: count={count_hits}, scroll={len(actual_ids)}, "
+                                f"pandas={len(expected_ids)}"
+                            )
+                            print(f"\n⚠️ [Test {i}] COUNT/SCROLL MISMATCH!")
+                            print(f"   Expr: {expr_str}")
+                            print(f"   Detail: {detail}")
+                            print(f"   Scroll: {format_scroll_plan(scroll_plan)}")
+                            file_log(f"  -> COUNT/SCROLL MISMATCH! {detail}")
+                            failed_cases.append(
+                                {
+                                    "id": i,
+                                    "expr": expr_str,
+                                    "detail": detail,
+                                    "seed": current_seed,
+                                }
+                            )
+                        elif scroll_matches_oracle and count_hits != len(expected_ids):
+                            detail = (
+                                f"Count/oracle mismatch: count={count_hits}, scroll={len(actual_ids)}, "
+                                f"pandas={len(expected_ids)}"
+                            )
+                            print(f"\n⚠️ [Test {i}] COUNT/ORACLE MISMATCH!")
+                            print(f"   Expr: {expr_str}")
+                            print(f"   Detail: {detail}")
+                            file_log(f"  -> COUNT/ORACLE MISMATCH! {detail}")
+                            failed_cases.append(
+                                {
+                                    "id": i,
+                                    "expr": expr_str,
+                                    "detail": detail,
+                                    "seed": current_seed,
+                                }
+                            )
+                        elif not scroll_matches_oracle and count_hits == len(actual_ids):
+                            file_log("  CountCheck: aligns_with_scroll (not an extra independent failure)")
+                        else:
+                            file_log("  CountCheck: PASS")
+                    except Exception as e:
+                        file_log(f"  CountCheck: ERROR {e}")
+
+                if scroll_matches_oracle:
                     file_log("  -> MATCH")
                 else:
                     known_boundary_bug = expr_mentions_known_unstable_boundary(expr_str)
                     print(f"\n❌ [Test {i}] MISMATCH!")
                     print(f"   Expr: {expr_str}")
                     print(f"   Expected: {len(expected_ids)} vs Actual: {len(actual_ids)}")
+                    print(f"   Scroll: {format_scroll_plan(scroll_plan)}")
 
                     missing = expected_ids - actual_ids
                     extra = actual_ids - expected_ids
                     diff_msg = ""
-                    if missing: diff_msg += f"Missing IDs: {list(missing)[:10]} "
-                    if extra: diff_msg += f"Extra IDs: {list(extra)[:10]}"
+                    if missing:
+                        diff_msg += f"Missing IDs: {sample_ids(missing, 10)} "
+                    if extra:
+                        diff_msg += f"Extra IDs: {sample_ids(extra, 10)}"
 
                     print(f"   Diff: {diff_msg}")
-                    print(f"   🔑 复现此bug: python qdrant_fuzz_oracle.py --seed {current_seed}\n")
+                    print(f"   🔑 复现此bug: {reproduce_command}\n")
 
                     file_log(f"  -> MISMATCH! {diff_msg}")
                     file_log(f"  -> REPRODUCTION SEED: {current_seed}")
@@ -5123,13 +6133,24 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
                             file_log(f"  VectorCheck: PASS ({len(returned_ids)} hits subset of scalar filter)")
                         else:
                             extra_vec = returned_ids - expected_ids
-                            file_log(f"  VectorCheck: FAIL extra ids {list(extra_vec)[:3]}...")
-                            print(f"\n⚠️ [Test {i}] Vector subset violated: extras {list(extra_vec)[:3]}...")
-                            failed_cases.append({
-                                "id": i,
-                                "expr": expr_str,
-                                "detail": f"VectorCheck extras: {list(extra_vec)[:3]}..."
-                            })
+                            extra_sample = sample_ids(extra_vec, 3)
+                            if expr_mentions_known_unstable_boundary(expr_str):
+                                file_log(
+                                    "  VectorCheck: KNOWN-BOUNDARY-BUG-CANDIDATE "
+                                    f"extra ids {extra_sample}..."
+                                )
+                                print(
+                                    f"\n⚠️ [Test {i}] Vector subset extras {extra_sample} "
+                                    "over known numeric boundary expression; downgraded to known-boundary candidate."
+                                )
+                            else:
+                                file_log(f"  VectorCheck: FAIL extra ids {extra_sample}...")
+                                print(f"\n⚠️ [Test {i}] Vector subset violated: extras {extra_sample}...")
+                                failed_cases.append({
+                                    "id": i,
+                                    "expr": expr_str,
+                                    "detail": f"VectorCheck extras: {extra_sample}..."
+                                })
                     except Exception as e:
                         file_log(f"  VectorCheck: ERROR {e}")
 
@@ -5164,17 +6185,17 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
             print(f"   Expr: {case['expr']}")
             print(f"   Issue: {case['detail']}")
             if 'seed' in case:
-                print(f"   🔑 复现: python qdrant_fuzz_oracle.py --seed {case['seed']}")
+                print(f"   🔑 复现: {reproduce_command}")
             print("-" * 30)
         for case in known_bug_cases:
             print(f"🟡 KnownBoundary Case {case['id']}:")
             print(f"   Expr: {case['expr']}")
             print(f"   Issue: {case['detail']}")
             if 'seed' in case:
-                print(f"   🔑 复现: python qdrant_fuzz_oracle.py --seed {case['seed']}")
+                print(f"   🔑 复现: {reproduce_command}")
             print("-" * 30)
         print(f"📄 请查看 {display_path(log_filename)} 获取完整上下文。")
-        print(f"🔑 全局复现命令: python qdrant_fuzz_oracle.py --seed {current_seed}")
+        print(f"🔑 全局复现命令: {reproduce_command}")
 
 
 def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
@@ -5192,22 +6213,36 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         random.seed(seed)
         np.random.seed(seed)
 
+    collection_name = set_collection_name("equiv", seed)
+
     # 种子已设置，初始化可复现的随机配置
     _init_vector_check_config()
 
-    timestamp = int(time.time())
-    log_filename = make_log_path(f"qdrant_equiv_test_{timestamp}.log")
+    # 初始化数据后再写 manifest，确保 schema_config 可复现地记录下来。
+    dm = DataManager(data_seed=seed)
+    dm.generate_schema()
+    dm.generate_data()
+
+    log_filename = make_mode_log_path("equiv", seed)
+    reproduce_command = build_reproduce_command("equiv", seed, rounds, enable_dynamic_ops)
+    manifest_path = write_run_manifest(
+        log_filename,
+        "equiv",
+        seed,
+        rounds,
+        reproduce_command,
+        enable_dynamic_ops,
+        schema_config=dm.schema_config,
+    )
     print("\n" + "="*60)
     print(f"👯 启动 Equivalence Mode (等价性测试)")
     print(f"   原理: Query(A) 应该等于 Query(Transformation(A))")
     print(f"   Seed: {seed}")
     print(f"📄 日志: {display_path(log_filename)}")
+    print(f"   Manifest: {display_path(manifest_path)}")
+    print(f"   Collection: {collection_name}")
+    print(f"   Reproduce: {reproduce_command}")
     print("="*60)
-
-    # 初始化
-    dm = DataManager(data_seed=seed)
-    dm.generate_schema()
-    dm.generate_data()
 
     qm = QdrantManager()
     qm.connect()
@@ -5227,6 +6262,9 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             f.flush()
 
         file_log(f"Equivalence Test Started | Seed: {seed}")
+        file_log(f"Reproduce: {reproduce_command}")
+        file_log(f"Manifest: {manifest_path}")
+        file_log(f"Collection: {collection_name}")
         file_log(_format_transport_line(qm))
         tw = _transport_warning_line()
         if tw:
@@ -5263,14 +6301,15 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
             # 执行基础查询
             try:
-                scroll_limit = len(dm.df) + 1000
-                base_res = qm.scroll(
-                    collection_name=COLLECTION_NAME,
-                    scroll_filter=base_filter,
-                    limit=scroll_limit,
-                    with_payload=False
+                base_res, base_scroll_plan = execute_scroll_query(
+                    qm,
+                    COLLECTION_NAME,
+                    base_filter,
+                    len(dm.df),
+                    with_payload=False,
+                    with_vectors=False,
                 )
-                base_ids = set(p.id for p in base_res[0])
+                base_ids = set(p.id for p in base_res)
             except Exception as e:
                 if is_qdrant_format_error(e):
                     file_log(f"[Test {i}] Base Query Skipped (invalid filter): {e}")
@@ -5280,6 +6319,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
             log_header = f"[Test {i}] Base: {base_expr} (Hits: {len(base_ids)})"
             file_log(f"\n{log_header}")
+            file_log(f"  BaseScroll: {format_scroll_plan(base_scroll_plan)}")
 
             # 执行并对比所有变体
             for m in mutations:
@@ -5288,16 +6328,18 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                 m_expr = m["expr"]
 
                 try:
-                    mut_res = qm.scroll(
-                        collection_name=COLLECTION_NAME,
-                        scroll_filter=m_filter,
-                        limit=scroll_limit,
-                        with_payload=False
+                    mut_res, mut_scroll_plan = execute_scroll_query(
+                        qm,
+                        COLLECTION_NAME,
+                        m_filter,
+                        len(dm.df),
+                        with_payload=False,
+                        with_vectors=False,
                     )
-                    mut_ids = set(p.id for p in mut_res[0])
+                    mut_ids = set(p.id for p in mut_res)
 
                     if base_ids == mut_ids:
-                        file_log(f"  ✅ [{m_type}] Match")
+                        file_log(f"  ✅ [{m_type}] Match | Scroll: {format_scroll_plan(mut_scroll_plan)}")
                     else:
                         known_boundary_bug = (
                             expr_mentions_known_unstable_boundary(base_expr)
@@ -5308,12 +6350,16 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                         print(f"   Base Expr: {base_expr}")
                         print(f"   Mut  Expr: {m_expr}")
                         print(f"   Base Hits: {len(base_ids)} | Mut Hits: {len(mut_ids)}")
+                        print(f"   Base Scroll: {format_scroll_plan(base_scroll_plan)}")
+                        print(f"   Mut  Scroll: {format_scroll_plan(mut_scroll_plan)}")
 
                         missing = base_ids - mut_ids
                         extra = mut_ids - base_ids
                         diff_msg = ""
-                        if missing: diff_msg += f"Mutation Missing: {list(missing)[:5]} "
-                        if extra: diff_msg += f"Mutation Extra: {list(extra)[:5]} "
+                        if missing:
+                            diff_msg += f"Mutation Missing: {sample_ids(missing, 5)} "
+                        if extra:
+                            diff_msg += f"Mutation Extra: {sample_ids(extra, 5)} "
                         print(f"   Diff: {diff_msg}")
                         print("-" * 50)
 
@@ -5381,21 +6427,35 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         np.random.seed(seed)
         print(f"\n🎲 PQS模式随机生成种子: {seed}")
 
+    collection_name = set_collection_name("pqs", seed)
+
     # 种子已设置，初始化可复现的随机配置
     _init_vector_check_config()
 
-    timestamp = int(time.time())
-    log_filename = make_log_path(f"qdrant_pqs_test_{timestamp}.log")
+    # 初始化数据后再写 manifest，确保 schema_config 可复现地记录下来。
+    dm = DataManager(data_seed=seed)
+    dm.generate_schema()
+    dm.generate_data()
+
+    log_filename = make_mode_log_path("pqs", seed)
+    reproduce_command = build_reproduce_command("pqs", seed, rounds, enable_dynamic_ops)
+    manifest_path = write_run_manifest(
+        log_filename,
+        "pqs",
+        seed,
+        rounds,
+        reproduce_command,
+        enable_dynamic_ops,
+        schema_config=dm.schema_config,
+    )
     print("\n" + "="*60)
     print(f"🚀 启动 PQS (Pivot Query Synthesis) 模式测试")
     print(f"   Seed: {seed}")
     print(f"📄 详细日志将写入: {display_path(log_filename)}")
+    print(f"   Manifest: {display_path(manifest_path)}")
+    print(f"   Collection: {collection_name}")
+    print(f"   Reproduce: {reproduce_command}")
     print("="*60)
-
-    # 初始化
-    dm = DataManager(data_seed=seed)
-    dm.generate_schema()
-    dm.generate_data()
 
     qm = QdrantManager()
     qm.connect()
@@ -5432,6 +6492,9 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
             f.flush()
 
         file_log(f"PQS Test Started | Rounds: {rounds} | Seed: {seed}")
+        file_log(f"Reproduce: {reproduce_command}")
+        file_log(f"Manifest: {manifest_path}")
+        file_log(f"Collection: {collection_name}")
         file_log(_format_transport_line(qm))
         tw = _transport_warning_line()
         if tw:
@@ -5482,19 +6545,22 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
 
             try:
                 start_t = time.time()
-                scroll_limit = len(dm.df) + 1000
-                res = qm.scroll(
-                    collection_name=COLLECTION_NAME,
-                    scroll_filter=filter_obj,
-                    limit=scroll_limit,
-                    with_payload=False
+                res, scroll_plan = execute_scroll_query(
+                    qm,
+                    COLLECTION_NAME,
+                    filter_obj,
+                    len(dm.df),
+                    with_payload=False,
+                    with_vectors=False,
                 )
                 cost = (time.time() - start_t) * 1000
-                found_ids = set(p.id for p in res[0])
+                found_ids = set(p.id for p in res)
 
                 successful_tests += 1
                 if pivot_id in found_ids:
-                    file_log(f"  -> PASS | Found: {len(found_ids)} hits | Time: {cost:.2f}ms")
+                    file_log(
+                        f"  -> PASS | Found: {len(found_ids)} hits | Time: {cost:.2f}ms | Scroll: {format_scroll_plan(scroll_plan)}"
+                    )
                 else:
                     safe_row = safe_format_row(pivot_row)
                     json_data = safe_row.get("meta_json", {})
@@ -5504,6 +6570,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
                     print(f"   Target ID: {pivot_id}")
                     print(f"   Expression: {expr}")
                     print(f"   Found Count: {len(found_ids)} (Target NOT found)")
+                    print(f"   Scroll: {format_scroll_plan(scroll_plan)}")
                     print("-" * 50)
                     print(f"   🔎 EVIDENCE (Target Row Data):")
                     print(f"   [meta_json]:")
@@ -5564,21 +6631,35 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
         np.random.seed(seed)
         print(f"\n🎲 GroupBy模式随机生成种子: {seed}")
 
+    collection_name = set_collection_name("group", seed)
+
     # 种子已设置，初始化可复现的随机配置
     _init_vector_check_config()
 
-    timestamp = int(time.time())
-    log_filename = make_log_path(f"qdrant_group_test_{timestamp}.log")
+    # 初始化数据后再写 manifest，确保 schema_config 可复现地记录下来。
+    dm = DataManager(data_seed=seed)
+    dm.generate_schema()
+    dm.generate_data()
+
+    log_filename = make_mode_log_path("group", seed)
+    reproduce_command = build_reproduce_command("group", seed, rounds, enable_dynamic_ops)
+    manifest_path = write_run_manifest(
+        log_filename,
+        "group",
+        seed,
+        rounds,
+        reproduce_command,
+        enable_dynamic_ops,
+        schema_config=dm.schema_config,
+    )
     print("\n" + "="*60)
     print(f"📊 启动 GroupBy 逻辑专项测试")
     print(f"   Seed: {seed}")
     print(f"   日志: {display_path(log_filename)}")
+    print(f"   Manifest: {display_path(manifest_path)}")
+    print(f"   Collection: {collection_name}")
+    print(f"   Reproduce: {reproduce_command}")
     print("="*60)
-
-    # 初始化
-    dm = DataManager(data_seed=seed)
-    dm.generate_schema()
-    dm.generate_data()
 
     qm = QdrantManager()
     qm.connect()
@@ -5609,6 +6690,9 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
             f.flush()
 
         file_log(f"GroupBy Test Started | Rounds: {rounds} | Seed: {seed}")
+        file_log(f"Reproduce: {reproduce_command}")
+        file_log(f"Manifest: {manifest_path}")
+        file_log(f"Collection: {collection_name}")
         file_log(_format_transport_line(qm))
         tw = _transport_warning_line()
         if tw:
@@ -5687,13 +6771,13 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
 
 MODE_DISPATCH = {
     "oracle": lambda a: run(rounds=a.rounds, seed=a.seed,
-                            enable_dynamic_ops=a.dynamic),
+                            enable_dynamic_ops=a.dynamic or a.payload_mutations),
     "equiv":  lambda a: run_equivalence_mode(rounds=a.rounds, seed=a.seed,
-                                             enable_dynamic_ops=a.dynamic),
+                                             enable_dynamic_ops=a.dynamic or a.payload_mutations),
     "pqs":    lambda a: run_pqs_mode(rounds=a.pqs_rounds, seed=a.seed,
-                                     enable_dynamic_ops=a.dynamic),
+                                     enable_dynamic_ops=a.dynamic or a.payload_mutations),
     "group":  lambda a: run_group_test(rounds=a.rounds, seed=a.seed,
-                                       enable_dynamic_ops=a.dynamic),
+                                       enable_dynamic_ops=a.dynamic or a.payload_mutations),
 }
 
 
@@ -5710,7 +6794,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   python qdrant_fuzz_oracle.py --equiv --rounds 500    # 等价性模式
   python qdrant_fuzz_oracle.py --pqs --pqs-rounds 200  # PQS 模式
   python qdrant_fuzz_oracle.py --dynamic --rounds 300  # 动态操作模式
+  python qdrant_fuzz_oracle.py --dynamic --payload-mutations # 动态 payload 更新/删除/覆盖
   python qdrant_fuzz_oracle.py --dynamic --evo-null-sync # 演进字段严格 IsNull 语义
+  python qdrant_fuzz_oracle.py --scroll-mode paged     # 强制使用分页 scroll 路径
   python qdrant_fuzz_oracle.py --prefer-grpc            # 使用 gRPC 查询路径
   python qdrant_fuzz_oracle.py --read-consistency all --write-ordering strong
         """,
@@ -5735,6 +6821,46 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="主测试轮数 (默认: 1000)")
     p.add_argument("--pqs-rounds", type=int, default=1000, dest="pqs_rounds",
                    help="PQS 测试轮数 (默认: 1000)")
+    p.add_argument("-N", "--rows", type=int, default=N, dest="rows",
+                   help=f"初始数据量 (默认: {N})")
+    p.add_argument("--dim", type=int, default=DIM,
+                   help=f"向量维度 (默认: {DIM})")
+    p.add_argument("--batch-size", type=int, default=BATCH_SIZE, dest="batch_size",
+                   help=f"批量 upsert 大小 (默认: {BATCH_SIZE})")
+    p.add_argument("--sleep-interval", type=float, default=SLEEP_INTERVAL, dest="sleep_interval",
+                   help=f"批量 upsert 间隔秒数 (默认: {SLEEP_INTERVAL})")
+    p.add_argument(
+        "--scroll-mode",
+        type=str,
+        choices=["bulk", "paged", "mixed"],
+        default=SCROLL_MODE,
+        help="scroll 执行策略：bulk=单次全量，paged=分页拉取，mixed=两者混合 (默认: mixed)",
+    )
+    p.add_argument(
+        "--distance",
+        type=str,
+        choices=["random", *DISTANCE_NAME_MAP.keys()],
+        default="random",
+        help="向量距离类型；默认 random，会在每次运行中随机选取一个",
+    )
+    p.add_argument(
+        "--log-dir",
+        type=str,
+        default=DEFAULT_LOG_DIR,
+        help=f"日志输出目录 (默认: {DEFAULT_LOG_DIR})",
+    )
+    p.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help="可复现实验 run id；用于稳定日志/manifest 文件名",
+    )
+    p.add_argument(
+        "--collection-name",
+        type=str,
+        default=None,
+        help="显式指定 collection 名；默认按 mode/seed/run-id 稳定生成",
+    )
 
     # ---- 连接参数 ----
     p.add_argument("--host", type=str, default=HOST,
@@ -5763,6 +6889,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # ---- 功能开关 ----
     p.add_argument("--dynamic", action="store_true",
                    help="开启动态数据操作 (insert/delete/upsert)")
+    p.add_argument(
+        "--payload-mutations",
+        action="store_true",
+        help="开启动态 payload mutation 子操作（set/delete/overwrite/clear，隐含 --dynamic）",
+    )
     p.add_argument("--chaos",   action="store_true",
                    help="开启混淆模式 (默认概率 10%%)")
     p.add_argument("--chaos-rate", type=float, default=0.0, dest="chaos_rate",
@@ -5785,11 +6916,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> None:
     global CHAOS_RATE
     global SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC
+    global PAYLOAD_MUTATIONS_ENABLED
     global HOST, PORT, GRPC_PORT, PREFER_GRPC
     global READ_CONSISTENCY, WRITE_ORDERING
     global INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES
+    global N, DIM, BATCH_SIZE, SLEEP_INTERVAL, LOG_DIR
+    global FORCED_DISTANCE_TYPE
+    global _global_id_counter
+    global RUN_ID, DISTANCE_ARG, SCROLL_MODE
+    global FORCED_COLLECTION_NAME
 
     args = parse_args(argv)
+    if args.payload_mutations:
+        args.dynamic = True
 
     # 处理 chaos 相关逻辑
     if args.chaos_rate > 0:
@@ -5798,6 +6937,7 @@ def main(argv: list[str] | None = None) -> None:
         CHAOS_RATE = 0.1
 
     SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = bool(args.evo_null_sync)
+    PAYLOAD_MUTATIONS_ENABLED = bool(args.payload_mutations)
     INCLUDE_KNOWN_UNSTABLE_INT64_BOUNDARIES = bool(args.include_known_int64_boundaries)
     HOST = args.host
     PORT = int(args.port)
@@ -5805,6 +6945,18 @@ def main(argv: list[str] | None = None) -> None:
     PREFER_GRPC = bool(args.prefer_grpc)
     READ_CONSISTENCY = 1 if args.read_consistency == "1" else args.read_consistency
     WRITE_ORDERING = args.write_ordering
+    N = max(1, int(args.rows))
+    DIM = max(1, int(args.dim))
+    BATCH_SIZE = max(1, int(args.batch_size))
+    SLEEP_INTERVAL = max(0.0, float(args.sleep_interval))
+    SCROLL_MODE = args.scroll_mode
+    LOG_DIR = os.path.abspath(os.path.expanduser(args.log_dir))
+    os.makedirs(LOG_DIR, exist_ok=True)
+    FORCED_DISTANCE_TYPE = None if args.distance == "random" else DISTANCE_NAME_MAP[args.distance]
+    DISTANCE_ARG = args.distance
+    RUN_ID = args.run_id
+    FORCED_COLLECTION_NAME = args.collection_name
+    _global_id_counter = max(N * 10, 50000)
 
     # Banner
     print("=" * 80)
@@ -5814,10 +6966,19 @@ def main(argv: list[str] | None = None) -> None:
     print(f"   PQS测试轮数: {args.pqs_rounds}")
     print(f"   随机种子:   {args.seed or '(随机)'}")
     print(f"   动态操作:   {'开启' if args.dynamic else '关闭'}")
+    print(f"   Payload变异:{'开启' if PAYLOAD_MUTATIONS_ENABLED else '关闭'}")
     print(f"   混淆概率:   {CHAOS_RATE}")
     print(f"   连接:       {HOST}:{PORT} (grpc:{GRPC_PORT}, prefer_grpc={PREFER_GRPC})")
     print(f"   读一致性:   {READ_CONSISTENCY}")
     print(f"   写排序:     {WRITE_ORDERING}")
+    print(f"   数据规模:   rows={N}, dim={DIM}, batch={BATCH_SIZE}, sleep={SLEEP_INTERVAL}")
+    print(f"   Scroll策略: {SCROLL_MODE}")
+    print(f"   距离度量:   {args.distance}")
+    print(f"   日志目录:   {display_path(LOG_DIR)}")
+    if RUN_ID:
+        print(f"   Run ID:     {RUN_ID}")
+    if FORCED_COLLECTION_NAME:
+        print(f"   Collection: {FORCED_COLLECTION_NAME}")
     if not PREFER_GRPC:
         print("   ⚠️  说明: REST 路径对 ±float32_max 的范围比较存在已知不一致；mismatch 日志会标记边界候选")
     print(

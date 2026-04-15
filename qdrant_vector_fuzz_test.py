@@ -21,6 +21,7 @@ import time
 import random
 import argparse
 import sys
+import os
 import numpy as np
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
@@ -64,10 +65,20 @@ class FuzzStats:
 # ── defaults ────────────────────────────────────────────────────────────────
 HOST = "127.0.0.1"
 PORT = 6333
+GRPC_PORT = 6334
 COLLECTION_NAME = "vec_fuzz_test"
 N = 2000
 DIM = 128
 BATCH_SIZE = 500
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_ARTIFACT_ROOT = os.environ.get(
+    "QDRANT_EXPERIMENT_ROOT",
+    os.path.join(os.path.expanduser("~"), "qdrant_artifacts"),
+)
+DEFAULT_LOG_DIR = os.path.join(DEFAULT_ARTIFACT_ROOT, "qdrant_log", "vector")
+LOG_DIR = DEFAULT_LOG_DIR
+PREFER_GRPC = False
+RUN_ID = None
 
 ALL_DISTANCE_TYPES = [Distance.EUCLID, Distance.COSINE, Distance.DOT, Distance.MANHATTAN]
 
@@ -86,27 +97,106 @@ def _next_id():
     return _id_counter
 
 
+def ensure_log_dir():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    return LOG_DIR
+
+
+def make_log_path(filename: str) -> str:
+    return os.path.join(ensure_log_dir(), filename)
+
+
+def display_path(path: str) -> str:
+    try:
+        return os.path.relpath(path, start=os.getcwd())
+    except Exception:
+        return path
+
+
+def slugify(value: object, max_len: int = 48) -> str:
+    text = str(value).strip().lower()
+    pieces = [ch if ch.isalnum() else "-" for ch in text]
+    collapsed = "".join(pieces).strip("-")
+    while "--" in collapsed:
+        collapsed = collapsed.replace("--", "-")
+    return (collapsed or "x")[:max_len]
+
+
+def make_run_label(seed: int, run_id: str | None) -> str:
+    if run_id:
+        return slugify(run_id, max_len=72)
+    return f"vector-seed{seed}"
+
+
+def make_collection_name(seed: int, run_id: str | None) -> str:
+    label = slugify(run_id if run_id else f"seed{seed}", max_len=40)
+    return f"vec_fuzz_{label}"
+
+
+def build_reproduce_command(args: argparse.Namespace, seed: int) -> str:
+    parts = [
+        "python",
+        "qdrant_vector_fuzz_test.py",
+        "--seed",
+        str(seed),
+        "--rounds",
+        str(args.rounds),
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--grpc-port",
+        str(args.grpc_port),
+        "-N",
+        str(args.N),
+        "--dim",
+        str(args.dim),
+        "--log-dir",
+        args.log_dir,
+    ]
+    if args.dynamic:
+        parts.append("--dynamic")
+    if args.prefer_grpc:
+        parts.append("--prefer-grpc")
+    if getattr(args, "run_id", None):
+        parts += ["--run-id", args.run_id]
+    return " ".join(parts)
+
+
 # ── core class ──────────────────────────────────────────────────────────────
 
 class QdrantVectorFuzzTest:
-    def __init__(self, host, port, dim, n, seed, enable_dynamic):
+    def __init__(self, host, port, grpc_port, dim, n, seed, enable_dynamic, prefer_grpc):
         self.host = host
         self.port = port
+        self.grpc_port = grpc_port
         self.dim = dim
         self.n = n
         self.seed = seed
         self.enable_dynamic = enable_dynamic
+        self.prefer_grpc = prefer_grpc
         self.client = None
         self.distance_type = None
         self.vectors = None   # (N, DIM) float32
         self.ids = []         # list[int]
+        self.py_rng = random.Random(self.seed)
+        self.vector_rng = np.random.default_rng(self.seed)
 
     # ── connection ──────────────────────────────────────────────────────────
 
     def connect(self):
-        self.client = QdrantClient(host=self.host, port=self.port, timeout=30)
+        self.client = QdrantClient(
+            host=self.host,
+            port=self.port,
+            grpc_port=self.grpc_port,
+            prefer_grpc=self.prefer_grpc,
+            timeout=30,
+        )
         self.client.get_collections()
-        print(f"✅ Connected to Qdrant @ {self.host}:{self.port}")
+        print(
+            f"✅ Connected to Qdrant @ {self.host}:{self.port} "
+            f"(grpc:{self.grpc_port}, prefer_grpc={self.prefer_grpc})"
+        )
 
     def close(self):
         if self.client:
@@ -118,7 +208,7 @@ class QdrantVectorFuzzTest:
     # ── collection setup ────────────────────────────────────────────────────
 
     def setup_collection(self):
-        self.distance_type = random.choice(ALL_DISTANCE_TYPES)
+        self.distance_type = self.py_rng.choice(ALL_DISTANCE_TYPES)
         print(f"   Distance: {self.distance_type}")
 
         try:
@@ -136,8 +226,7 @@ class QdrantVectorFuzzTest:
 
     def generate_and_insert(self):
         global _id_counter
-        rng = np.random.default_rng(self.seed)
-        self.vectors = rng.random((self.n, self.dim), dtype=np.float32)
+        self.vectors = self.vector_rng.random((self.n, self.dim)).astype(np.float32)
         norms = np.linalg.norm(self.vectors, axis=1, keepdims=True)
         norms[norms == 0] = 1
         self.vectors = (self.vectors / norms).astype(np.float32)
@@ -178,26 +267,26 @@ class QdrantVectorFuzzTest:
     # ── dynamic ops ─────────────────────────────────────────────────────────
 
     def _random_vector(self):
-        v = np.random.randn(self.dim).astype(np.float32)
+        v = self.vector_rng.standard_normal(self.dim).astype(np.float32)
         v /= (np.linalg.norm(v) + 1e-12)
         return v
 
     def do_dynamic_op(self):
-        op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.3, 0.3], k=1)[0]
+        op = self.py_rng.choices(["insert", "delete", "upsert"], weights=[0.4, 0.3, 0.3], k=1)[0]
 
         if op == "insert":
             new_id = _next_id()
             vec = self._random_vector()
             self.client.upsert(
                 collection_name=COLLECTION_NAME,
-                points=[PointStruct(id=new_id, vector=vec.tolist(), payload={"tag": random.randint(0, 99)})],
+                points=[PointStruct(id=new_id, vector=vec.tolist(), payload={"tag": self.py_rng.randint(0, 99)})],
                 wait=True,
             )
             self.ids.append(new_id)
             self.vectors = np.vstack([self.vectors, vec.reshape(1, -1)])
             return f"INSERT id={new_id}"
         elif op == "delete" and len(self.ids) > 200:
-            idx = random.randint(0, len(self.ids) - 1)
+            idx = self.py_rng.randint(0, len(self.ids) - 1)
             did = self.ids[idx]
             self.client.delete(
                 collection_name=COLLECTION_NAME,
@@ -210,12 +299,12 @@ class QdrantVectorFuzzTest:
         else:  # upsert existing
             if not self.ids:
                 return "SKIP"
-            idx = random.randint(0, len(self.ids) - 1)
+            idx = self.py_rng.randint(0, len(self.ids) - 1)
             uid = self.ids[idx]
             vec = self._random_vector()
             self.client.upsert(
                 collection_name=COLLECTION_NAME,
-                points=[PointStruct(id=uid, vector=vec.tolist(), payload={"tag": random.randint(0, 99)})],
+                points=[PointStruct(id=uid, vector=vec.tolist(), payload={"tag": self.py_rng.randint(0, 99)})],
                 wait=True,
             )
             self.vectors[idx] = vec
@@ -267,7 +356,7 @@ class QdrantVectorFuzzTest:
         if miss_ratio <= 0.05:
             return True, f"soft-ok (miss {len(missing)}/{len(ids_small)}={miss_ratio:.1%})"
         return False, (f"monotonicity violated: {len(missing)}/{len(ids_small)} IDs in top-{k_small} "
-                       f"missing from top-{k_large}, ratio={miss_ratio:.1%}, missing={list(missing)[:5]}")
+                       f"missing from top-{k_large}, ratio={miss_ratio:.1%}, missing={sorted(missing)[:5]}")
 
     # ── Test 3: self-retrieval ──────────────────────────────────────────────
 
@@ -336,13 +425,13 @@ class QdrantVectorFuzzTest:
 
         ops_done = []
         for _ in range(n_ops):
-            op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.3, 0.3], k=1)[0]
+            op = self.py_rng.choices(["insert", "delete", "upsert"], weights=[0.4, 0.3, 0.3], k=1)[0]
             if op == "insert":
                 oid = _next_id()
                 ov = self._random_vector()
                 self.client.upsert(
                     collection_name=COLLECTION_NAME,
-                    points=[PointStruct(id=oid, vector=ov.tolist(), payload={"tag": random.randint(0, 99)})],
+                    points=[PointStruct(id=oid, vector=ov.tolist(), payload={"tag": self.py_rng.randint(0, 99)})],
                     wait=True,
                 )
                 self.ids.append(oid)
@@ -351,7 +440,7 @@ class QdrantVectorFuzzTest:
             elif op == "delete" and len(self.ids) > 200:
                 candidates = [x for x in self.ids if x != new_id]
                 if candidates:
-                    did = random.choice(candidates)
+                    did = self.py_rng.choice(candidates)
                     didx = self.ids.index(did)
                     self.client.delete(collection_name=COLLECTION_NAME,
                                        points_selector=PointIdsList(points=[did]), wait=True)
@@ -361,12 +450,12 @@ class QdrantVectorFuzzTest:
             elif op == "upsert":
                 candidates = [x for x in self.ids if x != new_id]
                 if candidates:
-                    uid_op = random.choice(candidates)
+                    uid_op = self.py_rng.choice(candidates)
                     uidx = self.ids.index(uid_op)
                     uv = self._random_vector()
                     self.client.upsert(
                         collection_name=COLLECTION_NAME,
-                        points=[PointStruct(id=uid_op, vector=uv.tolist(), payload={"tag": random.randint(0, 99)})],
+                        points=[PointStruct(id=uid_op, vector=uv.tolist(), payload={"tag": self.py_rng.randint(0, 99)})],
                         wait=True,
                     )
                     self.vectors[uidx] = uv
@@ -387,31 +476,57 @@ class QdrantVectorFuzzTest:
 # ── main runner ─────────────────────────────────────────────────────────────
 
 def run(args):
+    global COLLECTION_NAME
+    global LOG_DIR
+    global PREFER_GRPC
+    global RUN_ID
+
     current_seed = args.seed if args.seed is not None else random.randint(0, 2**31 - 1)
     random.seed(current_seed)
     np.random.seed(current_seed)
+    LOG_DIR = os.path.abspath(os.path.expanduser(args.log_dir))
+    os.makedirs(LOG_DIR, exist_ok=True)
+    PREFER_GRPC = bool(args.prefer_grpc)
+    RUN_ID = args.run_id
+    COLLECTION_NAME = make_collection_name(current_seed, RUN_ID)
+    driver_rng = random.Random(current_seed ^ 0x00C0FFEE)
 
     print("=" * 80)
     print(f"🚀 Qdrant Vector Fuzz Test | Seed: {current_seed} | Rounds: {args.rounds}")
     print(f"   N={args.N} DIM={args.dim} Dynamic={'ON' if args.dynamic else 'OFF'}")
+    print(f"   Target={args.host}:{args.port} (grpc:{args.grpc_port}, prefer_grpc={args.prefer_grpc})")
+    print(f"   Collection={COLLECTION_NAME}")
+    print(f"   LogDir={display_path(LOG_DIR)}")
+    if RUN_ID:
+        print(f"   RunID={RUN_ID}")
     print("=" * 80)
 
-    t = QdrantVectorFuzzTest(args.host, args.port, args.dim, args.N, current_seed, args.dynamic)
+    t = QdrantVectorFuzzTest(
+        args.host,
+        args.port,
+        args.grpc_port,
+        args.dim,
+        args.N,
+        current_seed,
+        args.dynamic,
+        args.prefer_grpc,
+    )
     t.connect()
 
     try:
         t.setup_collection()
         t.generate_and_insert()
 
-        ts = int(time.time())
-        logfile = f"qdrant_vector_fuzz_{ts}.log"
-        print(f"📝 Log: {logfile}")
+        run_label = make_run_label(current_seed, RUN_ID)
+        logfile = make_log_path(f"qdrant_vector_fuzz_{run_label}.log")
+        print(f"📝 Log: {display_path(logfile)}")
 
         fuzz_stats = {k: FuzzStats() for k in ["ordering", "monotonicity", "self_ret", "self_ret_dyn"]}
         failures = []
 
         with open(logfile, "w", encoding="utf-8") as flog:
             flog.write(f"Qdrant Vector Fuzz Test | Seed: {current_seed}\n")
+            flog.write(f"Collection: {COLLECTION_NAME}\n")
             flog.write(f"Distance: {t.distance_type}  N={args.N}  DIM={args.dim}\n")
             flog.write(f"Dynamic: {args.dynamic}\n")
             flog.write("=" * 80 + "\n\n")
@@ -421,14 +536,14 @@ def run(args):
                     op_desc = t.do_dynamic_op()
                     flog.write(f"[DYN] {op_desc}\n")
 
-                if random.random() < 0.7 and len(t.ids) > 0:
-                    qi = random.randint(0, len(t.vectors) - 1)
+                if driver_rng.random() < 0.7 and len(t.ids) > 0:
+                    qi = driver_rng.randint(0, len(t.vectors) - 1)
                     qv = t.vectors[qi].tolist()
                 else:
                     qv = t._random_vector().tolist()
 
                 # Test 1
-                top_k = random.choice([5, 10, 20, 50, 100])
+                top_k = driver_rng.choice([5, 10, 20, 50, 100])
                 t0 = time.time()
                 ok, detail = t.test_distance_ordering(qv, top_k)
                 lat_ms = (time.time() - t0) * 1000
@@ -439,8 +554,8 @@ def run(args):
                     print(f"  ❌ [R{i}] ORDERING FAIL: {detail[:120]}")
 
                 # Test 2
-                k_small = random.choice([5, 10, 15])
-                k_large = k_small * random.choice([2, 3, 4])
+                k_small = driver_rng.choice([5, 10, 15])
+                k_large = k_small * driver_rng.choice([2, 3, 4])
                 t0 = time.time()
                 ok, detail = t.test_topk_monotonicity(qv, k_small, k_large)
                 lat_ms = (time.time() - t0) * 1000
@@ -464,7 +579,7 @@ def run(args):
                 # Test 3b
                 if args.dynamic and i % 30 == 0 and i > 0:
                     t0 = time.time()
-                    ok, detail = t.test_self_retrieval_after_ops(n_ops=random.randint(3, 8))
+                    ok, detail = t.test_self_retrieval_after_ops(n_ops=driver_rng.randint(3, 8))
                     lat_ms = (time.time() - t0) * 1000
                     fuzz_stats["self_ret_dyn"].record(ok, lat_ms, error_cat=None if ok else "self_ret_dyn")
                     flog.write(f"[R{i:04d}] SELF_RET_DYN: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
@@ -497,12 +612,13 @@ def run(args):
             print(f"  {status} {k}: {fs.summary()}")
         print(f"  Total: PASS={total_pass}  FAIL={total_fail}")
         if failures:
-            print(f"\n⚠️  {len(failures)} failure(s) detected — see {logfile}")
+            print(f"\n⚠️  {len(failures)} failure(s) detected — see {display_path(logfile)}")
         else:
             print(f"\n🎉 All tests passed! Seed={current_seed}")
-        print(f"📝 Full log: {logfile}")
-        print(f"🔑 Reproduce: python qdrant_vector_fuzz_test.py --seed {current_seed}")
+        print(f"📝 Full log: {display_path(logfile)}")
+        print(f"🔑 Reproduce: {build_reproduce_command(args, current_seed)}")
         print("=" * 80)
+        return 1 if failures else 0
 
     finally:
         try:
@@ -518,8 +634,12 @@ if __name__ == "__main__":
     parser.add_argument("--rounds", type=int, default=200)
     parser.add_argument("--host", type=str, default=HOST)
     parser.add_argument("--port", type=int, default=PORT)
+    parser.add_argument("--grpc-port", type=int, default=GRPC_PORT, dest="grpc_port")
+    parser.add_argument("--prefer-grpc", action="store_true")
     parser.add_argument("-N", type=int, default=N)
     parser.add_argument("--dim", type=int, default=DIM)
     parser.add_argument("--dynamic", action="store_true")
+    parser.add_argument("--log-dir", type=str, default=DEFAULT_LOG_DIR)
+    parser.add_argument("--run-id", type=str, default=None)
     args = parser.parse_args()
-    run(args)
+    raise SystemExit(run(args))

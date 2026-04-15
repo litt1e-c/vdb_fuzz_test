@@ -3,10 +3,11 @@ Minimal validation for the Qdrant `range` operator.
 
 This script validates a conservative, non-extreme subset:
 1. Integer and float scalar fields support gt/gte/lt/lte.
-2. Multiple range bounds are conjunctive.
+2. Multiple range bounds are conjunctive, including mixed open/closed bounds.
 3. Integer/float arrays match if any element satisfies the range.
-4. Missing/null rows do not satisfy ordinary range predicates.
-5. Tested type-mismatched string rows do not match numeric range predicates.
+4. Cross-zero and exact-boundary cases behave consistently in the tested subset.
+5. Missing/null rows do not satisfy ordinary range predicates.
+6. Tested type-mismatched string rows do not match numeric range predicates.
 
 Known unstable numeric extremes are intentionally not tested here; historical
 bug scripts under history_find_bug/qdrant cover those separately.
@@ -157,10 +158,28 @@ def run_transport(prefer_grpc: bool) -> bool:
             "Open bounds are strict and conjunctive.",
         ),
         (
+            "int_left_closed_right_open",
+            Filter(must=[FieldCondition(key="int_val", range=Range(gte=0, lt=10))]),
+            [1, 6],
+            "Mixed closed/open bounds include zero but exclude the upper endpoint.",
+        ),
+        (
+            "int_cross_zero_closed",
+            Filter(must=[FieldCondition(key="int_val", range=Range(gte=-5, lte=0))]),
+            [3, 6],
+            "Closed bounds across zero include both endpoints in the tested subset.",
+        ),
+        (
             "float_open_interval",
             Filter(must=[FieldCondition(key="float_val", range=Range(gt=0.0, lt=2.0))]),
             [1],
             "Float open interval matches only present values inside the interval.",
+        ),
+        (
+            "float_closed_exact_zero",
+            Filter(must=[FieldCondition(key="float_val", range=Range(gte=0.0, lte=0.0))]),
+            [6],
+            "A closed float interval with equal bounds matches the exact value only.",
         ),
         (
             "float_lte_zero",
@@ -179,6 +198,18 @@ def run_transport(prefer_grpc: bool) -> bool:
             Filter(must=[FieldCondition(key="arr_float", range=Range(gte=2.0, lte=3.0))]),
             [1],
             "Float arrays match when any element satisfies the range.",
+        ),
+        (
+            "array_int_open_closed_combo",
+            Filter(must=[FieldCondition(key="arr_int", range=Range(gt=5, lte=10))]),
+            [1],
+            "Array range checks also respect mixed open/closed bounds on the matching element.",
+        ),
+        (
+            "array_float_cross_zero_closed",
+            Filter(must=[FieldCondition(key="arr_float", range=Range(gte=-1.5, lte=1.0))]),
+            [1, 6],
+            "Array float matching is any-element and includes tested closed endpoints across zero.",
         ),
         (
             "missing_null_excluded",
