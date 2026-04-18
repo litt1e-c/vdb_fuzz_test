@@ -55,3 +55,4 @@ c3_triage_agent/auto_cases/
 
 deploy_*
 .codex
+tools/*
