@@ -1,0 +1,31 @@
+operator_id: type_mismatch_query
+family: other
+syntax_examples:
+  - 'Filter.by_property("intVal").equal("oops")'
+  - '{"path":["dateVal"],"operator":"LessThan","valueInt":7}'
+  - '{ Get { Demo(where:{path:["intVal"], operator: Equal, valueText: "oops"}) { tag } } }'
+doc_status: derived
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/search/filters"
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+doc_supported_types:
+  - scalar_numeric
+  - scalar_bool
+  - scalar_datetime
+  - array_field
+doc_semantics: "The checked official filters references expose type-specific value slots such as `valueInt`, `valueNumber`, `valueBoolean`, and `valueDate` for where filters. They do not define a dedicated 'type mismatch' operator, but they do document typed filter inputs rather than arbitrary cross-type comparisons."
+doc_notes:
+  - "This record captures local rejection behavior for invalid scalar/filter input combinations, not a positive data-selection semantics."
+  - "GraphQL input validation can reject some malformed `ContainsAny` payloads before deeper type validation runs."
+verify_status: edge_validated
+observed_summary: "Local `type_mismatch_query_operator.py` validation on Weaviate v1.36.10 showed that scalar type-mismatch queries were rejected across all three exercised frontdoors. Python-client / gRPC raised `WeaviateQueryError` for INT-vs-string, BOOL-vs-string, DATE-vs-int, and scalar `contains_any` with string arrays on an INT field. REST where JSON rejected the same mismatches with HTTP 500 validation errors explaining the expected `value*` key. GraphQL where JSON rejected the same scalar mismatches with GraphQL error payloads; one malformed `ContainsAny` case failed earlier as a GraphQL input-shape validation error (`Unknown field`) rather than the deeper type-mismatch wording."
+oracle_support: []
+case_refs:
+  - python_int_equal_text
+  - python_bool_equal_text
+  - python_date_lt_int
+  - rest_int_equal_valueText
+  - graphql_int_equal_valueText
+  - graphql_int_contains_any_valueTextArray
+repro_path: "operator_test/weaviate/type_mismatch_query_operator.py"
+oracle_mapping: "This is a negative robustness oracle rather than a positive result-set oracle: returning matching objects is treated as FAIL, while an empty result or a rejected query is treated as PASS. The local validator classifies observed rejection paths into coarse categories such as `type_rejection` and `validation_error`; category mismatches are warnings by default and can be escalated to failures with `WEAVIATE_EXPECTED_ERROR_CATEGORY_MODE=strict`."

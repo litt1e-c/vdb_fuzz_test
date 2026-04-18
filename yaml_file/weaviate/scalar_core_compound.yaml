@@ -21,6 +21,7 @@ verify_status: edge_validated
 observed_summary: "On local Weaviate v1.36.10, `scalar_core_compound_operator.py` validated common deeper scalar compounds: `int >= 2 AND NOT(int < 2)` matched the same rows as the lower-bound INT predicate, `int >= 2 AND int <= 3` preserved inclusive range semantics, `num <= 2.5 AND NOT(num > 2.5)` preserved the expected NUMBER upper-bound subset, `date >= 2024-01-02 AND NOT(date < 2024-01-02)` preserved the expected DATE lower-bound subset, `flag == true AND NOT(flag == false)` isolated the true rows, and `text == \"Alpha\" AND NOT(text != \"Alpha\")` remained stable on FIELD-tokenized exact text equality."
 oracle_support:
   - pandas
+  - pqs
 case_refs:
   - int_ge_and_not_lt_same_pivot
   - int_closed_range
@@ -29,4 +30,4 @@ case_refs:
   - bool_true_and_not_false
   - text_equal_and_not_not_equal_same_value
 repro_path: "operator_test/weaviate/scalar_core_compound_operator.py"
-oracle_mapping: "The pandas oracle maps these compounds to explicit boolean-mask conjunctions over validated scalar comparison masks and the observed Weaviate `NOT` null behavior. The main fuzzer only emits the directly validated same-field subset so that deeper scalar coverage stays reproducible and semantically explainable."
+oracle_mapping: "The pandas oracle maps these compounds to explicit boolean-mask conjunctions over validated scalar comparison masks and the observed Weaviate `NOT` null behavior. PQS only emits pivot-true instances from the directly validated same-field subset, so deeper scalar coverage stays reproducible and semantically explainable without widening the oracle beyond tested behavior."

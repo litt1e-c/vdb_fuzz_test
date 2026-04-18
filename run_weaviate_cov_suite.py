@@ -109,22 +109,29 @@ class CaseResult:
     elapsed_seconds: float
 
 
+STANDARD_SCALAR_PROFILE_ARGS = ["--scalar-depth-profile", "default"]
+SMOKE_SCALAR_PROFILE_ARGS = ["--scalar-depth-profile", "coverage-smoke"]
+REST_XCHECK_PROFILE_ARGS = ["--scalar-depth-profile", "rest-xcheck"]
+SCALAR_DEEP_PROFILE_ARGS = ["--scalar-depth-profile", "scalar-deep"]
+SCALAR_DEEP_RELAXED_PROFILE_ARGS = ["--scalar-depth-profile", "scalar-deep-relaxed"]
+
+
 SCALAR_SMOKE_TEMPLATES = [
-    CaseTemplate("oracle-nodyn-smoke", "oracle", 12, [1238], 1200, ["--no-dynamic"]),
-    CaseTemplate("oracle-dyn-smoke", "oracle", 18, [2238], 1200, []),
-    CaseTemplate("oracle-inverted-smoke", "oracle", 16, [1838], 1400, ["--no-dynamic", "--profile", "inverted"]),
+    CaseTemplate("oracle-nodyn-smoke", "oracle", 12, [1238], 1200, ["--no-dynamic", *SMOKE_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("oracle-dyn-smoke", "oracle", 18, [2238], 1200, [*SMOKE_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("oracle-inverted-smoke", "oracle", 16, [1838], 1400, ["--no-dynamic", "--profile", "inverted", *SMOKE_SCALAR_PROFILE_ARGS]),
     CaseTemplate("graphql-probe-smoke", "graphql-probe", 8, [2638], 400, []),
     CaseTemplate("equiv-smoke", "equiv", 10, [3238], 1000, []),
     CaseTemplate("pqs-smoke", "pqs", 12, [4238], 1000, []),
-    CaseTemplate("aggregate-smoke", "aggregate", 12, [5238], 1200, []),
-    CaseTemplate("aggregate-inverted-smoke", "aggregate", 14, [5838], 1400, ["--profile", "inverted"]),
+    CaseTemplate("aggregate-smoke", "aggregate", 12, [5238], 1200, [*SMOKE_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("aggregate-inverted-smoke", "aggregate", 14, [5838], 1400, ["--profile", "inverted", *SMOKE_SCALAR_PROFILE_ARGS]),
     CaseTemplate(
         "rest-filter-smoke",
         "rest-filter",
         12,
         [6238],
         1200,
-        ["--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+        [*SMOKE_SCALAR_PROFILE_ARGS],
     ),
     CaseTemplate(
         "rest-filter-inverted-smoke",
@@ -132,7 +139,7 @@ SCALAR_SMOKE_TEMPLATES = [
         14,
         [6838],
         1400,
-        ["--profile", "inverted", "--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+        ["--profile", "inverted", *SMOKE_SCALAR_PROFILE_ARGS],
     ),
     CaseTemplate(
         "oracle-inverted-rest-xcheck-smoke",
@@ -144,12 +151,7 @@ SCALAR_SMOKE_TEMPLATES = [
             "--no-dynamic",
             "--profile",
             "inverted",
-            "--oracle-rest-crosscheck-rate",
-            "0.70",
-            "--rest-filter-min-depth",
-            "3",
-            "--rest-filter-max-depth",
-            "6",
+            *REST_XCHECK_PROFILE_ARGS,
         ],
     ),
     CaseTemplate(
@@ -160,28 +162,23 @@ SCALAR_SMOKE_TEMPLATES = [
         1200,
         [
             "--no-dynamic",
-            "--oracle-rest-crosscheck-rate",
-            "0.70",
-            "--rest-filter-min-depth",
-            "3",
-            "--rest-filter-max-depth",
-            "6",
+            *REST_XCHECK_PROFILE_ARGS,
         ],
     ),
 ]
 
 SCALAR_TEMPLATES = [
-    CaseTemplate("oracle-scalar-nodyn-a", "oracle", 35, [1238, 2027], 2500, ["--no-dynamic"]),
-    CaseTemplate("oracle-scalar-nodyn-b", "oracle", 35, [3137, 4488], 2500, ["--no-dynamic"]),
-    CaseTemplate("oracle-inverted-a", "oracle", 36, [18381, 18382], 2600, ["--no-dynamic", "--profile", "inverted"]),
-    CaseTemplate("oracle-scalar-dyn-a", "oracle", 45, [5501, 6602], 2500, []),
-    CaseTemplate("oracle-scalar-dyn-b", "oracle", 45, [7703], 4000, []),
-    CaseTemplate("oracle-scalar-randcl", "oracle", 35, [8804], 2500, ["--random-consistency"]),
+    CaseTemplate("oracle-scalar-nodyn-a", "oracle", 35, [1238, 2027], 2500, ["--no-dynamic", *STANDARD_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("oracle-scalar-nodyn-b", "oracle", 35, [3137, 4488], 2500, ["--no-dynamic", *STANDARD_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("oracle-inverted-a", "oracle", 36, [18381, 18382], 2600, ["--no-dynamic", "--profile", "inverted", *STANDARD_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("oracle-scalar-dyn-a", "oracle", 45, [5501, 6602], 2500, [*STANDARD_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("oracle-scalar-dyn-b", "oracle", 45, [7703], 4000, [*STANDARD_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("oracle-scalar-randcl", "oracle", 35, [8804], 2500, ["--random-consistency", *STANDARD_SCALAR_PROFILE_ARGS]),
     CaseTemplate("graphql-probe-a", "graphql-probe", 12, [9031, 9032], 600, []),
     CaseTemplate("equiv-scalar-a", "equiv", 20, [9101, 9102], 1800, []),
     CaseTemplate("pqs-scalar-a", "pqs", 25, [9201, 9202], 1800, []),
-    CaseTemplate("aggregate-scalar-a", "aggregate", 30, [9301, 9302], 2200, []),
-    CaseTemplate("aggregate-inverted-a", "aggregate", 28, [9331, 9332], 2400, ["--profile", "inverted"]),
+    CaseTemplate("aggregate-scalar-a", "aggregate", 30, [9301, 9302], 2200, [*STANDARD_SCALAR_PROFILE_ARGS]),
+    CaseTemplate("aggregate-inverted-a", "aggregate", 28, [9331, 9332], 2400, ["--profile", "inverted", *STANDARD_SCALAR_PROFILE_ARGS]),
     CaseTemplate(
         "oracle-inverted-rest-xcheck-a",
         "oracle",
@@ -192,12 +189,7 @@ SCALAR_TEMPLATES = [
             "--no-dynamic",
             "--profile",
             "inverted",
-            "--oracle-rest-crosscheck-rate",
-            "0.70",
-            "--rest-filter-min-depth",
-            "3",
-            "--rest-filter-max-depth",
-            "6",
+            *REST_XCHECK_PROFILE_ARGS,
         ],
     ),
     CaseTemplate(
@@ -208,12 +200,7 @@ SCALAR_TEMPLATES = [
         2200,
         [
             "--no-dynamic",
-            "--oracle-rest-crosscheck-rate",
-            "0.70",
-            "--rest-filter-min-depth",
-            "3",
-            "--rest-filter-max-depth",
-            "6",
+            *REST_XCHECK_PROFILE_ARGS,
         ],
     ),
     CaseTemplate(
@@ -222,7 +209,7 @@ SCALAR_TEMPLATES = [
         24,
         [9501, 9502],
         2200,
-        ["--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+        [*STANDARD_SCALAR_PROFILE_ARGS],
     ),
     CaseTemplate(
         "rest-filter-inverted-a",
@@ -230,21 +217,21 @@ SCALAR_TEMPLATES = [
         26,
         [9551, 9552],
         2400,
-        ["--profile", "inverted", "--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+        ["--profile", "inverted", *STANDARD_SCALAR_PROFILE_ARGS],
     ),
 ]
 
 FULL_TEMPLATES = SCALAR_TEMPLATES + [
     CaseTemplate("oracle-large-dyn", "oracle", 25, [10001], 12000, []),
     CaseTemplate("groupby-broad", "groupby", 18, [11001], 2000, []),
-    CaseTemplate("aggregate-broad", "aggregate", 28, [12001], 5000, []),
+    CaseTemplate("aggregate-broad", "aggregate", 28, [12001], 5000, [*STANDARD_SCALAR_PROFILE_ARGS]),
     CaseTemplate(
         "rest-filter-broad",
         "rest-filter",
         24,
         [13001],
         4500,
-        ["--rest-filter-min-depth", "3", "--rest-filter-max-depth", "6"],
+        [*STANDARD_SCALAR_PROFILE_ARGS],
     ),
 ]
 
@@ -268,14 +255,7 @@ DEEP_TEMPLATES = [
         150,
         [15001],
         3000,
-        [
-            "--oracle-rest-crosscheck-rate",
-            "0.60",
-            "--rest-filter-min-depth",
-            "4",
-            "--rest-filter-max-depth",
-            "8",
-        ],
+        [*SCALAR_DEEP_PROFILE_ARGS],
     ),
     CaseTemplate(
         "oracle-inverted-dyn-deep-120",
@@ -286,12 +266,7 @@ DEEP_TEMPLATES = [
         [
             "--profile",
             "inverted",
-            "--oracle-rest-crosscheck-rate",
-            "0.60",
-            "--rest-filter-min-depth",
-            "4",
-            "--rest-filter-max-depth",
-            "8",
+            *SCALAR_DEEP_PROFILE_ARGS,
         ],
     ),
     CaseTemplate(
@@ -302,12 +277,7 @@ DEEP_TEMPLATES = [
         3000,
         [
             "--random-consistency",
-            "--oracle-rest-crosscheck-rate",
-            "0.50",
-            "--rest-filter-min-depth",
-            "4",
-            "--rest-filter-max-depth",
-            "8",
+            *SCALAR_DEEP_RELAXED_PROFILE_ARGS,
         ],
     ),
     CaseTemplate(
@@ -316,14 +286,7 @@ DEEP_TEMPLATES = [
         96,
         [15101],
         3200,
-        [
-            "--rest-filter-min-depth",
-            "4",
-            "--rest-filter-max-depth",
-            "8",
-            "--rest-filter-max-compare-results",
-            "12000",
-        ],
+        [*SCALAR_DEEP_PROFILE_ARGS],
     ),
     CaseTemplate(
         "rest-filter-inverted-deep-96",
@@ -334,12 +297,7 @@ DEEP_TEMPLATES = [
         [
             "--profile",
             "inverted",
-            "--rest-filter-min-depth",
-            "4",
-            "--rest-filter-max-depth",
-            "8",
-            "--rest-filter-max-compare-results",
-            "12000",
+            *SCALAR_DEEP_PROFILE_ARGS,
         ],
     ),
     CaseTemplate(
@@ -348,12 +306,7 @@ DEEP_TEMPLATES = [
         72,
         [15201],
         4200,
-        [
-            "--aggregate-filter-min-depth",
-            "3",
-            "--aggregate-filter-max-depth",
-            "7",
-        ],
+        [*SCALAR_DEEP_PROFILE_ARGS],
     ),
     CaseTemplate(
         "vector-dynamic-deep-150",
@@ -516,6 +469,10 @@ def build_case_command(
     grpc_port: int,
     case_log_dir: Path | None = None,
     log_suffix: str | None = None,
+    robustness_rate: float | None = None,
+    robustness_start_fraction: float | None = None,
+    robustness_frontdoors: str | None = None,
+    robustness_category_mode: str | None = None,
 ) -> list[str]:
     if case.mode == "vector":
         cmd = [
@@ -557,6 +514,14 @@ def build_case_command(
         cmd += ["--log-dir", str(case_log_dir)]
     if log_suffix:
         cmd += ["--log-suffix", str(log_suffix)]
+    if case.mode in {"oracle", "rest-filter"} and robustness_rate is not None and robustness_rate > 0.0:
+        cmd += ["--robustness-rate", str(robustness_rate)]
+        if robustness_start_fraction is not None:
+            cmd += ["--robustness-start-fraction", str(robustness_start_fraction)]
+        if robustness_frontdoors:
+            cmd += ["--robustness-frontdoors", str(robustness_frontdoors)]
+        if robustness_category_mode:
+            cmd += ["--robustness-category-mode", str(robustness_category_mode)]
     cmd.extend(case.extra_args)
     return cmd
 
@@ -1291,7 +1256,16 @@ def main() -> int:
         help="Comma-separated GOCOVERDIR directories to analyze/merge for the coverage report",
     )
     parser.add_argument("--ready-timeout", type=float, default=90.0, help="Seconds to wait for Weaviate readiness")
-    parser.add_argument("--query-page-size", type=int, default=1000, help="Pass-through query page size for fuzz cases")
+    parser.add_argument("--query-page-size", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--robustness-rate", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--robustness-start-fraction", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--robustness-frontdoors", default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--robustness-category-mode",
+        choices=["ignore", "warn", "strict"],
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--stop-on-fail", action="store_true", help="Abort the suite on first failed fuzz case")
     parser.add_argument("--start-case", type=int, default=1, help="1-based case index to start from after suite expansion")
     parser.add_argument("--max-cases", type=int, default=None, help="Run only the first N expanded cases")
@@ -1477,6 +1451,13 @@ def main() -> int:
     print(f"  Host:Port:  {args.host}:{args.port}")
     print(f"  gRPC Port:  {args.grpc_port}")
     print(f"  Server:     {'reuse existing' if args.reuse_running_server else 'launch new'}")
+    if args.robustness_rate is not None and args.robustness_rate > 0.0:
+        print(
+            f"  Robustness: rate={args.robustness_rate:.2f} "
+            f"start={float(args.robustness_start_fraction or 0.80):.2f} "
+            f"frontdoors={args.robustness_frontdoors or 'python,rest,graphql'} "
+            f"category={args.robustness_category_mode or 'warn'}"
+        )
     if args.coverage_timeline:
         print(f"  Timeline:   every {args.coverage_timeline_interval_cases} completed case(s)")
     print(f"{CYAN}{'-' * 76}{RESET}")
@@ -1504,6 +1485,10 @@ def main() -> int:
             args.grpc_port,
             case_log_dir=log_dir / "case_logs",
             log_suffix=log_suffix,
+            robustness_rate=args.robustness_rate,
+            robustness_start_fraction=args.robustness_start_fraction,
+            robustness_frontdoors=args.robustness_frontdoors,
+            robustness_category_mode=args.robustness_category_mode,
         )
         print(
             f"  [{index:02d}] {case.name:<22} mode={case.mode:<7} "
@@ -1600,6 +1585,10 @@ def main() -> int:
                 args.grpc_port,
                 case_log_dir=log_dir / "case_logs",
                 log_suffix=log_suffix,
+                robustness_rate=args.robustness_rate,
+                robustness_start_fraction=args.robustness_start_fraction,
+                robustness_frontdoors=args.robustness_frontdoors,
+                robustness_category_mode=args.robustness_category_mode,
             )
             log_name = f"{index:03d}_cycle{cycle:02d}_{case.name}_seed_{seed_label}.log"
             log_path = log_dir / log_name

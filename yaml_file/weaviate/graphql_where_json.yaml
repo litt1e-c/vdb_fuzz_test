@@ -1,0 +1,36 @@
+operator_id: graphql_where_json
+family: other
+syntax_examples:
+  - '{ Get { FuzzOracleV2(where:{path:["intVal"], operator: Equal, valueInt: 7}) { tag } } }'
+  - '{ Get { FuzzOracleV2(where:{operator: And, operands:[{path:["textVal"], operator: Like, valueText: "alpha*"}, {path:["boolVal"], operator: Equal, valueBoolean: true}]}) { tag } } }'
+  - '{ Get { FuzzOracleV2(where:{path:["textVal"], operator: IsNull, valueBoolean: true}) { tag } } }'
+doc_status: derived
+doc_source_urls:
+  - "https://docs.weaviate.io/weaviate/api/graphql/filters"
+  - "https://docs.weaviate.io/weaviate/search/filters"
+doc_supported_types:
+  - scalar_numeric
+  - scalar_text
+  - scalar_bool
+  - scalar_datetime
+  - array_field
+  - metadata_field
+  - unknown
+doc_semantics: "The checked GraphQL filter references expose a `where` input object with typed operators and value fields. Local validation uses raw GraphQL `Get` queries as a direct frontdoor probe for the documented filter family, but only claims the subset that was exercised deterministically."
+doc_notes:
+  - "This entry records a locally validated subset of GraphQL `where` behavior rather than the full GraphQL filter surface."
+  - "The retained subset currently covers simple property paths with `Equal`, `NotEqual`, range comparisons, `Like`, `IsNull`, and `And`/`Or`/`Not` composition."
+  - "Nested object child paths, metadata-only paths such as `id`, and array-membership variants are kept outside this YAML record unless separately validated."
+verify_status: edge_validated
+observed_summary: "Local `graphql_where_json_operator.py` validation on Weaviate v1.36.10 showed that raw GraphQL `where` JSON matched the expected tag sets for INT equality/inequality and ranges, NUMBER comparisons, BOOL equality, FIELD-tokenized TEXT equality/inequality, `Like`, DATE comparisons, `IsNull`, and `And`/`Or`/`Not` composition. This is the same narrow subset now eligible for GraphQL sidecar cross-checks inside the main oracle, but only when the generated REST/where tree stays inside the validated path and operator subset."
+oracle_support:
+  - pandas
+case_refs:
+  - int_equal
+  - number_greater_than
+  - text_like_prefix
+  - null_text
+  - and_bool_text
+  - not_text_equal
+repro_path: "operator_test/weaviate/graphql_where_json_operator.py"
+oracle_mapping: "The local oracle converts a validated subset of REST-like where trees into GraphQL `where` input, computes the expected ID set with the pandas-side filter evaluator, and compares that expected set with the GraphQL `Get` result IDs. This record intentionally excludes frontdoor shapes whose semantics or parser behavior have not been independently validated."

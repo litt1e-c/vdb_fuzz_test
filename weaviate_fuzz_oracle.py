@@ -103,6 +103,22 @@ AGGREGATE_FILTER_MAX_DEPTH = max(
     AGGREGATE_FILTER_MIN_DEPTH,
     _env_positive_int("WEAVIATE_FUZZ_AGGREGATE_FILTER_MAX_DEPTH", 4),
 )
+ORACLE_FILTER_DEPTH_MIN = _env_positive_int("WEAVIATE_FUZZ_ORACLE_FILTER_DEPTH_MIN", 2)
+ORACLE_FILTER_DEPTH_MAX = max(
+    ORACLE_FILTER_DEPTH_MIN,
+    _env_positive_int("WEAVIATE_FUZZ_ORACLE_FILTER_DEPTH_MAX", 10),
+)
+ORACLE_FILTER_DEPTH_INVERTED_MIN = _env_positive_int("WEAVIATE_FUZZ_ORACLE_FILTER_DEPTH_INVERTED_MIN", 6)
+ORACLE_FILTER_DEPTH_INVERTED_MAX = max(
+    ORACLE_FILTER_DEPTH_INVERTED_MIN,
+    _env_positive_int("WEAVIATE_FUZZ_ORACLE_FILTER_DEPTH_INVERTED_MAX", 14),
+)
+PQS_FILTER_DEPTH_MIN = _env_positive_int("WEAVIATE_FUZZ_PQS_FILTER_DEPTH_MIN", 3)
+PQS_FILTER_DEPTH_MAX = max(
+    PQS_FILTER_DEPTH_MIN,
+    _env_positive_int("WEAVIATE_FUZZ_PQS_FILTER_DEPTH_MAX", 13),
+)
+PQS_MULTI_FIELD_RATE = _env_probability("WEAVIATE_FUZZ_PQS_MULTI_FIELD_RATE", 0.30)
 REST_FILTER_MIN_DEPTH = _env_positive_int("WEAVIATE_FUZZ_REST_FILTER_MIN_DEPTH", 3)
 REST_FILTER_MAX_DEPTH = max(
     REST_FILTER_MIN_DEPTH,
@@ -112,10 +128,112 @@ REST_FILTER_MAX_COMPARE_RESULTS = _env_positive_int("WEAVIATE_FUZZ_REST_FILTER_M
 ORACLE_REST_CROSSCHECK_RATE = _env_probability("WEAVIATE_FUZZ_ORACLE_REST_CROSSCHECK_RATE", 0.35)
 QUERY_MAXIMUM_RESULTS_RE = re.compile(r"QUERY_MAXIMUM_RESULTS '(\d+)'")
 
+ROBUSTNESS_FRONTDOORS_ALL = ("python", "rest", "graphql")
+ROBUSTNESS_ERROR_CATEGORY_MODES = {"ignore", "warn", "strict"}
+
+
+def _normalize_frontdoor_list(raw_value):
+    if isinstance(raw_value, (list, tuple, set)):
+        tokens = [str(item).strip().lower() for item in raw_value]
+    else:
+        text = str(raw_value or "").strip().lower()
+        tokens = [token.strip() for token in text.split(",")] if text else []
+    ordered = []
+    for token in tokens:
+        if token in ROBUSTNESS_FRONTDOORS_ALL and token not in ordered:
+            ordered.append(token)
+    return tuple(ordered)
+
+
+def _normalize_error_category_mode(value):
+    mode = str(value or "warn").strip().lower() or "warn"
+    if mode not in ROBUSTNESS_ERROR_CATEGORY_MODES:
+        return "warn"
+    return mode
+
+
+ROBUSTNESS_RATE = _env_probability("WEAVIATE_FUZZ_ROBUSTNESS_RATE", 0.0)
+ROBUSTNESS_START_FRACTION = _env_probability("WEAVIATE_FUZZ_ROBUSTNESS_START_FRACTION", 0.80)
+ROBUSTNESS_FRONTDOORS = _normalize_frontdoor_list(
+    os.getenv("WEAVIATE_FUZZ_ROBUSTNESS_FRONTDOORS", ",".join(ROBUSTNESS_FRONTDOORS_ALL))
+)
+ROBUSTNESS_ERROR_CATEGORY_MODE = _normalize_error_category_mode(
+    os.getenv("WEAVIATE_FUZZ_ROBUSTNESS_CATEGORY_MODE", "warn")
+)
+
 FUZZ_PROFILE_DEFAULT = "default"
 FUZZ_PROFILE_INVERTED = "inverted"
 ALL_FUZZ_PROFILES = [FUZZ_PROFILE_DEFAULT, FUZZ_PROFILE_INVERTED]
 FUZZ_PROFILE = FUZZ_PROFILE_DEFAULT
+
+DEFAULT_SCALAR_DEPTH_TUNING = {
+    "query_page_size": QUERY_PAGE_SIZE,
+    "oracle_min_depth": ORACLE_FILTER_DEPTH_MIN,
+    "oracle_max_depth": ORACLE_FILTER_DEPTH_MAX,
+    "oracle_inverted_min_depth": ORACLE_FILTER_DEPTH_INVERTED_MIN,
+    "oracle_inverted_max_depth": ORACLE_FILTER_DEPTH_INVERTED_MAX,
+    "pqs_min_depth": PQS_FILTER_DEPTH_MIN,
+    "pqs_max_depth": PQS_FILTER_DEPTH_MAX,
+    "pqs_multi_field_rate": PQS_MULTI_FIELD_RATE,
+    "aggregate_min_depth": AGGREGATE_FILTER_MIN_DEPTH,
+    "aggregate_max_depth": AGGREGATE_FILTER_MAX_DEPTH,
+    "rest_min_depth": REST_FILTER_MIN_DEPTH,
+    "rest_max_depth": REST_FILTER_MAX_DEPTH,
+    "rest_max_compare_results": REST_FILTER_MAX_COMPARE_RESULTS,
+    "oracle_rest_crosscheck_rate": ORACLE_REST_CROSSCHECK_RATE,
+}
+
+SCALAR_DEPTH_PROFILE_DEFAULT = "default"
+SCALAR_DEPTH_PROFILE_COVERAGE_SMOKE = "coverage-smoke"
+SCALAR_DEPTH_PROFILE_REST_XCHECK = "rest-xcheck"
+SCALAR_DEPTH_PROFILE_SCALAR_DEEP = "scalar-deep"
+SCALAR_DEPTH_PROFILE_SCALAR_DEEP_RELAXED = "scalar-deep-relaxed"
+
+SCALAR_DEPTH_PROFILES = {
+    SCALAR_DEPTH_PROFILE_DEFAULT: dict(DEFAULT_SCALAR_DEPTH_TUNING),
+    SCALAR_DEPTH_PROFILE_COVERAGE_SMOKE: {
+        **DEFAULT_SCALAR_DEPTH_TUNING,
+        "oracle_rest_crosscheck_rate": max(0.35, float(DEFAULT_SCALAR_DEPTH_TUNING["oracle_rest_crosscheck_rate"])),
+    },
+    SCALAR_DEPTH_PROFILE_REST_XCHECK: {
+        **DEFAULT_SCALAR_DEPTH_TUNING,
+        "oracle_rest_crosscheck_rate": 0.70,
+    },
+    SCALAR_DEPTH_PROFILE_SCALAR_DEEP: {
+        **DEFAULT_SCALAR_DEPTH_TUNING,
+        "oracle_min_depth": 4,
+        "oracle_max_depth": 12,
+        "oracle_inverted_min_depth": 7,
+        "oracle_inverted_max_depth": 16,
+        "pqs_min_depth": 5,
+        "pqs_max_depth": 15,
+        "pqs_multi_field_rate": 0.42,
+        "aggregate_min_depth": 3,
+        "aggregate_max_depth": 7,
+        "rest_min_depth": 4,
+        "rest_max_depth": 8,
+        "rest_max_compare_results": 12000,
+        "oracle_rest_crosscheck_rate": 0.60,
+    },
+    SCALAR_DEPTH_PROFILE_SCALAR_DEEP_RELAXED: {
+        **DEFAULT_SCALAR_DEPTH_TUNING,
+        "oracle_min_depth": 4,
+        "oracle_max_depth": 11,
+        "oracle_inverted_min_depth": 7,
+        "oracle_inverted_max_depth": 15,
+        "pqs_min_depth": 4,
+        "pqs_max_depth": 15,
+        "pqs_multi_field_rate": 0.38,
+        "aggregate_min_depth": 3,
+        "aggregate_max_depth": 7,
+        "rest_min_depth": 4,
+        "rest_max_depth": 8,
+        "rest_max_compare_results": 12000,
+        "oracle_rest_crosscheck_rate": 0.50,
+    },
+}
+ALL_SCALAR_DEPTH_PROFILES = list(SCALAR_DEPTH_PROFILES.keys())
+SCALAR_DEPTH_PROFILE = SCALAR_DEPTH_PROFILE_DEFAULT
 
 
 def set_fuzz_profile(profile):
@@ -132,6 +250,114 @@ def get_fuzz_profile():
 
 def is_inverted_profile():
     return FUZZ_PROFILE == FUZZ_PROFILE_INVERTED
+
+
+def _normalize_scalar_depth_profile(profile):
+    normalized = str(profile or SCALAR_DEPTH_PROFILE_DEFAULT).strip().lower()
+    if normalized not in SCALAR_DEPTH_PROFILES:
+        raise ValueError(f"Unsupported scalar depth profile: {profile}")
+    return normalized
+
+
+def set_scalar_depth_profile(profile):
+    global SCALAR_DEPTH_PROFILE
+    global QUERY_PAGE_SIZE
+    global ORACLE_FILTER_DEPTH_MIN, ORACLE_FILTER_DEPTH_MAX
+    global ORACLE_FILTER_DEPTH_INVERTED_MIN, ORACLE_FILTER_DEPTH_INVERTED_MAX
+    global PQS_FILTER_DEPTH_MIN, PQS_FILTER_DEPTH_MAX, PQS_MULTI_FIELD_RATE
+    global AGGREGATE_FILTER_MIN_DEPTH, AGGREGATE_FILTER_MAX_DEPTH
+    global REST_FILTER_MIN_DEPTH, REST_FILTER_MAX_DEPTH
+    global REST_FILTER_MAX_COMPARE_RESULTS
+    global ORACLE_REST_CROSSCHECK_RATE
+
+    normalized = _normalize_scalar_depth_profile(profile)
+    config = SCALAR_DEPTH_PROFILES[normalized]
+    QUERY_PAGE_SIZE = max(1, int(config["query_page_size"]))
+    ORACLE_FILTER_DEPTH_MIN = max(1, int(config["oracle_min_depth"]))
+    ORACLE_FILTER_DEPTH_MAX = max(ORACLE_FILTER_DEPTH_MIN, int(config["oracle_max_depth"]))
+    ORACLE_FILTER_DEPTH_INVERTED_MIN = max(1, int(config["oracle_inverted_min_depth"]))
+    ORACLE_FILTER_DEPTH_INVERTED_MAX = max(ORACLE_FILTER_DEPTH_INVERTED_MIN, int(config["oracle_inverted_max_depth"]))
+    PQS_FILTER_DEPTH_MIN = max(1, int(config["pqs_min_depth"]))
+    PQS_FILTER_DEPTH_MAX = max(PQS_FILTER_DEPTH_MIN, int(config["pqs_max_depth"]))
+    PQS_MULTI_FIELD_RATE = max(0.0, min(1.0, float(config["pqs_multi_field_rate"])))
+    AGGREGATE_FILTER_MIN_DEPTH = max(1, int(config["aggregate_min_depth"]))
+    AGGREGATE_FILTER_MAX_DEPTH = max(AGGREGATE_FILTER_MIN_DEPTH, int(config["aggregate_max_depth"]))
+    REST_FILTER_MIN_DEPTH = max(1, int(config["rest_min_depth"]))
+    REST_FILTER_MAX_DEPTH = max(REST_FILTER_MIN_DEPTH, int(config["rest_max_depth"]))
+    REST_FILTER_MAX_COMPARE_RESULTS = max(1, int(config["rest_max_compare_results"]))
+    ORACLE_REST_CROSSCHECK_RATE = max(0.0, min(1.0, float(config["oracle_rest_crosscheck_rate"])))
+    SCALAR_DEPTH_PROFILE = normalized
+
+
+def get_scalar_depth_profile():
+    return SCALAR_DEPTH_PROFILE
+
+
+def get_oracle_filter_depth_range():
+    if is_inverted_profile():
+        return ORACLE_FILTER_DEPTH_INVERTED_MIN, ORACLE_FILTER_DEPTH_INVERTED_MAX
+    return ORACLE_FILTER_DEPTH_MIN, ORACLE_FILTER_DEPTH_MAX
+
+
+def get_pqs_filter_depth_range():
+    return PQS_FILTER_DEPTH_MIN, PQS_FILTER_DEPTH_MAX
+
+
+def set_robustness_config(*, rate=None, start_fraction=None, frontdoors=None, category_mode=None):
+    global ROBUSTNESS_RATE, ROBUSTNESS_START_FRACTION, ROBUSTNESS_FRONTDOORS, ROBUSTNESS_ERROR_CATEGORY_MODE
+
+    if rate is not None:
+        ROBUSTNESS_RATE = max(0.0, min(1.0, float(rate)))
+    if start_fraction is not None:
+        ROBUSTNESS_START_FRACTION = max(0.0, min(1.0, float(start_fraction)))
+    if frontdoors is not None:
+        ROBUSTNESS_FRONTDOORS = _normalize_frontdoor_list(frontdoors)
+    if category_mode is not None:
+        ROBUSTNESS_ERROR_CATEGORY_MODE = _normalize_error_category_mode(category_mode)
+
+
+def robustness_enabled_for_mode(mode):
+    return (
+        mode in {"oracle", "rest-filter"}
+        and ROBUSTNESS_RATE > 0.0
+        and bool(ROBUSTNESS_FRONTDOORS)
+    )
+
+
+def robustness_start_round(rounds):
+    if rounds <= 0:
+        return 0
+    return max(0, min(rounds - 1, int(rounds * ROBUSTNESS_START_FRACTION)))
+
+
+def robustness_should_inject(round_index, rounds, mode):
+    if not robustness_enabled_for_mode(mode):
+        return False
+    if round_index < robustness_start_round(rounds):
+        return False
+    return random.random() < ROBUSTNESS_RATE
+
+
+def robustness_short_label(mode):
+    if not robustness_enabled_for_mode(mode):
+        return None
+    pct = int(round(ROBUSTNESS_RATE * 100))
+    start_pct = int(round(ROBUSTNESS_START_FRACTION * 100))
+    return f"robust-{pct}pct-from-{start_pct}"
+
+
+def active_robustness_cli_args(mode):
+    if not robustness_enabled_for_mode(mode):
+        return []
+    return [
+        "--robustness-rate", str(ROBUSTNESS_RATE),
+        "--robustness-start-fraction", str(ROBUSTNESS_START_FRACTION),
+        "--robustness-frontdoors", ",".join(ROBUSTNESS_FRONTDOORS),
+        "--robustness-category-mode", str(ROBUSTNESS_ERROR_CATEGORY_MODE),
+    ]
+
+
+set_scalar_depth_profile(os.getenv("WEAVIATE_FUZZ_SCALAR_DEPTH_PROFILE", SCALAR_DEPTH_PROFILE_DEFAULT))
 
 # --- 延迟初始化的随机变量 (在 run() 中种子设置后初始化) ---
 VECTOR_CHECK_RATIO = None
@@ -747,6 +973,7 @@ def format_repro_command(
         parts.append("--random-consistency")
     elif (consistency or DEFAULT_CONSISTENCY_LEVEL) != DEFAULT_CONSISTENCY_LEVEL:
         parts.extend(["--consistency", (consistency or DEFAULT_CONSISTENCY_LEVEL).name.lower()])
+    parts.extend(active_robustness_cli_args(mode))
     for item in extra_args or []:
         parts.append(str(item))
     return shlex.join(parts)
@@ -829,6 +1056,275 @@ class FuzzStats:
         if self.error_categories:
             lines.append(f"Errors: {dict(self.error_categories)}")
         return " | ".join(lines)
+
+
+@dataclass(frozen=True)
+class RobustnessSpec:
+    name: str
+    field_name: str
+    field_type: str
+    variant: str
+    expected_error_categories: dict
+
+
+def classify_robustness_error(exc) -> str:
+    message = str(exc).lower()
+
+    if any(token in message for token in ("not supported", "unsupported", "not implement", "not support")):
+        return "unsupported"
+
+    if any(
+        token in message
+        for token in (
+            'cannot use "value',
+            "expected an integer value",
+            "expected value to be bool",
+            "expected value to be time.time",
+            "expected value to be",
+            "value type should be []int",
+            "value type should be []float",
+            "value type should be []bool",
+            "value type should be []string",
+            "got string",
+            "got int",
+            "could not parse string",
+            "parseable string",
+            "wrong type",
+            "expected type",
+            "data type filter cannot use",
+        )
+    ):
+        return "type_rejection"
+
+    if any(
+        token in message
+        for token in (
+            'argument "where" has invalid value',
+            "unknown field",
+            "invalid where filter",
+            "invalid 'where' filter",
+            "validation",
+        )
+    ):
+        return "validation_error"
+
+    if any(token in message for token in ("syntax", "parser", "cannot parse", "parse error")):
+        return "parse_rejection"
+
+    return "validation_error"
+
+
+def format_frontdoor_expr(spec: RobustnessSpec, frontdoor: str):
+    field_name = spec.field_name
+    if spec.variant == "equal_text":
+        if frontdoor == "python":
+            return f'Filter.by_property("{field_name}").equal("oops")'
+        where = {"path": [field_name], "operator": "Equal", "valueText": "oops"}
+        if frontdoor == "graphql":
+            return "{ Get { " + CLASS_NAME + f'(where:{graphql_input_literal(graphql_with_enum_operators(where))}) {{ _additional {{ id }} }} }}'
+        return where
+    if spec.variant == "less_than_int":
+        if frontdoor == "python":
+            return f'Filter.by_property("{field_name}").less_than(7)'
+        where = {"path": [field_name], "operator": "LessThan", "valueInt": 7}
+        if frontdoor == "graphql":
+            return "{ Get { " + CLASS_NAME + f'(where:{graphql_input_literal(graphql_with_enum_operators(where))}) {{ _additional {{ id }} }} }}'
+        return where
+    if spec.variant == "contains_any_text_array":
+        if frontdoor == "python":
+            return f'Filter.by_property("{field_name}").contains_any(["1", "2"])'
+        where = {"path": [field_name], "operator": "ContainsAny", "valueTextArray": ["1", "2"]}
+        if frontdoor == "graphql":
+            return "{ Get { " + CLASS_NAME + f'(where:{graphql_input_literal(graphql_with_enum_operators(where))}) {{ _additional {{ id }} }} }}'
+        return where
+    return f"{field_name}:{spec.variant}"
+
+
+def build_robustness_filter(spec: RobustnessSpec):
+    target = Filter.by_property(spec.field_name)
+    if spec.variant == "equal_text":
+        return target.equal("oops")
+    if spec.variant == "less_than_int":
+        return target.less_than(7)
+    if spec.variant == "contains_any_text_array":
+        return target.contains_any(["1", "2"])
+    raise ValueError(f"Unsupported robustness variant: {spec.variant}")
+
+
+def execute_robustness_probe(spec: RobustnessSpec, frontdoor: str, *, collection, client, collection_name):
+    if frontdoor == "python":
+        flt = build_robustness_filter(spec)
+        response = collection.query.fetch_objects(filters=flt, limit=4)
+        return sorted(str(obj.uuid) for obj in response.objects)
+
+    if spec.variant == "equal_text":
+        where_filter = {"path": [spec.field_name], "operator": "Equal", "valueText": "oops"}
+    elif spec.variant == "less_than_int":
+        where_filter = {"path": [spec.field_name], "operator": "LessThan", "valueInt": 7}
+    elif spec.variant == "contains_any_text_array":
+        where_filter = {"path": [spec.field_name], "operator": "ContainsAny", "valueTextArray": ["1", "2"]}
+    else:
+        raise ValueError(f"Unsupported robustness variant: {spec.variant}")
+
+    if frontdoor == "rest":
+        return rest_batch_delete_dry_run(collection_name, where_filter, timeout=30)
+    if frontdoor == "graphql":
+        graphql_ids, _ = graphql_fetch_ids_by_where(
+            client,
+            collection_name,
+            where_filter,
+            limit=min(4, get_query_maximum_results()),
+        )
+        return sorted(str(object_id) for object_id in graphql_ids)
+    raise ValueError(f"Unsupported robustness frontdoor: {frontdoor}")
+
+
+def collect_scalar_type_mismatch_specs(dm):
+    specs = []
+    ordered_fields = sorted(dm.schema_config, key=lambda item: item["name"])
+    for field in ordered_fields:
+        field_name = str(field["name"])
+        field_type = field["type"]
+        state = dict(dm.field_index_state.get(field_name, {}) or {})
+        if field_name not in dm.filterable_fields or not state.get("filterable"):
+            continue
+
+        if field_type == FieldType.INT:
+            specs.append(
+                RobustnessSpec(
+                    name=f"{field_name}_equal_text",
+                    field_name=field_name,
+                    field_type=field_type,
+                    variant="equal_text",
+                    expected_error_categories={"python": "type_rejection", "rest": "type_rejection", "graphql": "type_rejection"},
+                )
+            )
+            specs.append(
+                RobustnessSpec(
+                    name=f"{field_name}_contains_any_text_array",
+                    field_name=field_name,
+                    field_type=field_type,
+                    variant="contains_any_text_array",
+                    expected_error_categories={"python": "type_rejection", "rest": "type_rejection", "graphql": "validation_error"},
+                )
+            )
+        elif field_type == FieldType.BOOL:
+            specs.append(
+                RobustnessSpec(
+                    name=f"{field_name}_equal_text",
+                    field_name=field_name,
+                    field_type=field_type,
+                    variant="equal_text",
+                    expected_error_categories={"python": "type_rejection", "rest": "type_rejection", "graphql": "type_rejection"},
+                )
+            )
+        elif field_type == FieldType.DATE and state.get("range"):
+            specs.append(
+                RobustnessSpec(
+                    name=f"{field_name}_less_than_int",
+                    field_name=field_name,
+                    field_type=field_type,
+                    variant="less_than_int",
+                    expected_error_categories={"python": "type_rejection", "rest": "type_rejection", "graphql": "type_rejection"},
+                )
+            )
+    return specs
+
+
+def maybe_run_scalar_type_mismatch_probe(*, mode, round_index, rounds, dm, collection, client, collection_name, flog):
+    if not robustness_should_inject(round_index, rounds, mode):
+        return {"ran": False}
+
+    specs = collect_scalar_type_mismatch_specs(dm)
+    if not specs:
+        flog("  Robustness: SKIP no eligible scalar fields")
+        return {"ran": False, "skipped": True, "reason": "no_specs"}
+
+    spec = random.choice(specs)
+    available_frontdoors = [frontdoor for frontdoor in ROBUSTNESS_FRONTDOORS if frontdoor in spec.expected_error_categories]
+    if not available_frontdoors:
+        flog(f"  Robustness: SKIP no enabled frontdoor for {spec.name}")
+        return {"ran": False, "skipped": True, "reason": "no_frontdoor"}
+
+    frontdoor = random.choice(available_frontdoors)
+    expr_repr = format_frontdoor_expr(spec, frontdoor)
+    expected_category = spec.expected_error_categories.get(frontdoor, "type_rejection")
+    flog(
+        f"  Robustness: TRY spec={spec.name} frontdoor={frontdoor} "
+        f"expected_error={expected_category}"
+    )
+    flog(f"  RobustnessExpr: {expr_repr}")
+
+    try:
+        actual_ids = execute_robustness_probe(
+            spec,
+            frontdoor,
+            collection=collection,
+            client=client,
+            collection_name=collection_name,
+        )
+        if not actual_ids:
+            flog(
+                f"  Robustness: PASS empty_result spec={spec.name} frontdoor={frontdoor} "
+                "expected_no_matches"
+            )
+            return {
+                "ran": True,
+                "failed": False,
+                "warn": False,
+                "detail": (
+                    f"Robustness pass empty_result spec={spec.name} frontdoor={frontdoor}"
+                ),
+                "expr": str(expr_repr),
+            }
+
+        detail = (
+            f"Robustness unexpected matches spec={spec.name} frontdoor={frontdoor} "
+            f"returned={len(actual_ids)}"
+        )
+        flog(f"  Robustness: FAIL {detail}")
+        return {
+            "ran": True,
+            "failed": True,
+            "warn": False,
+            "detail": detail,
+            "expr": str(expr_repr),
+        }
+    except Exception as exc:
+        actual_category = classify_robustness_error(exc)
+        category_match = actual_category == expected_category
+        if ROBUSTNESS_ERROR_CATEGORY_MODE == "ignore":
+            status = "PASS"
+            failed = False
+            warned = False
+        elif category_match:
+            status = "PASS"
+            failed = False
+            warned = False
+        elif ROBUSTNESS_ERROR_CATEGORY_MODE == "strict":
+            status = "FAIL"
+            failed = True
+            warned = False
+        else:
+            status = "PASS_WARN"
+            failed = False
+            warned = True
+
+        flog(
+            f"  Robustness: {status} spec={spec.name} frontdoor={frontdoor} "
+            f"expected_error={expected_category} actual_error={actual_category}"
+        )
+        flog(f"  RobustnessErr: {type(exc).__name__}: {exc}")
+        return {
+            "ran": True,
+            "failed": failed,
+            "warn": warned,
+            "detail": (
+                f"Robustness {status.lower()} spec={spec.name} frontdoor={frontdoor} "
+                f"expected={expected_category} actual={actual_category}"
+            ),
+            "expr": str(expr_repr),
+        }
 
 
 def to_utc_timestamp(value):
@@ -4176,6 +4672,88 @@ class OracleQueryGenerator:
             )
         return None, None
 
+    def gen_true_like_boundary(self, row):
+        text_fields = self.like_text_schema[:]
+        random.shuffle(text_fields)
+        for field in text_fields:
+            name = field["name"]
+            value = row.get(name)
+            if self._is_effectively_null_value(value, FieldType.TEXT):
+                continue
+            sv = str(value)
+            candidates = [("*", f'{name} like "*"'), ("**", f'{name} like "**"')]
+            if len(sv) == 3:
+                candidates.append(("???", f'{name} like "???"'))
+            if sv == "%":
+                candidates.append(("%", f'{name} like "%"'))
+            if sv == "_":
+                candidates.append(("_", f'{name} like "_"'))
+            pattern, expr = random.choice(candidates)
+            return Filter.by_property(name).like(pattern), expr
+        return None, None
+
+    def gen_true_scalar_core_compound(self, row):
+        candidates = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.TEXT, FieldType.DATE)]
+        random.shuffle(candidates)
+        for field in candidates:
+            name, ftype = field["name"], field["type"]
+            value = row.get(name)
+            if self._is_effectively_null_value(value, ftype):
+                continue
+
+            if ftype == FieldType.INT:
+                if random.random() < 0.5:
+                    ge_filter, _, ge_expr = self._build_scalar_cmp_filter_clause(name, ftype, ">=", int(value))
+                    lt_filter, _, lt_expr = self._build_scalar_cmp_filter_clause(name, ftype, "<", int(value))
+                    if ge_filter is None or lt_filter is None:
+                        continue
+                    return ge_filter & Filter.not_(lt_filter), f"({ge_expr} AND NOT({lt_expr}))"
+
+                values = stable_unique_values(int(v) for v in self._field_values.get(name, []) if not is_null_like(v))
+                lower_choices = [candidate for candidate in values if candidate <= int(value)]
+                upper_choices = [candidate for candidate in values if candidate >= int(value)]
+                if not lower_choices or not upper_choices:
+                    continue
+                lo = random.choice(lower_choices)
+                hi = random.choice(upper_choices)
+                if lo > hi:
+                    lo, hi = hi, lo
+                ge_filter, _, ge_expr = self._build_scalar_cmp_filter_clause(name, ftype, ">=", lo)
+                le_filter, _, le_expr = self._build_scalar_cmp_filter_clause(name, ftype, "<=", hi)
+                if ge_filter is None or le_filter is None:
+                    continue
+                return ge_filter & le_filter, f"({ge_expr} AND {le_expr})"
+
+            if ftype == FieldType.NUMBER:
+                le_filter, _, le_expr = self._build_scalar_cmp_filter_clause(name, ftype, "<=", float(value))
+                gt_filter, _, gt_expr = self._build_scalar_cmp_filter_clause(name, ftype, ">", float(value))
+                if le_filter is None or gt_filter is None:
+                    continue
+                return le_filter & Filter.not_(gt_filter), f"({le_expr} AND NOT({gt_expr}))"
+
+            if ftype == FieldType.DATE:
+                ge_filter, _, ge_expr = self._build_scalar_cmp_filter_clause(name, ftype, ">=", value)
+                lt_filter, _, lt_expr = self._build_scalar_cmp_filter_clause(name, ftype, "<", value)
+                if ge_filter is None or lt_filter is None:
+                    continue
+                return ge_filter & Filter.not_(lt_filter), f"({ge_expr} AND NOT({lt_expr}))"
+
+            if ftype == FieldType.BOOL:
+                pivot = bool(value)
+                eq_filter, _, eq_expr = self._build_scalar_cmp_filter_clause(name, ftype, "==", pivot)
+                opp_filter, _, opp_expr = self._build_scalar_cmp_filter_clause(name, ftype, "==", not pivot)
+                if eq_filter is None or opp_filter is None:
+                    continue
+                return eq_filter & Filter.not_(opp_filter), f"({eq_expr} AND NOT({opp_expr}))"
+
+            eq_filter, _, eq_expr = self._build_scalar_cmp_filter_clause(name, ftype, "==", str(value))
+            neq_filter, _, neq_expr = self._build_scalar_cmp_filter_clause(name, ftype, "!=", str(value))
+            if eq_filter is None or neq_filter is None:
+                continue
+            return eq_filter & Filter.not_(neq_filter), f"({eq_expr} AND NOT({neq_expr}))"
+
+        return None, None
+
     def gen_true_scalar_contains_compound(self, row):
         fields = [field for field in self.schema if field["type"] in (FieldType.INT, FieldType.NUMBER, FieldType.BOOL, FieldType.DATE)]
         random.shuffle(fields)
@@ -4187,7 +4765,7 @@ class OracleQueryGenerator:
             series = self.df[name]
             contrast = self._scalar_contains_contrast_value(ftype, value)
             strategies = ["contains_all_and_not_none", "contains_any_or_null"]
-            if contrast is not None:
+            if contrast is not None and ftype in (FieldType.INT, FieldType.NUMBER, FieldType.DATE):
                 strategies.append("contains_none_guard")
             strategy = random.choice(strategies)
             if strategy == "contains_all_and_not_none":
@@ -4239,6 +4817,89 @@ class OracleQueryGenerator:
             pivot_dt = pivot_ts.to_pydatetime()
             guard = Filter.by_property(name).greater_or_equal(pivot_dt) & Filter.by_property(name).less_or_equal(pivot_dt)
             return contains_none_filter & guard, f"({contains_none_expr} AND {name} in [{pivot}, {pivot}])"
+        return None, None
+
+    def gen_true_array_contains_compound(self, row):
+        arr_fields = [
+            field
+            for field in self.schema
+            if field["type"] in [FieldType.INT_ARRAY, FieldType.TEXT_ARRAY, FieldType.NUMBER_ARRAY, FieldType.BOOL_ARRAY, FieldType.DATE_ARRAY]
+        ]
+        random.shuffle(arr_fields)
+        for field in arr_fields:
+            name, ftype = field["name"], field["type"]
+            value = row.get(name)
+            if not isinstance(value, list):
+                continue
+            row_items = stable_unique_values(item for item in value if item is not None)
+            if not row_items:
+                continue
+
+            series = self.df[name]
+            arrays = [arr for arr in series.dropna().tolist() if isinstance(arr, list) and len(arr) > 0]
+            if not arrays:
+                continue
+            unique_items = stable_unique_values(item for arr in arrays for item in arr if item is not None)
+            if not unique_items:
+                continue
+            if ftype in (FieldType.INT_ARRAY, FieldType.DATE_ARRAY):
+                sample_size = min(len(row_items), random.choice([1, 1, 2]))
+                hit_targets = random.sample(row_items, sample_size)
+                contains_any_filter, _, contains_any_expr = self._build_array_contains_filter_clause(
+                    name, ftype, series, "contains_any", hit_targets
+                )
+                contains_none_filter, _, contains_none_expr = self._build_array_contains_filter_clause(
+                    name, ftype, series, "contains_none", hit_targets
+                )
+                if contains_any_filter is None or contains_none_filter is None:
+                    continue
+                return (
+                    contains_any_filter & Filter.not_(contains_none_filter),
+                    f"({contains_any_expr} AND NOT({contains_none_expr}))",
+                )
+
+            if ftype == FieldType.TEXT_ARRAY:
+                sample_size = min(len(row_items), random.choice([1, 1, 2]))
+                hit_targets = random.sample(row_items, sample_size)
+                contains_any_filter, _, contains_any_expr = self._build_array_contains_filter_clause(
+                    name, ftype, series, "contains_any", hit_targets
+                )
+                if contains_any_filter is None:
+                    continue
+                return contains_any_filter | Filter.by_property(name).is_none(True), f"({contains_any_expr} OR {name} is null)"
+
+            if ftype == FieldType.NUMBER_ARRAY:
+                contrast_pool = [item for item in unique_items if item not in row_items]
+                if not contrast_pool:
+                    continue
+                sample_size = min(len(row_items), random.choice([1, 1, 2]))
+                hit_targets = random.sample(row_items, sample_size)
+                contains_any_filter, _, contains_any_expr = self._build_array_contains_filter_clause(
+                    name, ftype, series, "contains_any", hit_targets
+                )
+                if contains_any_filter is None:
+                    continue
+                contrast_targets = random.sample(contrast_pool, min(len(contrast_pool), random.choice([1, 1, 2])))
+                contains_none_filter, _, contains_none_expr = self._build_array_contains_filter_clause(
+                    name, ftype, series, "contains_none", contrast_targets
+                )
+                if contains_none_filter is None:
+                    continue
+                return (
+                    contains_any_filter & contains_none_filter,
+                    f"({contains_any_expr} AND {contains_none_expr})",
+                )
+
+            if ftype == FieldType.BOOL_ARRAY and True in row_items and False in row_items:
+                contains_all_filter, _, contains_all_expr = self._build_array_contains_filter_clause(
+                    name, ftype, series, "contains_all", [True, False]
+                )
+                if contains_all_filter is None:
+                    continue
+                return (
+                    contains_all_filter | Filter.by_property(name).is_none(True),
+                    f"({contains_all_expr} OR {name} is null)",
+                )
         return None, None
 
     def get_value_for_query(self, fname, ftype):
@@ -4543,99 +5204,88 @@ class OracleQueryGenerator:
         ]
         if not arr_fields:
             return None, None, None
+        candidates = arr_fields[:]
+        random.shuffle(candidates)
+        for field in candidates:
+            fname, ftype = field["name"], field["type"]
+            series = self.df[fname]
+            arrays = [arr for arr in series.dropna().tolist() if isinstance(arr, list) and len(arr) > 0]
+            if not arrays:
+                continue
+            unique_items = stable_unique_values(item for arr in arrays for item in arr if item is not None)
+            if not unique_items:
+                continue
 
-        field = random.choice(arr_fields)
-        fname, ftype = field["name"], field["type"]
-        series = self.df[fname]
-        arrays = [arr for arr in series.dropna().tolist() if isinstance(arr, list) and len(arr) > 0]
-        if not arrays:
-            return None, None, None
+            if ftype in (FieldType.INT_ARRAY, FieldType.DATE_ARRAY):
+                candidate_arrays = [stable_unique_values(item for item in arr if item is not None) for arr in arrays]
+                candidate_arrays = [arr for arr in candidate_arrays if arr]
+                if not candidate_arrays:
+                    continue
+                picked = random.choice(candidate_arrays)
+                targets = random.sample(picked, min(len(picked), random.choice([1, 1, 2])))
+                contains_any_filter, contains_any_mask, contains_any_expr = self._build_array_contains_filter_clause(
+                    fname, ftype, series, "contains_any", targets
+                )
+                contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
+                    fname, ftype, series, "contains_none", targets
+                )
+                if contains_any_filter is None or contains_none_filter is None:
+                    continue
+                return (
+                    contains_any_filter & Filter.not_(contains_none_filter),
+                    self._normalize_mask(contains_any_mask) & self._apply_not_mask(contains_none_mask),
+                    f"({contains_any_expr} AND NOT({contains_none_expr}))",
+                )
 
-        unique_items = stable_unique_values([item for arr in arrays for item in arr])
-        if not unique_items:
-            return None, None, None
+            if ftype == FieldType.TEXT_ARRAY:
+                targets = random.sample(unique_items, min(len(unique_items), random.choice([1, 1, 2])))
+                contains_any_filter, contains_any_mask, contains_any_expr = self._build_array_contains_filter_clause(
+                    fname, ftype, series, "contains_any", targets
+                )
+                if contains_any_filter is None:
+                    continue
+                null_mask = self._effective_null_mask(series, ftype)
+                return (
+                    contains_any_filter | Filter.by_property(fname).is_none(True),
+                    self._normalize_mask(contains_any_mask) | self._normalize_mask(null_mask),
+                    f"({contains_any_expr} OR {fname} is null)",
+                )
 
-        strategies = ["contains_any_and_not_none_self", "contains_any_or_null"]
-        if len(unique_items) >= 2:
-            strategies.append("contains_any_and_none_other")
-        if any(len(stable_unique_values(arr)) >= 2 for arr in arrays):
-            strategies.append("contains_all_and_not_none_self")
+            if ftype == FieldType.NUMBER_ARRAY:
+                hit_targets = random.sample(unique_items, min(len(unique_items), random.choice([1, 1, 2])))
+                contrast_pool = [item for item in unique_items if item not in hit_targets]
+                if not contrast_pool:
+                    continue
+                contains_any_filter, contains_any_mask, contains_any_expr = self._build_array_contains_filter_clause(
+                    fname, ftype, series, "contains_any", hit_targets
+                )
+                if contains_any_filter is None:
+                    continue
+                contrast_targets = random.sample(contrast_pool, min(len(contrast_pool), random.choice([1, 1, 2])))
+                contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
+                    fname, ftype, series, "contains_none", contrast_targets
+                )
+                if contains_none_filter is None:
+                    continue
+                return (
+                    contains_any_filter & contains_none_filter,
+                    self._normalize_mask(contains_any_mask) & self._normalize_mask(contains_none_mask),
+                    f"({contains_any_expr} AND {contains_none_expr})",
+                )
 
-        strategy = random.choice(strategies)
-
-        if strategy == "contains_any_or_null":
-            sample_size = min(len(unique_items), random.choice([1, 1, 2]))
-            targets = random.sample(unique_items, sample_size)
-            contains_any_filter, contains_any_mask, contains_any_expr = self._build_array_contains_filter_clause(
-                fname, ftype, series, "contains_any", targets
-            )
-            if contains_any_filter is None:
-                return None, None, None
-            null_filter = Filter.by_property(fname).is_none(True)
-            null_mask = self._effective_null_mask(series, ftype)
-            return (
-                contains_any_filter | null_filter,
-                self._normalize_mask(contains_any_mask) | self._normalize_mask(null_mask),
-                f"({contains_any_expr} OR {fname} is null)",
-            )
-
-        if strategy == "contains_all_and_not_none_self":
-            candidate_arrays = [
-                arr for arr in arrays
-                if len(stable_unique_values(arr)) >= 2
-            ]
-            if not candidate_arrays:
-                return None, None, None
-            picked = stable_unique_values(random.choice(candidate_arrays))
-            targets = picked[: min(len(picked), random.choice([1, 2]))]
-            contains_all_filter, contains_all_mask, contains_all_expr = self._build_array_contains_filter_clause(
-                fname, ftype, series, "contains_all", targets
-            )
-            contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
-                fname, ftype, series, "contains_none", targets
-            )
-            if contains_all_filter is None or contains_none_filter is None:
-                return None, None, None
-            return (
-                contains_all_filter & Filter.not_(contains_none_filter),
-                self._normalize_mask(contains_all_mask) & self._apply_not_mask(contains_none_mask),
-                f"({contains_all_expr} AND NOT({contains_none_expr}))",
-            )
-
-        sample_size = min(len(unique_items), random.choice([1, 1, 2]))
-        hit_targets = random.sample(unique_items, sample_size)
-        contains_any_filter, contains_any_mask, contains_any_expr = self._build_array_contains_filter_clause(
-            fname, ftype, series, "contains_any", hit_targets
-        )
-        if contains_any_filter is None:
-            return None, None, None
-
-        if strategy == "contains_any_and_not_none_self":
-            contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
-                fname, ftype, series, "contains_none", hit_targets
-            )
-            if contains_none_filter is None:
-                return None, None, None
-            return (
-                contains_any_filter & Filter.not_(contains_none_filter),
-                self._normalize_mask(contains_any_mask) & self._apply_not_mask(contains_none_mask),
-                f"({contains_any_expr} AND NOT({contains_none_expr}))",
-            )
-
-        contrast_pool = [item for item in unique_items if item not in hit_targets]
-        if not contrast_pool:
-            return None, None, None
-        contrast_targets = random.sample(contrast_pool, min(len(contrast_pool), random.choice([1, 1, 2])))
-        contains_none_filter, contains_none_mask, contains_none_expr = self._build_array_contains_filter_clause(
-            fname, ftype, series, "contains_none", contrast_targets
-        )
-        if contains_none_filter is None:
-            return None, None, None
-        return (
-            contains_any_filter & contains_none_filter,
-            self._normalize_mask(contains_any_mask) & self._normalize_mask(contains_none_mask),
-            f"({contains_any_expr} AND {contains_none_expr})",
-        )
+            if ftype == FieldType.BOOL_ARRAY and True in unique_items and False in unique_items:
+                contains_all_filter, contains_all_mask, contains_all_expr = self._build_array_contains_filter_clause(
+                    fname, ftype, series, "contains_all", [True, False]
+                )
+                if contains_all_filter is None:
+                    continue
+                null_mask = self._effective_null_mask(series, ftype)
+                return (
+                    contains_all_filter | Filter.by_property(fname).is_none(True),
+                    self._normalize_mask(contains_all_mask) | self._normalize_mask(null_mask),
+                    f"({contains_all_expr} OR {fname} is null)",
+                )
+        return None, None, None
 
     def gen_geo_expr(self):
         if not self.geo_schema:
@@ -5634,39 +6284,39 @@ class OracleQueryGenerator:
     def _complex_expr_leaf(self):
         for _ in range(10):
             r = random.random()
-            if r < 0.08:
+            if r < 0.12:
                 res = self.gen_like_compound_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
-            elif r < 0.22:
+            elif r < 0.30:
                 res = self.gen_scalar_core_compound_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
-            elif r < 0.32:
+            elif r < 0.44:
                 res = self.gen_scalar_contains_compound_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
-            elif r < 0.36:
+            elif r < 0.52:
                 res = self.gen_array_contains_compound_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
-            elif r < 0.40:
+            elif r < 0.54:
                 res = self.gen_constant_expr()
                 if res[0]:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
-            elif r < 0.56:
+            elif r < 0.72:
                 res = self.gen_boundary_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
-            elif r < 0.60 and self.array_schema:
+            elif r < 0.76 and self.array_schema:
                 res = self.gen_multi_array_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
-            elif r < 0.74:
+            elif r < 0.88:
                 res = self.gen_not_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 1, "atoms": 1})
-            elif r < 0.78:
+            elif r < 0.90:
                 res = self.gen_nested_object_expr()
                 if res[0] is not None:
                     return (*self._finalize_expr(*res), {"depth": 0, "atoms": 1})
@@ -6692,34 +7342,50 @@ class PQSQueryGenerator(OracleQueryGenerator):
             if compound_filter is not None:
                 return compound_filter, compound_expr
 
+        if random.random() < 0.16:
+            compound_filter, compound_expr = self.gen_true_like_boundary(row)
+            if compound_filter is not None:
+                return compound_filter, compound_expr
+
+        if random.random() < 0.16:
+            compound_filter, compound_expr = self.gen_true_scalar_core_compound(row)
+            if compound_filter is not None:
+                return compound_filter, compound_expr
+
         if random.random() < 0.18:
             compound_filter, compound_expr = self.gen_true_scalar_contains_compound(row)
             if compound_filter is not None:
                 return compound_filter, compound_expr
 
-        pl_fields = self.property_length_schema[:]
-        random.shuffle(pl_fields)
-        for field in pl_fields:
-            fname, ftype = field["name"], field["type"]
-            value = row.get(fname)
-            if value is None:
-                length = 0
-            elif ftype == FieldType.TEXT:
-                length = len(str(value))
-            elif isinstance(value, list):
-                length = len(value)
-            else:
-                length = 0
-            base = Filter.by_property(fname, length=True)
-            strat = random.choice(["equal", "greater_or_equal", "less_or_equal", "not_equal_fake"])
-            if strat == "equal":
-                return base.equal(length), f"len({fname}) == {length}"
-            if strat == "greater_or_equal":
-                return base.greater_or_equal(length), f"len({fname}) >= {length}"
-            if strat == "less_or_equal":
-                return base.less_or_equal(length), f"len({fname}) <= {length}"
-            fake = length + random.choice([1, 2, 3])
-            return base.not_equal(fake), f"len({fname}) != {fake}"
+        if random.random() < 0.16:
+            compound_filter, compound_expr = self.gen_true_array_contains_compound(row)
+            if compound_filter is not None:
+                return compound_filter, compound_expr
+
+        if self.property_length_schema and random.random() < 0.22:
+            pl_fields = self.property_length_schema[:]
+            random.shuffle(pl_fields)
+            for field in pl_fields:
+                fname, ftype = field["name"], field["type"]
+                value = row.get(fname)
+                if value is None:
+                    length = 0
+                elif ftype == FieldType.TEXT:
+                    length = len(str(value))
+                elif isinstance(value, list):
+                    length = len(value)
+                else:
+                    length = 0
+                base = Filter.by_property(fname, length=True)
+                strat = random.choice(["equal", "greater_or_equal", "less_or_equal", "not_equal_fake"])
+                if strat == "equal":
+                    return base.equal(length), f"len({fname}) == {length}"
+                if strat == "greater_or_equal":
+                    return base.greater_or_equal(length), f"len({fname}) >= {length}"
+                if strat == "less_or_equal":
+                    return base.less_or_equal(length), f"len({fname}) <= {length}"
+                fake = length + random.choice([1, 2, 3])
+                return base.not_equal(fake), f"len({fname}) != {fake}"
 
         text_fields = self.like_text_schema[:]
         random.shuffle(text_fields)
@@ -7100,8 +7766,83 @@ def graphql_get_tags(result, collection_name):
     return [str(row.get("tag")) for row in rows]
 
 
+def graphql_get_ids(result, collection_name):
+    rows = getattr(result, "get", {}).get(collection_name, []) or []
+    ids = []
+    for row in rows:
+        additional = dict(row.get("_additional") or {})
+        row_id = additional.get("id")
+        if row_id is not None:
+            ids.append(str(row_id))
+    return ids
+
+
 def graphql_aggregate_groups(result, collection_name):
     return getattr(result, "aggregate", {}).get(collection_name, []) or []
+
+
+GRAPHQL_SAFE_REST_FILTER_OPERATORS = {
+    "Equal",
+    "NotEqual",
+    "GreaterThan",
+    "GreaterThanEqual",
+    "LessThan",
+    "LessThanEqual",
+    "Like",
+    "IsNull",
+}
+GRAPHQL_SAFE_REST_VALUE_KEYS = {
+    "valueInt",
+    "valueNumber",
+    "valueBoolean",
+    "valueText",
+    "valueDate",
+    "valueString",
+}
+
+
+def graphql_where_from_rest_where(where_filter):
+    return graphql_with_enum_operators(where_filter)
+
+
+def graphql_rest_where_is_supported(where_filter):
+    if not isinstance(where_filter, dict):
+        return False
+
+    operator = str(where_filter.get("operator") or "")
+    if operator in {"And", "Or"}:
+        operands = where_filter.get("operands") or []
+        return len(operands) >= 2 and all(graphql_rest_where_is_supported(operand) for operand in operands)
+    if operator == "Not":
+        operands = where_filter.get("operands") or []
+        return len(operands) == 1 and graphql_rest_where_is_supported(operands[0])
+    if operator not in GRAPHQL_SAFE_REST_FILTER_OPERATORS:
+        return False
+
+    path = where_filter.get("path") or []
+    if not isinstance(path, list) or len(path) != 1:
+        return False
+    field_name = str(path[0] or "")
+    if not field_name or field_name == "id" or field_name.startswith("len("):
+        return False
+
+    value_keys = [key for key in where_filter.keys() if key.startswith("value")]
+    if operator == "IsNull":
+        return value_keys == ["valueBoolean"]
+    if len(value_keys) != 1:
+        return False
+    return value_keys[0] in GRAPHQL_SAFE_REST_VALUE_KEYS
+
+
+def graphql_fetch_ids_by_where(client, collection_name, where_filter, *, limit):
+    graphql_where = graphql_where_from_rest_where(where_filter)
+    query = (
+        "{ Get { "
+        f"{collection_name}(where:{graphql_input_literal(graphql_where)}, limit:{int(limit)}) "
+        "{ _additional { id } } } }"
+    )
+    result = graphql_raw_query_or_raise(client, query)
+    return set(graphql_get_ids(result, collection_name)), query
 
 
 def graphql_probe_expected_tags(seed, predicate):
@@ -7164,6 +7905,13 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
         f"Depth={REST_FILTER_MIN_DEPTH}..{REST_FILTER_MAX_DEPTH}, "
         f"RestCompareCap={REST_FILTER_MAX_COMPARE_RESULTS}"
     )
+    if robustness_enabled_for_mode("oracle"):
+        print(
+            f"   Robustness: rate={ROBUSTNESS_RATE:.2f}, start={ROBUSTNESS_START_FRACTION:.2f}, "
+            f"frontdoors={','.join(ROBUSTNESS_FRONTDOORS)}, category={ROBUSTNESS_ERROR_CATEGORY_MODE}"
+        )
+    oracle_depth_min, oracle_depth_max = get_oracle_filter_depth_range()
+    print(f"   OracleDepth: {oracle_depth_min}..{oracle_depth_max}")
 
     dm = DataManager(current_seed)
     dm.generate_schema()
@@ -7188,6 +7936,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                 "oracle",
                 f"dynamic-{'on' if enable_dynamic_ops else 'off'}",
                 f"consistency-{consistency_label(resolved_consistency, randomize=randomize_consistency)}",
+                robustness_short_label("oracle"),
             )
         )
         repro_cmd = format_repro_command(
@@ -7216,6 +7965,12 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
         dynamic_ids = set()
         rest_crosschecks = 0
         rest_crosscheck_skips = 0
+        graphql_crosschecks = 0
+        graphql_crosscheck_skips = 0
+        robustness_checks = 0
+        robustness_skips = 0
+        robustness_warns = 0
+        robustness_fails = 0
 
         with open(logf, "w", encoding="utf-8") as f:
             def flog(msg):
@@ -7254,6 +8009,11 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                 f"Consistency: {consistency_label(resolved_consistency, randomize=randomize_consistency)} | "
                 f"VecIdx: {active_vector_index_type} | Dist: {active_distance_metric}"
             )
+            if robustness_enabled_for_mode("oracle"):
+                flog(
+                    f"Robustness: rate={ROBUSTNESS_RATE:.4f} start_fraction={ROBUSTNESS_START_FRACTION:.4f} "
+                    f"frontdoors={','.join(ROBUSTNESS_FRONTDOORS)} category={ROBUSTNESS_ERROR_CATEGORY_MODE}"
+                )
             flog("=" * 50)
 
             for i in range(rounds):
@@ -7443,7 +8203,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                     except Exception as e:
                         flog(f"[Reconfig] Failed: {e}")
 
-                depth_lo, depth_hi = (6, 14) if is_inverted_profile() else (2, 10)
+                depth_lo, depth_hi = get_oracle_filter_depth_range()
                 depth = random.randint(depth_lo, depth_hi)
                 fo = None
                 rest_where = None
@@ -7569,6 +8329,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                     if rest_where is not None:
                         if len(exp) > REST_FILTER_MAX_COMPARE_RESULTS:
                             rest_crosscheck_skips += 1
+                            graphql_crosscheck_skips += 1
                             flog(
                                 f"  REST: SKIP expected rows {len(exp)} exceed RestCompareCap={REST_FILTER_MAX_COMPARE_RESULTS}"
                             )
@@ -7603,10 +8364,83 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
                                 else:
                                     raise
 
+                            graphql_limit = len(dm.df) + 1
+                            if not graphql_rest_where_is_supported(rest_where):
+                                graphql_crosscheck_skips += 1
+                                flog("  GraphQL: SKIP unsupported where subset")
+                            elif graphql_limit > get_query_maximum_results():
+                                graphql_crosscheck_skips += 1
+                                flog(
+                                    f"  GraphQL: SKIP collection size {len(dm.df)} exceeds QUERY_MAXIMUM_RESULTS={get_query_maximum_results()}"
+                                )
+                            else:
+                                graphql_crosschecks += 1
+                                try:
+                                    graphql_t0 = time.time()
+                                    graphql_act, graphql_query = graphql_fetch_ids_by_where(
+                                        wm.client,
+                                        CLASS_NAME,
+                                        rest_where,
+                                        limit=graphql_limit,
+                                    )
+                                    graphql_ms = (time.time() - graphql_t0) * 1000.0
+                                    flog(f"  GraphQL: Pandas:{len(exp)} | GraphQL:{len(graphql_act)} | {graphql_ms:.1f}ms")
+                                    if graphql_act != exp:
+                                        graphql_missing, graphql_extra = exp - graphql_act, graphql_act - exp
+                                        graphql_detail = f"GraphQL Missing:{len(graphql_missing)} Extra:{len(graphql_extra)}"
+                                        print(f"\n❌ [T{i}] GRAPHQL MISMATCH! {graphql_detail}")
+                                        print(f"   Expr: {es}")
+                                        print(f"   🔑 {repro_cmd}")
+                                        flog(f"  GraphQL: FAIL {graphql_detail}")
+                                        flog(f"  GraphQLQuery: {graphql_query}")
+                                        if graphql_missing:
+                                            flog(f"  GraphQL Missing: {sample(graphql_missing)}")
+                                        if graphql_extra:
+                                            flog(f"  GraphQL Extra: {sample(graphql_extra)}")
+                                        fails.append({"id": i, "expr": es, "detail": graphql_detail, "seed": current_seed})
+                                        round_failed = True
+                                    else:
+                                        flog("  GraphQL: MATCH")
+                                except Exception as graphql_exc:
+                                    graphql_err = str(graphql_exc)
+                                    if is_query_maximum_results_error(graphql_err):
+                                        graphql_crosscheck_skips += 1
+                                        update_query_limits_from_error(graphql_err)
+                                        flog(
+                                            f"  GraphQL: SKIP query maximum results ({get_query_maximum_results()}): {graphql_err}"
+                                        )
+                                    else:
+                                        raise
+
                     if round_failed:
                         stats.record(False, ms, expr_depth, "mismatch")
                     else:
                         stats.record(True, ms, expr_depth)
+
+                    robustness_result = maybe_run_scalar_type_mismatch_probe(
+                        mode="oracle",
+                        round_index=i,
+                        rounds=rounds,
+                        dm=dm,
+                        collection=col,
+                        client=wm.client,
+                        collection_name=CLASS_NAME,
+                        flog=flog,
+                    )
+                    if robustness_result.get("ran"):
+                        robustness_checks += 1
+                        if robustness_result.get("warn"):
+                            robustness_warns += 1
+                        if robustness_result.get("failed"):
+                            robustness_fails += 1
+                            fails.append({
+                                "id": i,
+                                "expr": robustness_result.get("expr"),
+                                "detail": robustness_result.get("detail"),
+                                "seed": current_seed,
+                            })
+                    elif robustness_result.get("skipped"):
+                        robustness_skips += 1
 
                     if exp and random.random() < VECTOR_CHECK_RATIO:
                         try:
@@ -7724,6 +8558,12 @@ def run(rounds=100, seed=None, enable_dynamic_ops=True, consistency=DEFAULT_CONS
         print("\n" + "="*60)
         print(f"📊 Stats: {stats.summary()}")
         print(f"🔁 OracleREST: checks={rest_crosschecks} skips={rest_crosscheck_skips}")
+        print(f"🔁 OracleGraphQL: checks={graphql_crosschecks} skips={graphql_crosscheck_skips}")
+        if robustness_enabled_for_mode("oracle"):
+            print(
+                f"🧪 Robustness: checks={robustness_checks} skips={robustness_skips} "
+                f"warn={robustness_warns} fail={robustness_fails}"
+            )
         wb = getattr(stats, 'weaviate_bugs', 0)
         if wb:
             print(f"⚠️  {wb} Weaviate inverted-index bugs detected (dynamic rows, downgraded to warnings)")
@@ -8220,6 +9060,8 @@ def run_pqs_mode(rounds=100, seed=None):
         f"   QueryPageSize: {get_query_page_size()} (CapHint={get_query_maximum_results()}, "
         f"Partition={get_filter_partition_size()}, IdBatch={get_filter_id_batch_size()})"
     )
+    pqs_depth_min, pqs_depth_max = get_pqs_filter_depth_range()
+    print(f"   PQSDepth: {pqs_depth_min}..{pqs_depth_max} | MultiFieldRate: {PQS_MULTI_FIELD_RATE:.2f}")
     print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(seed); dm.generate_schema(); dm.generate_data()
@@ -8238,10 +9080,9 @@ def run_pqs_mode(rounds=100, seed=None):
                 pi = random.randint(0, len(dm.df) - 1)
                 pr = dm.df.iloc[pi].to_dict()
                 pid = pr["id"]
-                d = random.randint(3, 13)
+                d = random.randint(pqs_depth_min, pqs_depth_max)
                 try:
-                    # 30% chance: use multi-field joint expression for higher coverage
-                    if random.random() < 0.3:
+                    if random.random() < PQS_MULTI_FIELD_RATE:
                         mf, me = pqs.gen_multi_field_true_filter(pr, n=random.randint(2, 4))
                         if mf:
                             pf, pe = mf, f"MultiField({me})"
@@ -8537,6 +9378,7 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
             rounds,
             "rest-filter",
             f"consistency-{consistency_label(resolved_consistency, randomize=randomize_consistency)}",
+            robustness_short_label("rest-filter"),
         )
     )
     print(
@@ -8548,6 +9390,11 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
         f"RestCompareCap={REST_FILTER_MAX_COMPARE_RESULTS})"
     )
     print(f"   RestFilterDepth: {REST_FILTER_MIN_DEPTH}..{REST_FILTER_MAX_DEPTH}")
+    if robustness_enabled_for_mode("rest-filter"):
+        print(
+            f"   Robustness: rate={ROBUSTNESS_RATE:.2f}, start={ROBUSTNESS_START_FRACTION:.2f}, "
+            f"frontdoors={','.join(ROBUSTNESS_FRONTDOORS)}, category={ROBUSTNESS_ERROR_CATEGORY_MODE}"
+        )
     print(f"📄 Log: {display_path(logf)}")
 
     dm = DataManager(current_seed)
@@ -8568,6 +9415,12 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
         qg = OracleQueryGenerator(dm)
         failures = []
         stats = FuzzStats()
+        graphql_crosschecks = 0
+        graphql_crosscheck_skips = 0
+        robustness_checks = 0
+        robustness_skips = 0
+        robustness_warns = 0
+        robustness_fails = 0
 
         with open(logf, "w", encoding="utf-8") as f:
             def flog(msg):
@@ -8577,6 +9430,11 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
             flog(
                 f"REST Filter | Seed:{current_seed} | Profile:{get_fuzz_profile()} | Consistency:{consistency_label(resolved_consistency, randomize=randomize_consistency)}"
             )
+            if robustness_enabled_for_mode("rest-filter"):
+                flog(
+                    f"Robustness: rate={ROBUSTNESS_RATE:.4f} start_fraction={ROBUSTNESS_START_FRACTION:.4f} "
+                    f"frontdoors={','.join(ROBUSTNESS_FRONTDOORS)} category={ROBUSTNESS_ERROR_CATEGORY_MODE}"
+                )
 
             for i in range(rounds):
                 print(f"\r⏳ REST {i+1}/{rounds}", end="", flush=True)
@@ -8632,13 +9490,60 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
 
                     grpc_match = grpc_exhausted and grpc_ids == expected_set
                     rest_match = rest_ids == expected_set
+                    graphql_match = None
+                    graphql_ids = set()
+                    graphql_ms = 0.0
+                    graphql_status = "SKIP"
+
+                    graphql_limit = len(dm.df) + 1
+                    if not graphql_rest_where_is_supported(where_filter):
+                        graphql_crosscheck_skips += 1
+                        graphql_status = "UNSUPPORTED"
+                    elif graphql_limit > get_query_maximum_results():
+                        graphql_crosscheck_skips += 1
+                        graphql_status = f"OVER_LIMIT({get_query_maximum_results()})"
+                    else:
+                        graphql_crosschecks += 1
+                        try:
+                            graphql_t0 = time.time()
+                            graphql_ids, graphql_query = graphql_fetch_ids_by_where(
+                                wm.client,
+                                CLASS_NAME,
+                                where_filter,
+                                limit=graphql_limit,
+                            )
+                            graphql_ms = (time.time() - graphql_t0) * 1000.0
+                            latency_ms += graphql_ms
+                            graphql_match = graphql_ids == expected_set
+                            graphql_status = f"{len(graphql_ids)}"
+                        except Exception as graphql_exc:
+                            graphql_err = str(graphql_exc)
+                            if is_query_maximum_results_error(graphql_err):
+                                graphql_crosscheck_skips += 1
+                                update_query_limits_from_error(graphql_err)
+                                graphql_status = f"QMAX({get_query_maximum_results()})"
+                                flog(f"  GraphQL: SKIP query maximum results: {graphql_err}")
+                            else:
+                                raise
 
                     flog(
                         f"  Pandas:{len(expected_set)} | gRPC:{capped_result_count(len(grpc_ids), grpc_exhausted)} "
-                        f"| REST:{len(rest_ids)} | {latency_ms:.1f}ms"
+                        f"| REST:{len(rest_ids)} | GraphQL:{graphql_status} | {latency_ms:.1f}ms"
                     )
 
-                    if grpc_match and rest_match:
+                    if graphql_match is False:
+                        graphql_missing = sorted(expected_set - graphql_ids)
+                        graphql_extra = sorted(graphql_ids - expected_set)
+                        detail = f"graphql_only_mismatch: GraphQL(M:{len(graphql_missing)} E:{len(graphql_extra)})"
+                        failures.append({"id": i, "expr": expr, "detail": detail})
+                        stats.record(False, latency_ms=latency_ms, depth=expr_depth, error_cat="graphql_only_mismatch")
+                        flog(f"  FAIL: {detail}")
+                        flog(f"  GraphQLQuery: {graphql_query}")
+                        if graphql_missing:
+                            flog(f"  GraphQL MissingSample: {graphql_missing[:5]}")
+                        if graphql_extra:
+                            flog(f"  GraphQL ExtraSample: {graphql_extra[:5]}")
+                    elif grpc_match and rest_match:
                         stats.record(True, latency_ms=latency_ms, depth=expr_depth)
                         flog("  PASS")
                     else:
@@ -8670,6 +9575,30 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
                             flog(f"  REST MissingSample: {rest_missing[:5]}")
                         if rest_extra:
                             flog(f"  REST ExtraSample: {rest_extra[:5]}")
+
+                    robustness_result = maybe_run_scalar_type_mismatch_probe(
+                        mode="rest-filter",
+                        round_index=i,
+                        rounds=rounds,
+                        dm=dm,
+                        collection=col,
+                        client=wm.client,
+                        collection_name=CLASS_NAME,
+                        flog=flog,
+                    )
+                    if robustness_result.get("ran"):
+                        robustness_checks += 1
+                        if robustness_result.get("warn"):
+                            robustness_warns += 1
+                        if robustness_result.get("failed"):
+                            robustness_fails += 1
+                            failures.append({
+                                "id": i,
+                                "expr": robustness_result.get("expr"),
+                                "detail": robustness_result.get("detail"),
+                            })
+                    elif robustness_result.get("skipped"):
+                        robustness_skips += 1
                 except Exception as exc:
                     err = str(exc)
                     if is_query_maximum_results_error(err):
@@ -8683,6 +9612,12 @@ def run_rest_filter_mode(rounds=100, seed=None, consistency=DEFAULT_CONSISTENCY_
 
         print()
         print(f"📊 REST Filter: {stats.summary()}")
+        print(f"🔁 RestGraphQL: checks={graphql_crosschecks} skips={graphql_crosscheck_skips}")
+        if robustness_enabled_for_mode("rest-filter"):
+            print(
+                f"🧪 Robustness: checks={robustness_checks} skips={robustness_skips} "
+                f"warn={robustness_warns} fail={robustness_fails}"
+            )
         print(f"{'✅ All passed' if not failures else f'🚫 {len(failures)} failures'}. Log: {display_path(logf)}")
     finally:
         wm.close()
@@ -8715,17 +9650,39 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=None, help="Weaviate port")
     parser.add_argument("--grpc-port", type=int, default=None, help="Weaviate gRPC port")
     parser.add_argument("-N", type=int, default=None, help="Data rows")
-    parser.add_argument("--query-page-size", type=int, default=None, help="Cursor fetch page size for large-result queries")
-    parser.add_argument("--aggregate-filter-min-depth", type=int, default=None, help="Minimum recursive depth for aggregate-mode filters")
-    parser.add_argument("--aggregate-filter-max-depth", type=int, default=None, help="Maximum recursive depth for aggregate-mode filters")
-    parser.add_argument("--rest-filter-min-depth", type=int, default=None, help="Minimum recursive depth for REST filter-mode filters")
-    parser.add_argument("--rest-filter-max-depth", type=int, default=None, help="Maximum recursive depth for REST filter-mode filters")
-    parser.add_argument("--rest-filter-max-compare-results", type=int, default=None, help="Skip REST dry-run comparisons above this matched-row count")
-    parser.add_argument("--oracle-rest-crosscheck-rate", type=float, default=None, help="Probability of using a REST-crosschecked stable filter inside oracle mode")
-    parser.add_argument("--log-dir", type=str, default=None, help="Directory for deterministic fuzzer-internal logs")
-    parser.add_argument("--log-suffix", type=str, default=None, help="Stable suffix appended to fuzzer-internal log filenames")
+    parser.add_argument(
+        "--scalar-depth-profile",
+        choices=ALL_SCALAR_DEPTH_PROFILES,
+        default=os.getenv("WEAVIATE_FUZZ_SCALAR_DEPTH_PROFILE"),
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--query-page-size", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--aggregate-filter-min-depth", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--aggregate-filter-max-depth", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rest-filter-min-depth", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rest-filter-max-depth", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--rest-filter-max-compare-results", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--oracle-rest-crosscheck-rate", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--robustness-rate", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--robustness-start-fraction", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--robustness-frontdoors", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--robustness-category-mode",
+        choices=sorted(ROBUSTNESS_ERROR_CATEGORY_MODES),
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument("--log-dir", type=str, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--log-suffix", type=str, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
     set_fuzz_profile(args.profile)
+    set_scalar_depth_profile(args.scalar_depth_profile or os.getenv("WEAVIATE_FUZZ_SCALAR_DEPTH_PROFILE", SCALAR_DEPTH_PROFILE_DEFAULT))
+    set_robustness_config(
+        rate=args.robustness_rate,
+        start_fraction=args.robustness_start_fraction,
+        frontdoors=args.robustness_frontdoors,
+        category_mode=args.robustness_category_mode,
+    )
     set_log_dir(args.log_dir)
     set_log_suffix(args.log_suffix)
 
@@ -8753,8 +9710,14 @@ if __name__ == "__main__":
     print(
         f" Weaviate Fuzz Oracle V2 | Mode: {args.mode} | Rounds: {args.rounds} | "
         f"Seed: {args.seed or '(random)'} | Profile: {get_fuzz_profile()} | Dynamic: {'OFF' if args.no_dynamic else 'ON'} | "
+        f"ScalarDepth: {get_scalar_depth_profile()} | "
         f"Consistency: {consistency_label(resolved_consistency, randomize=args.random_consistency)}"
     )
+    if robustness_enabled_for_mode(args.mode):
+        print(
+            f" Robustness | rate={ROBUSTNESS_RATE:.2f} | start={ROBUSTNESS_START_FRACTION:.2f} | "
+            f"frontdoors={','.join(ROBUSTNESS_FRONTDOORS)} | category={ROBUSTNESS_ERROR_CATEGORY_MODE}"
+        )
     print("=" * 80)
 
     if args.mode == "equiv":

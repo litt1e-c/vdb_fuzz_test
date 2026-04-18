@@ -19,6 +19,7 @@ verify_status: edge_validated
 observed_summary: On local Weaviate v1.36.10 with the installed Python client, `like_boundary_operator.py` validated a deterministic FIELD-tokenized Like boundary subset. `like("*")` and `like("**")` matched all present rows, including the explicit empty-string row. `like("???")` matched exactly the 3-character row. `like("%")` and `like("_")` matched only literal `%` and `_` rows, confirming that the local engine did not treat them as SQL wildcards. Observation-only checks showed `like("")` matched the explicit empty-string row and a very long all-`*` pattern behaved like a universal wildcard.
 oracle_support:
 - pandas
+- pqs
 case_refs:
 - like_star_matches_all_present
 - like_double_star_matches_all_present
@@ -26,4 +27,4 @@ case_refs:
 - like_percent_is_literal
 - like_underscore_is_literal
 repro_path: operator_test/weaviate/like_boundary_operator.py
-oracle_mapping: The pandas oracle translates the validated `Like` subset into deterministic regex-style masks where only `*` and `?` are treated as wildcards, while `%` and `_` remain literal characters. REST filter mode reuses the same mask semantics, and empty-pattern / very-long-pattern behavior remains outside the randomized mainline.
+oracle_mapping: The pandas oracle translates the validated `Like` subset into deterministic regex-style masks where only `*` and `?` are treated as wildcards, while `%` and `_` remain literal characters. PQS only emits pivot-true instances from this checked subset (`*`, `**`, `???` on length-3 strings, and literal `%` / `_` rows), and empty-pattern / very-long-pattern behavior remains outside the randomized mainline.

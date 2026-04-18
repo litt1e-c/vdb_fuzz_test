@@ -18,6 +18,10 @@ RANDOM_SUITE="${RANDOM_SUITE:-comprehensive}"
 RANDOM_SCHEDULE="${RANDOM_SCHEDULE:-random}"
 RANDOM_SUITE_SEED="${RANDOM_SUITE_SEED:-20260416}"
 TIMELINE_INTERVAL_CASES="${TIMELINE_INTERVAL_CASES:-4}"
+RANDOM_ROBUSTNESS_RATE="${RANDOM_ROBUSTNESS_RATE:-0.02}"
+RANDOM_ROBUSTNESS_START_FRACTION="${RANDOM_ROBUSTNESS_START_FRACTION:-0.80}"
+RANDOM_ROBUSTNESS_FRONTDOORS="${RANDOM_ROBUSTNESS_FRONTDOORS:-python,rest,graphql}"
+RANDOM_ROBUSTNESS_CATEGORY_MODE="${RANDOM_ROBUSTNESS_CATEGORY_MODE:-warn}"
 HOST="${WEAVIATE_HOST:-127.0.0.1}"
 HTTP_PORT="${WEAVIATE_PORT:-18080}"
 GRPC_PORT="${WEAVIATE_GRPC_PORT:-15051}"
@@ -87,6 +91,10 @@ cat > "$METADATA_JSON" <<EOF
   "random_schedule": "${RANDOM_SCHEDULE}",
   "random_suite_seed": ${RANDOM_SUITE_SEED},
   "timeline_interval_cases": ${TIMELINE_INTERVAL_CASES},
+  "random_robustness_rate": ${RANDOM_ROBUSTNESS_RATE},
+  "random_robustness_start_fraction": ${RANDOM_ROBUSTNESS_START_FRACTION},
+  "random_robustness_frontdoors": "${RANDOM_ROBUSTNESS_FRONTDOORS}",
+  "random_robustness_category_mode": "${RANDOM_ROBUSTNESS_CATEGORY_MODE}",
   "host": "${HOST}",
   "port": ${HTTP_PORT},
   "grpc_port": ${GRPC_PORT}
@@ -176,6 +184,10 @@ if (( RANDOM_BUDGET_SECONDS > 0 )); then
     --budget-schedule "$RANDOM_SCHEDULE" \
     --coverage-timeline \
     --coverage-timeline-interval-cases "$TIMELINE_INTERVAL_CASES" \
+    --robustness-rate "$RANDOM_ROBUSTNESS_RATE" \
+    --robustness-start-fraction "$RANDOM_ROBUSTNESS_START_FRACTION" \
+    --robustness-frontdoors "$RANDOM_ROBUSTNESS_FRONTDOORS" \
+    --robustness-category-mode "$RANDOM_ROBUSTNESS_CATEGORY_MODE" \
     --launcher "$LAUNCHER" \
     --python-bin "$PYTHON_BIN" \
     --go-bin "$GO_BIN" \
