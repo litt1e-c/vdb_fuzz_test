@@ -101,6 +101,7 @@ def run_one(
     port: str,
     run_id: str,
     case_logs_dir: Path,
+    expected_error_category_mode: str,
 ) -> dict[str, object]:
     started = time.time()
     case_slug = slugify(name)
@@ -113,6 +114,7 @@ def run_one(
     env = os.environ.copy()
     env["MILVUS_HOST"] = host
     env["MILVUS_PORT"] = str(port)
+    env["MILVUS_EXPECTED_ERROR_CATEGORY_MODE"] = expected_error_category_mode
 
     with log_path.open("w", encoding="utf-8") as fout:
         proc = subprocess.run(command, stdout=fout, stderr=subprocess.STDOUT, env=env)
@@ -147,6 +149,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-id", default=f"scalar-focus-{int(time.time())}")
     parser.add_argument("--python-bin", default=sys.executable)
     parser.add_argument("--log-dir", default=str(DEFAULT_LOG_DIR))
+    parser.add_argument(
+        "--expected-error-category-mode",
+        choices=["ignore", "warn", "strict"],
+        default=os.getenv("MILVUS_EXPECTED_ERROR_CATEGORY_MODE", "warn"),
+        help="How to handle expected_error category mismatches inside operator validators",
+    )
     parser.add_argument("--stop-on-failure", action="store_true")
     args = parser.parse_args(argv)
 
@@ -165,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Target: {args.host}:{args.port}")
     print(f"Run id: {args.run_id}")
     print(f"Operators: {', '.join(selected)}")
+    print(f"Expected-error category mode: {args.expected_error_category_mode}")
 
     results: list[dict[str, object]] = []
     for name in selected:
@@ -193,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
             port=str(args.port),
             run_id=args.run_id,
             case_logs_dir=case_logs_dir,
+            expected_error_category_mode=args.expected_error_category_mode,
         )
         results.append(result)
         print(
@@ -207,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         "host": args.host,
         "port": str(args.port),
         "operators": selected,
+        "expected_error_category_mode": args.expected_error_category_mode,
         "results": results,
         "passed": all(bool(item.get("passed")) for item in results),
         "result_count": len(results),
@@ -225,6 +236,7 @@ def main(argv: list[str] | None = None) -> int:
         "",
         f"- Run ID: `{args.run_id}`",
         f"- Target: `{args.host}:{args.port}`",
+        f"- Expected-error category mode: `{args.expected_error_category_mode}`",
         f"- Passed: `{summary['passed']}`",
         f"- Total operators: `{summary['result_count']}`",
         f"- Failed operators: `{summary['failed_count']}`",

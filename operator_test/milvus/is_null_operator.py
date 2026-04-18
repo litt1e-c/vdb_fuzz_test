@@ -9,6 +9,8 @@ from pymilvus import (
     utility,
 )
 
+from operator_case_validator import run_operator_cases
+
 
 HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
 PORT = os.getenv("MILVUS_PORT", "19531")
@@ -30,7 +32,7 @@ def main():
         connections.connect("default", host=HOST, port=PORT)
     except Exception as exc:
         print(f"connection_failed: {exc}")
-        return
+        return 2
 
     try:
         if utility.has_collection(COLLECTION_NAME):
@@ -139,42 +141,24 @@ def main():
                 "array_subscript_is_null_unsupported",
                 "tags[0] is null",
                 None,
+                "unsupported",
             ),
             (
                 "expected_error",
                 "array_subscript_is_not_null_unsupported",
                 "tags[0] is not null",
                 None,
+                "unsupported",
             ),
         ]
 
-        print("--- IS NULL operator validation ---")
-        for mode, name, expr, expected_ids in tests:
-            try:
-                actual_ids = query_ids(col, expr)
-                if mode == "expected_error":
-                    print(
-                        f"{name}: FAIL | expr={expr} | "
-                        f"expected_error=unsupported | actual={actual_ids}"
-                    )
-                else:
-                    status = "PASS" if actual_ids == expected_ids else "FAIL"
-                    print(
-                        f"{name}: {status} | expr={expr} | "
-                        f"expected={expected_ids} | actual={actual_ids}"
-                    )
-            except Exception as exc:
-                if mode == "expected_error":
-                    print(
-                        f"{name}: PASS | expr={expr} | "
-                        f"expected_error=unsupported | "
-                        f"actual={type(exc).__name__}: {exc}"
-                    )
-                else:
-                    print(
-                        f"{name}: ERROR | expr={expr} | "
-                        f"error={type(exc).__name__}: {exc}"
-                    )
+        failed = run_operator_cases(
+            collection=col,
+            tests=tests,
+            query_fn=query_ids,
+            title="IS NULL operator validation",
+        )
+        return 0 if failed == 0 else 1
 
     finally:
         if utility.has_collection(COLLECTION_NAME):
@@ -183,4 +167,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

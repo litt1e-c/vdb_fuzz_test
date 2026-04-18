@@ -1,3 +1,4 @@
+import os
 import time
 from pymilvus import (
     Collection,
@@ -8,9 +9,11 @@ from pymilvus import (
     utility,
 )
 
+from operator_case_validator import run_operator_cases
 
-HOST = "127.0.0.1"
-PORT = "19531"
+
+HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+PORT = os.getenv("MILVUS_PORT", "19531")
 COLLECTION_NAME = "and_operator_validation"
 
 
@@ -29,7 +32,7 @@ def main():
         connections.connect("default", host=HOST, port=PORT)
     except Exception as exc:
         print(f"connection_failed: {exc}")
-        return
+        return 2
 
     try:
         if utility.has_collection(COLLECTION_NAME):
@@ -143,36 +146,17 @@ def main():
                 "constant_json_and_unsupported",
                 '(null is null) and (meta["value"] > 50)',
                 None,
+                "parse_rejection",
             ),
         ]
 
-        print("--- AND operator validation ---")
-        for mode, name, expr, expected_ids in tests:
-            try:
-                actual_ids = query_ids(col, expr)
-                if mode == "expected_error":
-                    print(
-                        f"{name}: FAIL | expr={expr} | "
-                        f"expected_error=parse_rejection | actual={actual_ids}"
-                    )
-                else:
-                    status = "PASS" if actual_ids == expected_ids else "FAIL"
-                    print(
-                        f"{name}: {status} | expr={expr} | "
-                        f"expected={expected_ids} | actual={actual_ids}"
-                    )
-            except Exception as exc:
-                if mode == "expected_error":
-                    print(
-                        f"{name}: PASS | expr={expr} | "
-                        f"expected_error=parse_rejection | "
-                        f"actual={type(exc).__name__}: {exc}"
-                    )
-                else:
-                    print(
-                        f"{name}: ERROR | expr={expr} | "
-                        f"error={type(exc).__name__}: {exc}"
-                    )
+        failed = run_operator_cases(
+            collection=col,
+            tests=tests,
+            query_fn=query_ids,
+            title="AND operator validation",
+        )
+        return 0 if failed == 0 else 1
 
     finally:
         if utility.has_collection(COLLECTION_NAME):
@@ -181,4 +165,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

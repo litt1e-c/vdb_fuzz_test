@@ -10,6 +10,8 @@ from pymilvus import (
     utility,
 )
 
+from operator_case_validator import run_operator_cases
+
 
 HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
 PORT = os.getenv("MILVUS_PORT", "19532")
@@ -71,7 +73,7 @@ def main():
         connections.connect("default", host=HOST, port=PORT)
     except Exception as exc:
         print(f"connection_failed: {exc}")
-        return
+        return 2
 
     try:
         if utility.has_collection(COLLECTION_NAME):
@@ -109,7 +111,6 @@ def main():
         col.load(timeout=10)
         time.sleep(1)
 
-        print("--- ARRAY subscript access validation ---")
         tests = [
             ("normal", "int_index_gt", "arr_int[0] > 3", [1]),
             ("normal", "int_second_index_eq", "arr_int[1] == 4", [3]),
@@ -117,49 +118,23 @@ def main():
             ("normal", "str_index_eq", 'arr_str[0] == "user"', [2]),
             ("normal", "str_second_index_eq", 'arr_str[1] == "ops"', [3]),
             ("normal", "bool_index_eq_true", "arr_bool[0] == true", [1, 3]),
-            ("expected_error", "int_subscript_is_null_unsupported", "arr_int[0] is null", None),
+            ("expected_error", "int_subscript_is_null_unsupported", "arr_int[0] is null", None, "unsupported"),
             (
                 "expected_error",
                 "int_subscript_is_not_null_unsupported",
                 "arr_int[0] is not null",
                 None,
+                "unsupported",
             ),
         ]
 
-        failed = 0
-        for mode, name, expr, expected_ids in tests:
-            try:
-                actual_ids = query_ids(col, expr)
-                if mode == "expected_error":
-                    failed += 1
-                    print(
-                        f"{name}: FAIL | expr={expr} | "
-                        f"expected_error=unsupported | actual={actual_ids}"
-                    )
-                else:
-                    status = "PASS" if actual_ids == expected_ids else "FAIL"
-                    if status == "FAIL":
-                        failed += 1
-                    print(
-                        f"{name}: {status} | expr={expr} | "
-                        f"expected={expected_ids} | actual={actual_ids}"
-                    )
-            except Exception as exc:
-                if mode == "expected_error":
-                    print(
-                        f"{name}: PASS | expr={expr} | "
-                        f"expected_error=unsupported | "
-                        f"actual={type(exc).__name__}: {exc}"
-                    )
-                else:
-                    failed += 1
-                    print(
-                        f"{name}: ERROR | expr={expr} | "
-                        f"error={type(exc).__name__}: {exc}"
-                    )
-
-        summary = "PASS" if failed == 0 else "FAIL"
-        print(f"summary: {summary} | failed={failed} | total={len(tests)}")
+        failed = run_operator_cases(
+            collection=col,
+            tests=tests,
+            query_fn=query_ids,
+            title="ARRAY subscript access validation",
+        )
+        return 0 if failed == 0 else 1
 
     finally:
         if utility.has_collection(COLLECTION_NAME):
@@ -168,4 +143,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
