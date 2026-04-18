@@ -26,6 +26,6 @@ oracle_support:
 - pandas
 - pqs
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/contains_all_operator.py
+repro_path: operator_test/weaviate/contains_all_operator.py
 oracle_mapping: Current fuzzer models contains_all with pandas all-membership on present array values for INT_ARRAY, NUMBER_ARRAY, BOOL_ARRAY, and FIELD-tokenized TEXT_ARRAY. After the local refinement in this round, scalar FIELD TEXT `contains_all` is also generated and modeled as exact whole-field token membership, and this scalar-text generation now covers locally queryable FIELD text properties reachable through either `index_filterable` or `index_searchable`. Null and omitted rows are treated as non-matches for positive contains_all in the validated subset. PQS contains direct pivot-true contains_all generation for arrays and scalar FIELD text. The main fuzzer still normalizes dynamically generated empty arrays to null or omitted rows, so explicit empty-array semantics are not part of the main generated oracle subset even though the local engine can store `[]`. WORD or other non-FIELD tokenizations, metadata filters, reference filters, objects, duplicate-target semantics, and undocumented
   index interactions are not claimed. This is our oracle assumption, not an official claim.

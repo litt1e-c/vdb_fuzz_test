@@ -29,5 +29,5 @@ observed_summary: On local Weaviate v1.36.x with anonymous auth enabled, `rest_w
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/rest_where_json_operator.py
+repro_path: operator_test/weaviate/rest_where_json_operator.py
 oracle_mapping: The REST filter oracle builds a conservative recursive `where` JSON subset, computes the expected ID set from pandas using a dedicated REST evaluator over the final JSON tree, and compares both the Python client filter-builder path and the REST dry-run path against that expected set. DATE and DATE_ARRAY comparisons are normalized by parsed UTC instants, and zero-length arrays are treated as null-equivalent in the claimed subset. This is our local oracle rule, not an official claim.

@@ -27,5 +27,5 @@ oracle_support:
 - pqs
 case_refs:
 - issue10917
-repro_path: /home/caihao/compare_test/operator_test/weaviate/equal_operator.py
+repro_path: operator_test/weaviate/equal_operator.py
 oracle_mapping: Current fuzzer maps positive Equal to pandas exact equality for BOOL, INT, Tokenization.FIELD TEXT, and DATE after UTC timestamp normalization, with null/omitted values and empty text values excluded from generated positive equality matches. The inverted-focused profile also allows this exact-equality modeling on locally validated search-only FIELD TEXT properties (`index_filterable=False`, `index_searchable=True`) to exercise the searchable inverted path. Positive NUMBER Equal is intentionally not part of the main atomic oracle; numeric exact-value checks are modeled through small range windows in boundary/PQS paths, and -0.0 is excluded from generated NUMBER values because local signed-zero behavior is unstable. WORD-tokenized text Equal, Equal(''), arrays, objects, metadata filters, reference filters, and arbitrary object paths are not covered. This is our oracle assumption, not an official claim.

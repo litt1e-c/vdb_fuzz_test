@@ -17,5 +17,5 @@ observed_summary: The local aggregate probe validated scalar and flattened-array
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+repro_path: operator_test/weaviate/aggregate_operator.py
 oracle_mapping: The oracle computes mean over present scalar values or flattened numeric-array elements. Integer means are still compared as floats. Empty-result behavior follows the locally observed client defaults.

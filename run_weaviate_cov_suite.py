@@ -261,11 +261,128 @@ VECTOR_TEMPLATES = [
     CaseTemplate("vector-random-a", "vector", 84, [9815], 2000, ["--dim", "128", "--vector-index", "random", "--dynamic"]),
 ]
 
+DEEP_TEMPLATES = [
+    CaseTemplate(
+        "oracle-scalar-dyn-deep-150",
+        "oracle",
+        150,
+        [15001],
+        3000,
+        [
+            "--oracle-rest-crosscheck-rate",
+            "0.60",
+            "--rest-filter-min-depth",
+            "4",
+            "--rest-filter-max-depth",
+            "8",
+        ],
+    ),
+    CaseTemplate(
+        "oracle-inverted-dyn-deep-120",
+        "oracle",
+        120,
+        [15002],
+        3000,
+        [
+            "--profile",
+            "inverted",
+            "--oracle-rest-crosscheck-rate",
+            "0.60",
+            "--rest-filter-min-depth",
+            "4",
+            "--rest-filter-max-depth",
+            "8",
+        ],
+    ),
+    CaseTemplate(
+        "oracle-randcl-dyn-deep-120",
+        "oracle",
+        120,
+        [15003],
+        3000,
+        [
+            "--random-consistency",
+            "--oracle-rest-crosscheck-rate",
+            "0.50",
+            "--rest-filter-min-depth",
+            "4",
+            "--rest-filter-max-depth",
+            "8",
+        ],
+    ),
+    CaseTemplate(
+        "rest-filter-scalar-deep-96",
+        "rest-filter",
+        96,
+        [15101],
+        3200,
+        [
+            "--rest-filter-min-depth",
+            "4",
+            "--rest-filter-max-depth",
+            "8",
+            "--rest-filter-max-compare-results",
+            "12000",
+        ],
+    ),
+    CaseTemplate(
+        "rest-filter-inverted-deep-96",
+        "rest-filter",
+        96,
+        [15102],
+        3200,
+        [
+            "--profile",
+            "inverted",
+            "--rest-filter-min-depth",
+            "4",
+            "--rest-filter-max-depth",
+            "8",
+            "--rest-filter-max-compare-results",
+            "12000",
+        ],
+    ),
+    CaseTemplate(
+        "aggregate-scalar-deep-72",
+        "aggregate",
+        72,
+        [15201],
+        4200,
+        [
+            "--aggregate-filter-min-depth",
+            "3",
+            "--aggregate-filter-max-depth",
+            "7",
+        ],
+    ),
+    CaseTemplate(
+        "vector-dynamic-deep-150",
+        "vector",
+        150,
+        [15301],
+        2200,
+        ["--dim", "128", "--vector-index", "dynamic", "--dynamic"],
+    ),
+    CaseTemplate(
+        "vector-hfresh-deep-120",
+        "vector",
+        120,
+        [15302],
+        2000,
+        ["--dim", "128", "--vector-index", "hfresh"],
+    ),
+]
+
 COMPREHENSIVE_TEMPLATES = [
     *SCALAR_SMOKE_TEMPLATES,
     *FULL_TEMPLATES,
     *VECTOR_SMOKE_TEMPLATES,
     *VECTOR_TEMPLATES,
+]
+
+COMPREHENSIVE_DEEP_TEMPLATES = [
+    *COMPREHENSIVE_TEMPLATES,
+    *DEEP_TEMPLATES,
 ]
 
 AGGREGATE_SUITE_TEMPLATES = [
@@ -282,7 +399,9 @@ SUITES = {
     "full": FULL_TEMPLATES,
     "vector-smoke": VECTOR_SMOKE_TEMPLATES,
     "vector": VECTOR_TEMPLATES,
+    "deep": DEEP_TEMPLATES,
     "comprehensive": COMPREHENSIVE_TEMPLATES,
+    "comprehensive-deep": COMPREHENSIVE_DEEP_TEMPLATES,
 }
 
 

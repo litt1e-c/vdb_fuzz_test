@@ -17,5 +17,5 @@ observed_summary: The local aggregate probe validated scalar INT / NUMBER sums a
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+repro_path: operator_test/weaviate/aggregate_operator.py
 oracle_mapping: The oracle models sum as the arithmetic sum of present scalar values or flattened numeric-array elements. Integer sums are compared exactly for the validated local subset; floating-point sums are compared with tolerance.

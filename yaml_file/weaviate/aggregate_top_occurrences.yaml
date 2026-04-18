@@ -18,5 +18,5 @@ observed_summary: The local aggregate probe validated TEXT and flattened TEXT_AR
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+repro_path: operator_test/weaviate/aggregate_operator.py
 oracle_mapping: The oracle computes text count from present scalar values or flattened text-array elements, and it compares `top_occurrences` as a frequency multiset. When a boundary tie exists at the requested limit, the oracle intentionally skips strict `top_occurrences` comparison because the checked docs do not define the cutoff tie rule.

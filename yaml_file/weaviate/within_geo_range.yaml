@@ -25,6 +25,6 @@ oracle_support:
 - pandas
 case_refs:
 - issue4728
-repro_path: /home/caihao/compare_test/operator_test/weaviate/within_geo_range_operator.py
+repro_path: operator_test/weaviate/within_geo_range_operator.py
 oracle_mapping: Current fuzzer models `within_geo_range` in pandas by normalizing stored geo values to latitude/longitude pairs and applying a great-circle distance helper. Null, missing, or invalid geo values are treated as non-matches. Oracle mode emits `within_geo_range` only on `GEO_COORDINATES` fields when the raw geo candidate set is between 1 and 800 rows, matching the documented nearest-800 implementation limit, and it chooses strictly positive guarded radii from safe gaps between sorted distances so the cutoff does not sit on or very near stored-point distances. Radius 0 is intentionally excluded because local evidence shows Weaviate can return centimeter-near coordinates for 0 m queries, so exact-coordinate semantics are not a sound oracle assumption. PQS does not claim support for `within_geo_range`, because geo remains disabled as a pivot-true primitive there. The guarded-radius rule and `distance <= radius + 1e-6` check are oracle workarounds, not official claims. This is our
   oracle assumption, not an official claim.

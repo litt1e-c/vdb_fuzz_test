@@ -20,5 +20,5 @@ observed_summary: The local aggregate probe validated scalar INT / NUMBER minimu
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+repro_path: operator_test/weaviate/aggregate_operator.py
 oracle_mapping: The oracle computes minimum over present scalar values or flattened numeric-array elements. DATE minimum is computed by UTC-normalized instant ordering and rendered in canonical RFC3339 form. Empty-result aggregates are modeled with the client-observed zero / empty-string defaults.

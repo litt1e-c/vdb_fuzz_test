@@ -25,5 +25,5 @@ oracle_support:
 - pandas
 - pqs
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/property_length_operator.py
+repro_path: operator_test/weaviate/property_length_operator.py
 oracle_mapping: Current fuzzer models property length in pandas as Python string length for TEXT and list length for arrays, with explicit null, missing properties, and empty values normalized to length 0 based on local observation. Direct random generation covers TEXT fields that are locally queryable via either `index_filterable` or `index_searchable`, plus filterable array fields. PQS uses pivot-true `len(field) == n`, `>= n`, `<= n`, and `!= fake_n` patterns over the same subset. Non-filterable arrays, objects, geo values, invalid property names, cross-reference paths, and undocumented per-type/index interactions are not claimed. The length-zero treatment for null and missing properties is a local oracle rule, not an official statement. This is our oracle assumption, not an official claim.

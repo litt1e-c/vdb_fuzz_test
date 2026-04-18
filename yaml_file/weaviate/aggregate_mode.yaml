@@ -21,5 +21,5 @@ observed_summary: The local aggregate probe validated numeric mode on scalar and
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+repro_path: operator_test/weaviate/aggregate_operator.py
 oracle_mapping: For numeric properties, the oracle computes mode over scalar values or flattened array elements and applies the observed lower-value tie-break. For DATE, the oracle compares exactly when the filtered subset has a unique mode and otherwise accepts any tied mode candidate. This is our validated local oracle subset, not an official claim.

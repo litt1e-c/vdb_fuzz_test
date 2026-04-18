@@ -26,5 +26,5 @@ oracle_support:
 - pandas
 - pqs
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/by_update_time_operator.py
+repro_path: operator_test/weaviate/by_update_time_operator.py
 oracle_mapping: Current fuzzer treats `by_update_time` as metadata over a synced dataframe `_update_time` column populated from server-returned object metadata. pandas maps `equal`, `not_equal`, `less_than`, `less_or_equal`, `greater_than`, `greater_or_equal`, `contains_any`, and `contains_none` to UTC-normalized last-update timestamp equality, ordering, membership, and non-membership over that column. Oracle mode syncs `_update_time` after initial insert and after dynamic `replace()`/`update()`/upsert(existing) paths before generating new predicates. PQS uses pivot-true update-time predicates based on the pivot row's synced timestamp plus absent future timestamps, and equivalence mode uses the same atomic generator subset. Empty timestamp lists, invalid timestamp values, unsynced metadata, delete semantics, vector-only update semantics, GraphQL-path generation, and undocumented update-path differences are not claimed. This is our oracle assumption, not an official claim.

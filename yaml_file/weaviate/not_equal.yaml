@@ -28,5 +28,5 @@ oracle_support:
 - pqs
 case_refs:
 - issue10917
-repro_path: /home/caihao/compare_test/operator_test/weaviate/not_equal_operator.py
+repro_path: operator_test/weaviate/not_equal_operator.py
 oracle_mapping: Current fuzzer maps NotEqual to pandas `!=` for BOOL, INT, regular finite NUMBER, Tokenization.FIELD TEXT with non-empty generated target values, and DATE after UTC timestamp normalization; direct NotEqual includes null or omitted rows in the generated scalar/date subset, and non-empty TEXT NotEqual includes empty-string rows. The inverted-focused profile also allows this exact-inequality modeling on locally validated search-only FIELD TEXT properties (`index_filterable=False`, `index_searchable=True`) to exercise the searchable inverted path. DATE NotEqual generation was added after local validation. PQS uses selected NotEqual patterns with fake values for pivot-true checks. NUMBER generation excludes -0.0 because local signed-zero behavior is unstable. WORD-tokenized text, direct NotEqual(''), arrays, objects, metadata filters, reference filters, property length, and arbitrary object paths are not covered. This is our oracle assumption, not an official claim.

@@ -22,5 +22,5 @@ oracle_support:
 - pqs
 case_refs:
 - issue10642
-repro_path: /home/caihao/compare_test/operator_test/weaviate/and_operator.py
+repro_path: operator_test/weaviate/and_operator.py
 oracle_mapping: 'Current fuzzer maps AND to pandas boolean conjunction (`mask_l & mask_r`) over generated subfilter masks, uses Python-client `&` to build Weaviate filters, and has PQS compose AND only from pivot-true operands. Support is partial but sound for the generated filter subset: scalar predicates, array contains predicates, selected null checks, NOT subfilters, and OBJECT `is_none(True)` as validated here. Metadata filters, reference filters, property length, cross-reference paths, arbitrary object paths, OBJECT `is_none(False)`, and undocumented empty-operand behavior are not covered. This is our oracle assumption, not an official claim.'

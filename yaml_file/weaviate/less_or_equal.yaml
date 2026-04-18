@@ -27,5 +27,5 @@ oracle_support:
 - pqs
 case_refs:
 - issue10917
-repro_path: /home/caihao/compare_test/operator_test/weaviate/less_or_equal_operator.py
+repro_path: operator_test/weaviate/less_or_equal_operator.py
 oracle_mapping: Current fuzzer models less_or_equal with pandas strict `<=` on generated INT, NUMBER, and DATE masks; DATE values are normalized to UTC timestamps, and null or omitted rows are excluded. After the local refinement in this round, PQS also contains direct pivot-true `less_or_equal` generation for INT, NUMBER, and DATE, in addition to existing bounded-range uses. Current generation remains intentionally limited to fields that are locally queryable in this environment, so standalone range-only index configurations are not claimed. Signed `-0.0`, text or boolean ordering, arrays, objects, metadata filters, reference filters, and undocumented null/index interactions are outside the validated subset. This is our oracle assumption, not an official claim.

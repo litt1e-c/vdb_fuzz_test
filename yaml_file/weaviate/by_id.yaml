@@ -26,5 +26,5 @@ oracle_support:
 - pandas
 - pqs
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/by_id_operator.py
+repro_path: operator_test/weaviate/by_id_operator.py
 oracle_mapping: Current fuzzer treats `by_id` as metadata over the dataframe `id` column, not as a schema-property operator. pandas maps `equal` and `not_equal` to UUID equality and inequality, maps `contains_any` and `contains_none` to non-empty UUID-list membership and non-membership, and composes `NOT` through normal boolean mask negation. Generated UUID inputs are valid strings; object ids are assumed present and non-null in the dataframe; valid absent UUIDs are modeled as non-matching for `equal` and `contains_any`, and as harmless noise for `not_equal` and `contains_none`. PQS currently uses pivot-true `equal`, `contains_any`, `not_equal(absent_uuid)`, and `contains_none([absent_uuid])`. Empty UUID lists, invalid UUID syntax, GraphQL-path generation, and delete semantics are not claimed. This is our oracle assumption, not an official claim.

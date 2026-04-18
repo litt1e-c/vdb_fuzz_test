@@ -25,5 +25,5 @@ oracle_support:
 - pandas
 - pqs
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/like_operator.py
+repro_path: operator_test/weaviate/like_operator.py
 oracle_mapping: Current fuzzer models Like only for Tokenization.FIELD TEXT. pandas uses case-sensitive full-string wildcard matching over the generated FIELD subset, and the positive non-empty-pattern subset excludes null, missing, and empty text values. After the local refinement in this round, direct Like generation also covers FIELD text properties that are locally queryable via either `index_filterable` or `index_searchable`, and PQS contains pivot-true prefix, suffix, infix, and single-character Like generation for the same subset. Randomized Like generation remains a subset of the documented FIELD behavior rather than an exhaustive text-pattern corpus, and non-FIELD tokenizations, direct empty-string `like("*")`, arrays, objects, metadata filters, reference filters, and undocumented null/index interactions are not claimed. This is our oracle assumption, not an official claim.

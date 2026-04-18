@@ -7,6 +7,7 @@ from typing import Any
 
 import yaml
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 FIELD_ORDER = [
     "operator_id",
@@ -216,6 +217,14 @@ def normalize_record(data: dict[str, Any]) -> dict[str, Any]:
         record["case_refs"] = []
     if "repro_path" not in record:
         record["repro_path"] = None
+    repro_path = record.get("repro_path")
+    if isinstance(repro_path, str):
+        repro_candidate = Path(repro_path)
+        if repro_candidate.is_absolute():
+            try:
+                record["repro_path"] = repro_candidate.resolve().relative_to(REPO_ROOT).as_posix()
+            except ValueError:
+                pass
 
     ordered: dict[str, Any] = {}
     for field in FIELD_ORDER:

@@ -30,5 +30,5 @@ oracle_support:
 - pqs
 case_refs:
 - issue10642
-repro_path: /home/caihao/compare_test/operator_test/weaviate/is_null_operator.py
+repro_path: operator_test/weaviate/is_null_operator.py
 oracle_mapping: Current fuzzer maps scalar, TEXT, and array `is_none(True/False)` to pandas through `_effective_null_mask`. TEXT `""` is treated as effective null, and after the local helper refinement in this round, empty arrays `[]` are also treated as effective null if they are present in the dataframe. The current generator still writes Python `None` by omitting the property and normalizes generated empty arrays to omitted/null-like rows, so explicit-null writes and direct generated `[]` cases are not part of the exercised main-fuzzer subset. PQS currently uses pivot-true `is_none(True)` generation for null-like rows; direct `is_none(False)` is exercised in oracle mode, not as a dedicated PQS primitive. Direct OBJECT `is_none(False)` is excluded, while OBJECT `is_none(True)` remains an observation-backed local subset. This is our oracle assumption, not an official claim.

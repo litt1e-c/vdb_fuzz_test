@@ -27,5 +27,5 @@ oracle_support:
 - pqs
 case_refs:
 - issue10917
-repro_path: /home/caihao/compare_test/operator_test/weaviate/greater_than_operator.py
+repro_path: operator_test/weaviate/greater_than_operator.py
 oracle_mapping: Current fuzzer models greater_than with pandas strict `>` on generated INT, NUMBER, and DATE masks; DATE values are normalized to UTC timestamps, and null or omitted rows are excluded. The implemented NUMBER subset now includes adjacent finite float thresholds around observed values and safe near-zero subnormal thresholds, while DATE generation includes microsecond-resolution RFC3339 boundaries. PQS uses pivot-true greater_than and bounded-range variants on fields that are locally queryable. Current generation is intentionally limited to fields tracked as filterable in this environment, so standalone range-only index configurations are not claimed. Signed `-0.0`, text or boolean ordering, arrays, objects, metadata filters, reference filters, and undocumented null/index interactions are outside the validated subset. This is our oracle assumption, not an official claim.

@@ -24,5 +24,5 @@ observed_summary: On the local Weaviate service, `aggregate_operator.py` validat
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+repro_path: operator_test/weaviate/aggregate_operator.py
 oracle_mapping: The aggregate oracle computes `total_count` from the matched DataFrame row count. Per-property `count` is modeled as the number of present scalar values or the number of flattened array elements after filtering, with null, missing, and empty-array cases contributing zero. This is our oracle assumption for the validated local subset, not an official claim.

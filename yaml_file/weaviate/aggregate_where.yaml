@@ -19,5 +19,5 @@ observed_summary: The local aggregate probe validated filtered aggregates on sca
 oracle_support:
 - pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/aggregate_operator.py
+repro_path: operator_test/weaviate/aggregate_operator.py
 oracle_mapping: The aggregate oracle first computes the filtered DataFrame subset, then applies per-property aggregate semantics on that subset only. This includes flattened array aggregation and locally observed empty-result defaults. This is our oracle assumption for the validated local subset, not an official claim.

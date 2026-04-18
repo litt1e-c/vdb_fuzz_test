@@ -23,5 +23,5 @@ oracle_support:
 - pqs
 case_refs:
 - issue10642
-repro_path: /home/caihao/compare_test/operator_test/weaviate/not_operator.py
+repro_path: operator_test/weaviate/not_operator.py
 oracle_mapping: Current fuzzer maps NOT to pandas by complementing generated subfilter masks and treating null/unknown mask values as included for ordinary negated predicates; dedicated NOT strategies model numeric/text comparisons, ranges, array contains, scalar/array/text `is_none(True)`, and now the validated OBJECT workaround `NOT(OBJECT is_none(True))`, while PQS uses double-NOT and selected pivot-true NOT patterns. Empty text values and zero-length arrays are modeled as null-equivalent for null-state filters. Support is partial but sound for the generated subset validated here; metadata filters, reference filters, property length, arbitrary object paths, direct OBJECT `is_none(False)`, and undocumented empty-operand behavior are not covered. This is our oracle assumption, not an official claim.

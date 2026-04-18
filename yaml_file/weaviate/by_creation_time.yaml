@@ -24,5 +24,5 @@ oracle_support:
 - pandas
 - pqs
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/weaviate/by_creation_time_operator.py
+repro_path: operator_test/weaviate/by_creation_time_operator.py
 oracle_mapping: Current fuzzer treats `by_creation_time` as metadata over a synced dataframe `_creation_time` column populated from server-returned object metadata. pandas maps `equal`, `not_equal`, `less_than`, `less_or_equal`, `greater_than`, `greater_or_equal`, `contains_any`, and `contains_none` to UTC-normalized timestamp equality, ordering, membership, and non-membership over that column. PQS uses pivot-true creation-time predicates based on the pivot row's synced timestamp plus absent future timestamps. Oracle and equivalence modes generate the same timestamp subset through the normal atomic filter generator. Locally generated timestamps are valid timezone-aware datetimes; empty timestamp lists, invalid timestamp values, unsynced metadata, GraphQL-path generation, delete semantics, and `by_update_time` behavior are not claimed. This is our oracle assumption, not an official claim.
