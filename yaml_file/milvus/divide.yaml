@@ -9,7 +9,7 @@ doc_status: operator_documented
 doc_source_urls:
   - https://milvus.io/docs/basic-operators.md
 doc_supported_types:
-  - numeric
+  - scalar_numeric
 doc_semantics: "The checked official Basic Operators page lists `/` as a supported arithmetic operator for building filter conditions on numeric fields."
 doc_notes:
   - "The checked official page lists `/` but does not provide a division-specific example."
@@ -19,7 +19,7 @@ verify_status: edge_validated
 observed_summary: "On the local 19532 deployment, safe FLOAT and DOUBLE division probes matched ordinary real-number division, while INT division behaved like truncation toward zero: `101 / 2 == 50`, `101 / 2 > 50` was false, and `-3 / 2 == -1`. An INT division expression compared against a float threshold (`c_int / 2 > 50.4`) was rejected by the parser with an Int64 cast error. Division-by-zero was not executed on the shared server because a historical local case indicates crash risk."
 oracle_support:
   - pandas
-  - PQS
+  - pqs
 case_refs:
   - issue47285
 repro_path: /home/caihao/compare_test/operator_test/milvus/divide_operator.py

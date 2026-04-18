@@ -1,5 +1,5 @@
 operator_id: json_contains
-family: json
+family: json_special
 syntax_examples:
   - 'json_contains(meta["tags"], "sale")'
   - 'json_contains(meta["nums"], 2)'
@@ -10,7 +10,7 @@ doc_source_urls:
   - "https://milvus.io/docs/id/json-field-overview.md"
   - "https://milvus.io/docs/v2.4.x/use-json-fields.md"
 doc_supported_types:
-  - json_path_array
+  - json_field
 doc_semantics: "json_contains checks whether the JSON array at the target path contains a specified element or sub-array."
 doc_notes:
   - "The checked official JSON pages explicitly document json_contains for JSON fields."

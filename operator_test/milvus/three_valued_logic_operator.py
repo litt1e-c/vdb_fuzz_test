@@ -16,12 +16,17 @@ from pymilvus import (
 
 
 DEFAULT_HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
-DEFAULT_PORT = os.getenv("MILVUS_PORT", "19531")
-DEFAULT_COLLECTION = "not_in_operator_validation"
+DEFAULT_PORT = os.getenv("MILVUS_PORT", "19630")
+DEFAULT_COLLECTION = "three_valued_logic_validation"
 
 
 def query_ids(collection: Collection, expr: str) -> list[int]:
-    rows = collection.query(expr, output_fields=["id"], consistency_level="Strong", timeout=20)
+    rows = collection.query(
+        expr,
+        output_fields=["id"],
+        consistency_level="Strong",
+        timeout=20,
+    )
     return sorted(int(row["id"]) for row in rows)
 
 
@@ -29,33 +34,45 @@ def build_rows() -> list[dict]:
     return [
         {
             "id": 1,
-            "role": "admin",
-            "meta": {"role": "admin"},
+            "c_true": True,
+            "c_false": False,
+            "c_null": None,
+            "c_num": 10,
+            "meta": {"color": "blue"},
             "vec": [0.0, 0.0],
         },
         {
             "id": 2,
-            "role": "user",
-            "meta": {"role": "user"},
-            "vec": [1.0, 1.0],
+            "c_true": True,
+            "c_false": False,
+            "c_null": None,
+            "c_num": None,
+            "meta": {"shape": "circle"},
+            "vec": [0.1, 0.1],
         },
         {
             "id": 3,
-            "role": None,
-            "meta": {"team": "ops"},
-            "vec": [2.0, 2.0],
+            "c_true": True,
+            "c_false": False,
+            "c_null": False,
+            "c_num": 5,
+            "meta": None,
+            "vec": [0.2, 0.2],
         },
         {
             "id": 4,
-            "role": None,
-            "meta": None,
-            "vec": [3.0, 3.0],
+            "c_true": True,
+            "c_false": False,
+            "c_null": True,
+            "c_num": 0,
+            "meta": {"color": "red"},
+            "vec": [0.3, 0.3],
         },
     ]
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Milvus NOT IN operator validation")
+    parser = argparse.ArgumentParser(description="Milvus 3VL semantic probe")
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", default=DEFAULT_PORT)
     parser.add_argument("--collection", default=DEFAULT_COLLECTION)
@@ -75,63 +92,58 @@ def main(argv: list[str] | None = None) -> int:
 
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
-            FieldSchema(name="role", dtype=DataType.VARCHAR, max_length=32, nullable=True),
+            FieldSchema(name="c_true", dtype=DataType.BOOL),
+            FieldSchema(name="c_false", dtype=DataType.BOOL),
+            FieldSchema(name="c_null", dtype=DataType.BOOL, nullable=True),
+            FieldSchema(name="c_num", dtype=DataType.INT64, nullable=True),
             FieldSchema(name="meta", dtype=DataType.JSON, nullable=True),
             FieldSchema(name="vec", dtype=DataType.FLOAT_VECTOR, dim=2),
         ]
-        schema = CollectionSchema(fields)
-        col = Collection(args.collection, schema)
-
+        col = Collection(args.collection, CollectionSchema(fields))
         col.insert(build_rows())
         col.flush(timeout=20)
-        col.create_index("vec", {"metric_type": "L2", "index_type": "FLAT"}, timeout=20)
-        col.load(timeout=20)
-        time.sleep(0.4)
+        col.create_index("vec", {"metric_type": "L2", "index_type": "FLAT"}, timeout=30)
+        col.load(timeout=30)
+        time.sleep(0.5)
 
-        direct_cases = [
-            (
-                "scalar_not_in_guarded",
-                '(role is not null and role not in ["admin"])',
-                [2],
-            ),
-            (
-                "json_not_in_guarded",
-                '(meta is not null and meta["role"] not in ["admin"])',
-                [2, 3],
-            ),
+        normative_cases = [
+            ("is_null_baseline", "c_null is null", [1, 2]),
+            ("not_is_null", "not (c_null is null)", [3, 4]),
+            ("not_num_is_null", "not (c_num is null)", [1, 3, 4]),
+            ("json_field_is_null", "meta is null", [3]),
+            ("json_field_not_null", "not (meta is null)", [1, 2, 4]),
         ]
 
         known_issue_probes = [
             (
-                "json_direct_not_in_null_semantics",
-                'meta["role"] not in ["admin"]',
-                [2, 3],
-                "SQL 3VL expects null-field row filtered; observed behavior may include null-field row",
+                "probe_not_null_and_false",
+                "not ((c_null == true) and (c_false == true))",
+                [1, 2, 3, 4],
+                "SQL 3VL expects UNKNOWN AND FALSE => FALSE, outer NOT => TRUE",
+            ),
+            (
+                "probe_true_or_null",
+                "(c_true == true) or (c_null == true)",
+                [1, 2, 3, 4],
+                "SQL 3VL expects TRUE OR UNKNOWN => TRUE",
+            ),
+            (
+                "probe_json_not_equal_with_null",
+                'meta["color"] != "blue"',
+                [4],
+                "SQL 3VL expects missing-key/null-field => UNKNOWN (filtered)",
             ),
         ]
 
-        equiv_pairs = [
-            (
-                "scalar_notin_equiv_not_in",
-                '(role is not null and role not in ["admin"])',
-                '(role is not null and not (role in ["admin"]))',
-            ),
-            (
-                "json_notin_equiv_not_in",
-                '(meta is not null and meta["role"] not in ["admin"])',
-                '(meta is not null and not (meta["role"] in ["admin"]))',
-            ),
-        ]
-
-        print("--- NOT IN operator direct checks ---")
-        for name, expr, expected in direct_cases:
+        print("--- 3VL normative checks ---")
+        for name, expr, expected in normative_cases:
             actual = query_ids(col, expr)
             ok = actual == expected
             print(f"{name}: {'PASS' if ok else 'FAIL'} | expr={expr} | expected={expected} | actual={actual}")
             if not ok:
                 hard_failures += 1
 
-        print("--- NOT IN known-issue probes ---")
+        print("--- 3VL known-issue probes ---")
         for name, expr, sql_expected, rationale in known_issue_probes:
             actual = query_ids(col, expr)
             if actual == sql_expected:
@@ -146,18 +158,6 @@ def main(argv: list[str] | None = None) -> int:
                     f"sql_expected={sql_expected} | actual={actual} | note={rationale}"
                 )
 
-        print("--- NOT IN operator equivalence checks ---")
-        for name, lhs, rhs in equiv_pairs:
-            lhs_ids = query_ids(col, lhs)
-            rhs_ids = query_ids(col, rhs)
-            ok = lhs_ids == rhs_ids
-            print(
-                f"{name}: {'PASS' if ok else 'FAIL'} | lhs={lhs_ids} | rhs={rhs_ids} | "
-                f"lhs_expr={lhs} | rhs_expr={rhs}"
-            )
-            if not ok:
-                hard_failures += 1
-
     finally:
         try:
             if utility.has_collection(args.collection):
@@ -167,7 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         connections.disconnect("default")
 
     if hard_failures:
-        print(f"Summary: FAIL ({hard_failures} NOT IN normative checks failed)")
+        print(f"Summary: FAIL ({hard_failures} normative checks failed)")
         return 1
     print(f"Summary: PASS (normative checks passed, known_bug_reproduced={known_bug_hits})")
     return 0

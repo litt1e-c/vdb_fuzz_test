@@ -10,7 +10,7 @@ doc_source_urls:
   - "https://blog.milvus.io/docs/basic-operators.md"
   - "https://milvus.io/docs/boolean.md"
 doc_supported_types:
-  - boolean_predicates
+  - unknown
 doc_semantics: "NOT negates a condition in a filter expression; the checked official pages document it as a logical operator for excluding a condition."
 doc_notes:
   - "The checked Basic Operators page lists NOT as a supported logical operator and gives `NOT color == \"green\"` as an example."

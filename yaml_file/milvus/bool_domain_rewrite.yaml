@@ -1,0 +1,25 @@
+operator_id: bool_domain_rewrite
+family: logical
+syntax_examples:
+  - 'flag in [true, false]'
+  - 'flag not in [true, false]'
+  - 'flag not in []'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/boolean.md"
+doc_supported_types:
+  - scalar_bool
+doc_semantics: "Milvus documents boolean scalar predicates, `in`, `not in`, and nullability predicates, but does not give a full formal rewrite rule for nullable BOOL domain lists."
+doc_notes:
+  - "The stable 2.6.14 source tree contains parser/rewriter tests for BOOL `not in [true,false]` on nullable fields, where the expression is expected to reduce to `is null`."
+  - "This entry is intentionally narrow: it validates the full BOOL domain and empty-list boundary before using it as a fuzzer seed pattern."
+verify_status: edge_validated
+observed_summary: "On the local Milvus 2.6.14 deployment, `flag in [true, false]` returned the non-null rows, `flag not in [true, false]` returned the null/missing rows, `not (flag in [true, false])` matched `flag is null`, and `flag not in []` matched `flag is not null`. The same ID sets were observed before scalar index creation, after a BOOL bitmap index, and after release/load."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - bool_domain_rewrite_operator
+repro_path: "/home/caihao/compare_test/operator_test/milvus/bool_domain_rewrite_operator.py"
+oracle_mapping: "The pandas oracle maps `flag in [true,false]` to the Milvus non-null mask and maps `flag not in [true,false]` to the Milvus null mask for nullable BOOL fields. Empty-list `not in` is modeled as non-null-only rather than all rows, preserving observed 3VL behavior."

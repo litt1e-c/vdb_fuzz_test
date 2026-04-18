@@ -1,5 +1,5 @@
 operator_id: is_not_null
-family: null_check
+family: nullability
 syntax_examples:
   - 'description IS NOT NULL'
   - 'metadata IS NOT NULL'
@@ -10,7 +10,9 @@ doc_source_urls:
   - "https://milvus.io/docs/basic-operators.md"
   - "https://milvus.io/docs/nullable-and-default.md"
 doc_supported_types:
-  - scalar_field
+  - scalar_numeric
+  - scalar_text
+  - scalar_bool
   - json_field
   - array_field
 doc_semantics: "IS NOT NULL filters rows whose field value is not NULL. The checked official pages state that empty strings are not NULL, and that for JSON and ARRAY fields the operator works at the column level: only a present, non-null whole field matches."

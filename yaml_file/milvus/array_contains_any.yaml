@@ -1,0 +1,29 @@
+operator_id: array_contains_any
+family: array_special
+syntax_examples:
+  - 'array_contains_any(int_arr, [1, 9])'
+  - 'array_contains_any(bool_arr, [true])'
+  - 'array_contains_any(str_arr, ["red", "green"])'
+
+doc_status: operator_documented
+doc_source_urls:
+  - "https://milvus.io/docs/array-operators.md"
+  - "https://milvus.io/docs/array_data_type.md"
+  - "https://milvus.io/docs/nullable-and-default.md"
+doc_supported_types:
+  - array_field
+doc_semantics: "ARRAY_CONTAINS_ANY checks whether an array field contains at least one element from the specified candidate list."
+doc_notes:
+  - "The checked Array Operators page documents ARRAY_CONTAINS_ANY as an array containment operator."
+  - "The checked Array Field page says array elements share one scalar element type and ARRAY does not support JSON as an element type."
+  - "The checked official pages do not clearly specify raw null/UNKNOWN behavior for ARRAY_CONTAINS_ANY under boolean composition."
+
+verify_status: edge_validated
+observed_summary: "Local validation matched integer, boolean, and string ARRAY_CONTAINS_ANY cases in the sampled direct queries. Empty arrays behaved as non-null arrays with a false containment result, while null or omitted arrays were excluded in direct queries and also stayed excluded under raw `not (array_contains_any(...))` in the sampled environment."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/array_contains_any_operator.py"
+
+oracle_mapping: "Current main pandas oracle maps ARRAY_CONTAINS_ANY to `any(item in arr for item in targets)` on Python lists and emits the guarded subset `(arr is not null and array_contains_any(arr, targets))`, while PQS emits raw positive witness forms for non-null arrays. Empty arrays are treated as non-null arrays with a false containment result; raw null-array behavior under arbitrary boolean composition is not fully modeled in the main oracle, and this is our oracle assumption, not an official claim."

@@ -9,7 +9,7 @@ doc_status: operator_documented
 doc_source_urls:
   - https://milvus.io/docs/id/basic-operators.md
 doc_supported_types:
-  - numeric
+  - scalar_numeric
 doc_semantics: "The checked official basic-operators page lists `-` as a supported arithmetic operator for building filter conditions on numeric fields."
 doc_notes:
   - "The checked official page lists `-` but does not provide a `-`-specific example."
@@ -19,7 +19,7 @@ verify_status: mismatch_observed
 observed_summary: "Safe INT, FLOAT, and DOUBLE subtraction probes matched mathematical expectations on the local 19532 deployment, but INT64 underflow probes showed wraparound-related mismatches: `c_int - 1 >= 0` produced a false positive at INT64_MIN, and `c_int - 10 < 0` missed an INT64_MIN row that should satisfy the mathematical condition."
 oracle_support:
   - pandas
-  - PQS
+  - pqs
 case_refs:
   - issue48440
 repro_path: /home/caihao/compare_test/operator_test/milvus/subtract_operator.py

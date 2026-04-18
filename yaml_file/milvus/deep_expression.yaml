@@ -1,0 +1,27 @@
+operator_id: deep_expression
+family: logical
+syntax_examples:
+  - '((((x is not null and x >= 10 and x <= 30) and id >= 0) and id >= 0) ...)'
+  - 'not (not (not (not (x is not null and x >= 10 and x <= 30))))'
+  - '((x == 10 or x == 20) or x == 30) and x is not null'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/boolean.md"
+doc_supported_types:
+  - scalar_numeric
+  - scalar_bool
+  - scalar_text
+doc_semantics: "Milvus documents logical operators and parentheses, but does not specify practical expression-depth limits. Controlled deep expressions should preserve the semantics of the underlying guarded predicate."
+doc_notes:
+  - "This is a bounded safety-oriented probe, not an unbounded denial-of-service test."
+  - "The current validation uses depth 8 double negation and depth 16 left-deep AND/OR forms to exercise parser and execution recursion without stressing production service availability."
+verify_status: edge_validated
+observed_summary: "On the local Milvus 2.6.14 deployment, bounded deep AND/OR and repeated double-negation expressions returned the expected ID sets before scalar indexes, after scalar indexes, and after release/load."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - deep_expression_operator
+repro_path: "/home/caihao/compare_test/operator_test/milvus/deep_expression_operator.py"
+oracle_mapping: "The oracle treats the guarded base predicate as the semantic reference, then verifies that adding `AND true`, `OR false`, and repeated double-negation does not change the resulting ID set. Nullable fields are guarded explicitly so the probe does not collapse SQL-style UNKNOWN into a two-valued model."

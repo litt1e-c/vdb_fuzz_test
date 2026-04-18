@@ -1,5 +1,5 @@
 operator_id: json_contains_any
-family: json
+family: json_special
 syntax_examples:
   - 'json_contains_any(meta["tags"], ["sale", "clearance"])'
   - 'json_contains_any(meta["nums"], [2, 9])'
@@ -9,7 +9,7 @@ doc_source_urls:
   - "https://milvus.io/docs/json-field-overview.md"
   - "https://milvus.io/docs/v2.4.x/use-json-fields.md"
 doc_supported_types:
-  - json_path_array
+  - json_field
 doc_semantics: "json_contains_any checks whether any specified item is present in the JSON array at the target path."
 doc_notes:
   - "The checked official JSON pages explicitly document json_contains_any for JSON fields."

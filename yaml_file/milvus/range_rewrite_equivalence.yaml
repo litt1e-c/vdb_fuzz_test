@@ -1,0 +1,27 @@
+operator_id: range_rewrite_equivalence
+family: range
+syntax_examples:
+  - 'x > 10 and x < 25'
+  - '(x >= 10 and x < 15) or (x >= 15 and x <= 20)'
+  - 'meta["price"] > 10 and meta["price"] < 25'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/boolean.md"
+doc_supported_types:
+  - scalar_numeric
+  - json_field
+  - json_path_scalar
+doc_semantics: "Milvus documents numeric comparison operators and logical composition. The source parser/rewriter also contains range-combination optimizations for scalar and JSON-path predicates, but the public documentation does not specify those rewrite internals."
+doc_notes:
+  - "This entry validates semantic equivalence rather than relying on internal plan shape."
+  - "The checked cases cover AND range intersection, adjacent OR range union, `in` versus OR-of-equality, `not in` versus AND-of-inequality, floating ranges, and JSON-path numeric ranges."
+verify_status: edge_validated
+observed_summary: "On the local Milvus 2.6.14 deployment, all checked range-rewrite equivalences returned identical ID sets before scalar indexes, after INT/DOUBLE/JSON-path index creation, and after release/load."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - range_rewrite_equivalence_operator
+repro_path: "/home/caihao/compare_test/operator_test/milvus/range_rewrite_equivalence_operator.py"
+oracle_mapping: "The oracle is result-set based: each optimized or rewritten expression is compared against an explicitly equivalent baseline on a fixed dataset. NULL and missing JSON-path rows are excluded from comparison predicates unless the expression explicitly checks nullability."

@@ -8,6 +8,7 @@ without relying on recall-rate thresholds:
   1. Distance Ordering:  returned distances must be monotonically sorted.
   2. TopK Monotonicity:  topK=10 ⊆ topK=20 (parameter-containment).
   3. Self-Retrieval:     insert V, search(V, top1) == V with dist ≈ 0.
+  4. Filtered Retrieval: insert V with a unique scalar tag, search(V, expr=tag==T) == V.
 
 Usage:
   python milvus_vector_fuzz_test.py                     # default 200 rounds
@@ -17,6 +18,7 @@ Usage:
   python milvus_vector_fuzz_test.py --dynamic           # enable insert/delete/upsert
 """
 
+import os
 import time
 import random
 import argparse
@@ -60,9 +62,9 @@ class FuzzStats:
         return " | ".join(parts)
 
 # ── defaults (overridable via CLI) ──────────────────────────────────────────
-HOST = "127.0.0.1"
-PORT = "19531"
-COLLECTION_NAME = "vec_fuzz_test"
+HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+PORT = os.getenv("MILVUS_PORT", "19630")
+COLLECTION_NAME = os.getenv("MILVUS_VECTOR_COLLECTION", "vec_fuzz_test")
 N = 2000          # base dataset size
 DIM = 128
 BATCH_SIZE = 500
@@ -96,13 +98,14 @@ def _make_search_params(index_type, metric_type, limit):
 # ── core class ──────────────────────────────────────────────────────────────
 
 class MilvusVectorFuzzTest:
-    def __init__(self, host, port, dim, n, seed, enable_dynamic):
+    def __init__(self, host, port, dim, n, seed, enable_dynamic, collection_name):
         self.host = host
         self.port = port
         self.dim = dim
         self.n = n
         self.seed = seed
         self.enable_dynamic = enable_dynamic
+        self.collection_name = collection_name
         self.col = None
         self.index_type = None
         self.metric_type = None
@@ -129,8 +132,8 @@ class MilvusVectorFuzzTest:
         self.metric_type = random.choice(ALL_METRIC_TYPES)
         print(f"   Index: {self.index_type}  Metric: {self.metric_type}")
 
-        if utility.has_collection(COLLECTION_NAME):
-            utility.drop_collection(COLLECTION_NAME)
+        if utility.has_collection(self.collection_name):
+            utility.drop_collection(self.collection_name)
 
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True),
@@ -138,7 +141,7 @@ class MilvusVectorFuzzTest:
             FieldSchema(name="tag", dtype=DataType.INT64),  # for grouping / filtering
         ]
         schema = CollectionSchema(fields, enable_dynamic_field=False)
-        self.col = Collection(COLLECTION_NAME, schema)
+        self.col = Collection(self.collection_name, schema)
 
     # ── data generation & insert ────────────────────────────────────────────
 
@@ -352,6 +355,42 @@ class MilvusVectorFuzzTest:
             self.col.flush()
             return False, detail
 
+    # ── Test 3a: filtered self-retrieval ───────────────────────────────────
+
+    def test_filtered_self_retrieval(self):
+        """Insert V with a unique scalar tag, then verify vector search+filter returns V."""
+        new_id = self._gen_id()
+        tag_value = 1_000_000_000 + new_id
+        vec = self._random_vector()
+        vec_list = vec.tolist()
+        expr = f"tag == {tag_value}"
+
+        self.col.insert([[new_id], [vec_list], [tag_value]])
+        self.col.flush()
+        try:
+            self.col.compact()
+            self.col.wait_for_compaction_completed()
+            self.col.release()
+            self.col.load()
+        except Exception:
+            time.sleep(1.0)
+
+        try:
+            hits = self._search(vec_list, top_k=1, expr=expr)
+            if not hits:
+                return False, f"filtered self-retrieval EMPTY: id={new_id}, expr={expr}"
+
+            best_id, best_dist = hits[0]
+            if best_id == new_id:
+                return True, f"ok (id={new_id}, expr={expr}, dist={best_dist:.6f})"
+            return False, (
+                f"filtered self-retrieval FAIL: inserted id={new_id}, expr={expr}, "
+                f"top1 id={best_id} dist={best_dist:.6f}"
+            )
+        finally:
+            self.col.delete(f"id in [{new_id}]")
+            self.col.flush()
+
     # ── Test 3b: self-retrieval after dynamic ops ───────────────────────────
 
     def test_self_retrieval_after_ops(self, n_ops=5):
@@ -420,7 +459,7 @@ def run(args):
     print(f"   N={args.N} DIM={args.dim} Dynamic={'ON' if args.dynamic else 'OFF'}")
     print("=" * 80)
 
-    t = MilvusVectorFuzzTest(args.host, args.port, args.dim, args.N, current_seed, args.dynamic)
+    t = MilvusVectorFuzzTest(args.host, args.port, args.dim, args.N, current_seed, args.dynamic, args.collection)
     t.connect()
 
     try:
@@ -428,12 +467,21 @@ def run(args):
         t.generate_and_insert()
         t.build_index_and_load()
 
-        # Log file
-        ts = int(time.time())
-        logfile = f"milvus_vector_fuzz_{ts}.log"
+        log_dir = args.log_dir
+        if args.log_path:
+            logfile = args.log_path
+            log_parent = os.path.dirname(logfile)
+            if log_parent:
+                os.makedirs(log_parent, exist_ok=True)
+        else:
+            os.makedirs(log_dir, exist_ok=True)
+            logfile = os.path.join(
+                log_dir,
+                f"milvus_vector_seed{current_seed}_rounds{args.rounds}_N{args.N}_dim{args.dim}_idx{t.index_type}_metric{t.metric_type}.log",
+            )
         print(f"📝 Log: {logfile}")
 
-        fuzz_stats = {k: FuzzStats() for k in ["ordering", "monotonicity", "self_ret", "self_ret_dyn"]}
+        fuzz_stats = {k: FuzzStats() for k in ["ordering", "monotonicity", "self_ret", "filtered_self_ret", "self_ret_dyn"]}
         failures = []
 
         with open(logfile, "w", encoding="utf-8") as flog:
@@ -489,6 +537,15 @@ def run(args):
                         failures.append(("self_retrieval", i, detail))
                         print(f"  ❌ [R{i}] SELF_RETRIEVAL FAIL: {detail[:120]}")
 
+                    t0 = time.time()
+                    ok, detail = t.test_filtered_self_retrieval()
+                    lat_ms = (time.time() - t0) * 1000
+                    fuzz_stats["filtered_self_ret"].record(ok, lat_ms, error_cat=None if ok else "filtered_self_ret")
+                    flog.write(f"[R{i:04d}] FILTERED_SELF_RETRIEVAL: {'PASS' if ok else 'FAIL'} ({lat_ms:.1f}ms) — {detail}\n")
+                    if not ok:
+                        failures.append(("filtered_self_retrieval", i, detail))
+                        print(f"  ❌ [R{i}] FILTERED_SELF_RETRIEVAL FAIL: {detail[:120]}")
+
                 # ── Test 3b: self-retrieval after dynamic ops ───────────
                 if args.dynamic and i % 30 == 0 and i > 0:
                     t0 = time.time()
@@ -504,6 +561,7 @@ def run(args):
                     print(f"  [R{i+1}/{args.rounds}] ordering=P{fuzz_stats['ordering'].passed}/F{fuzz_stats['ordering'].failed} "
                           f"mono=P{fuzz_stats['monotonicity'].passed}/F{fuzz_stats['monotonicity'].failed} "
                           f"self=P{fuzz_stats['self_ret'].passed}/F{fuzz_stats['self_ret'].failed} "
+                          f"filter=P{fuzz_stats['filtered_self_ret'].passed}/F{fuzz_stats['filtered_self_ret'].failed} "
                           f"dyn=P{fuzz_stats['self_ret_dyn'].passed}/F{fuzz_stats['self_ret_dyn'].failed}")
 
             # Summary
@@ -536,8 +594,8 @@ def run(args):
 
     finally:
         try:
-            if utility.has_collection(COLLECTION_NAME):
-                utility.drop_collection(COLLECTION_NAME)
+            if utility.has_collection(t.collection_name):
+                utility.drop_collection(t.collection_name)
         except Exception:
             pass
         t.disconnect()
@@ -551,6 +609,9 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=str, default=PORT, help=f"Milvus port (default: {PORT})")
     parser.add_argument("-N", type=int, default=N, help=f"Dataset size (default: {N})")
     parser.add_argument("--dim", type=int, default=DIM, help=f"Vector dimension (default: {DIM})")
+    parser.add_argument("--collection", type=str, default=COLLECTION_NAME, help=f"Collection name (default: {COLLECTION_NAME})")
+    parser.add_argument("--log-dir", type=str, default=os.path.join(os.path.dirname(__file__), "milvus_log"), help="Directory for deterministic logs")
+    parser.add_argument("--log-path", type=str, default=None, help="Explicit log file path (overrides --log-dir)")
     parser.add_argument("--dynamic", action="store_true", help="Enable dynamic insert/delete/upsert ops")
     args = parser.parse_args()
     run(args)

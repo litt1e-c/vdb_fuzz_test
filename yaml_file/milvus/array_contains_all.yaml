@@ -1,5 +1,5 @@
 operator_id: array_contains_all
-family: array
+family: array_special
 syntax_examples:
   - 'array_contains_all(history_temperatures, [23, 24])'
   - 'array_contains_all(tags, ["red", "blue"])'

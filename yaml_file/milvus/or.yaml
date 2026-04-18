@@ -1,27 +1,27 @@
 operator_id: or
 family: logical
 syntax_examples:
-'color == "red" OR color == "blue"'
-'(id == 1) OR (nullable_score > 0)'
+  - 'color == "red" OR color == "blue"'
+  - '(id == 1) OR (nullable_score > 0)'
+
 doc_status: operator_documented
 doc_source_urls:
-https://milvus.io/docs/basic-operators.md
+  - "https://milvus.io/docs/basic-operators.md"
 doc_supported_types:
-scalar_numeric
-scalar_text
-json_path_scalar
-array_field
+  - unknown
 doc_semantics: "OR combines conditions and returns matches when at least one condition is true."
 doc_notes:
-"The checked official page explicitly lists OR under logical operators and gives the example color == \"red\" OR color == \"blue\"."
-"The checked official page also states that basic operators can be used with JSON keys and ARRAY indexes, but it does not explicitly specify OR-specific NULL or three-valued-logic semantics."
+  - "The checked official page explicitly lists OR under logical operators and gives the example color == \"red\" OR color == \"blue\"."
+  - "The checked official page also states that basic operators can be used with JSON keys and ARRAY indexes, but it does not explicitly specify OR-specific NULL or three-valued-logic semantics."
+
 verify_status: mismatch_observed
 observed_summary: "Current local validation in or_operator.py matched expected results for a simple scalar OR case and for (id == 1) OR (nullable_score > 0). However, local historical evidence includes issue47116, where (c_true == true) or (c_null == true) returned 0 hits, and issue46972, where a complex combined expression equivalent to (False OR False) was reported as matching."
 oracle_support:
-pandas
-pqs
+  - pandas
+  - pqs
 case_refs:
-issue47116
-issue46972
+  - issue47116
+  - issue46972
 repro_path: "/home/caihao/compare_test/operator_test/milvus/or_operator.py"
+
 oracle_mapping: "Map OR to pandas nullable-boolean disjunction (|) over per-predicate masks, and in PQS expect any row with at least one true disjunct to survive while rows whose final result is still null/NA are filtered out. This is our oracle assumption, not an official claim."

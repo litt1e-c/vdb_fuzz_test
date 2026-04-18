@@ -1,26 +1,27 @@
 operator_id: ge
 family: comparison
 syntax_examples:
+  - "age >= 30"
+  - "score >= 10.0"
+  - 'meta["price"] >= 10'
 
-"age >= 30"
-"score >= 10.0"
-'meta["price"] >= 10'
 doc_status: operator_documented
 doc_source_urls:
-
-"https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/basic-operators.md"
 doc_supported_types:
-scalar_numeric
-scalar_text
+  - scalar_numeric
+  - scalar_text
 doc_semantics: "As a documented comparison operator, >= filters entities whose field value is greater than or equal to the comparison value."
 doc_notes:
-"The checked official page lists >= under comparison operators and states that comparison operators apply to numeric or text fields."
-"The checked official page also gives a family-level note that basic operators can be used with JSON keys and ARRAY indexes, but it does not provide a greater-than-or-equal-specific NULL or missing-key specification."
+  - "The checked official page lists >= under comparison operators and states that comparison operators apply to numeric or text fields."
+  - "The checked official page also gives a family-level note that basic operators can be used with JSON keys and ARRAY indexes, but it does not provide a greater-than-or-equal-specific NULL or missing-key specification."
+
 verify_status: edge_validated
 observed_summary: "Current local validation matched expected behavior for INT, DOUBLE, and JSON-path numeric greater-than-or-equal comparisons, including equality-at-threshold matches, strict-greater matches, and exclusion of rows where the compared scalar field was null."
 oracle_support:
-pandas
-pqs
+  - pandas
+  - pqs
 case_refs: []
 repro_path: "/home/caihao/compare_test/operator_test/milvus/ge_operator.py"
+
 oracle_mapping: "Current fuzzer maps >= to pandas greater-than-or-equal comparison on scalar values or extracted JSON-path scalars and then applies an explicit whole-field is not null guard; for JSON drill-down, a null JSON field becomes UNKNOWN while a missing path inside a non-null JSON object is treated as FALSE. In PQS, pivot-true >= predicates are generated through boundary and arithmetic true expressions; this is our oracle assumption, not an official claim."

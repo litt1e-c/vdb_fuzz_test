@@ -1,25 +1,28 @@
 operator_id: ne
 family: comparison
 syntax_examples:
-'role != "admin"'
-"age != 30"
-'meta["role"] != "admin"'
+  - 'role != "admin"'
+  - "age != 30"
+  - 'meta["role"] != "admin"'
+
 doc_status: operator_documented
 doc_source_urls:
-"https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/basic-operators.md"
 doc_supported_types:
-scalar_numeric
-scalar_text
+  - scalar_numeric
+  - scalar_text
 doc_semantics: "As a documented comparison operator, != filters entities whose field value is not equal to the comparison value."
 doc_notes:
-"The checked official page lists != under comparison operators and states that comparison operators apply to numeric or text fields."
-"The checked official page also gives a family-level note that basic operators can be used with JSON keys and ARRAY indexes, but it does not provide an inequality-specific NULL or missing-key specification."
+  - "The checked official page lists != under comparison operators and states that comparison operators apply to numeric or text fields."
+  - "The checked official page also gives a family-level note that basic operators can be used with JSON keys and ARRAY indexes, but it does not provide an inequality-specific NULL or missing-key specification."
+
 verify_status: mismatch_observed
 observed_summary: "Current local validation showed guarded scalar inequality behaved as expected for INT and VARCHAR, but JSON-path inequality was unstable: (meta is not null and (meta[\"role\"] != \"admin\")) returned [2, 3] instead of [2], and direct meta[\"role\"] != \"admin\" returned [2, 3, 4], so a missing key and a null JSON field were both treated as matching. Local historical case issue47164 reports the same JSON != mismatch pattern."
 oracle_support:
-pandas
-pqs
+  - pandas
+  - pqs
 case_refs:
-issue47164
+  - issue47164
 repro_path: "/home/caihao/compare_test/operator_test/milvus/ne_operator.py"
+
 oracle_mapping: "Current fuzzer maps scalar INT and VARCHAR != to pandas inequality with an explicit is not null guard, while scalar FLOAT and JSON-path != are intentionally avoided in the main atomic generator because of precision and known JSON-null instability; PQS may still emit non-JSON != through boundary-style true expressions. For standalone bug triage, JSON-path != is treated as non-matching on null JSON fields and missing keys, but this is our oracle assumption, not an official claim."

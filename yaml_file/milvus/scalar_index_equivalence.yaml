@@ -1,0 +1,26 @@
+operator_id: scalar_index_equivalence
+family: other
+syntax_examples:
+  - '(age is not null and (age >= 10 and age <= 30))'
+  - '(flag is not null and (flag == true))'
+  - 'meta["a"]["b"] >= 100'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/scalar_index.md"
+  - "https://milvus.io/docs/filtered-search.md"
+doc_supported_types:
+  - scalar_numeric
+  - scalar_bool
+  - json_path_scalar
+doc_semantics: "For the same dataset and the same filter predicate, the no-index path and the indexed path should return equivalent ID sets. This applies both to ordinary scalar indexes and to JSON-path indexes after the index has been built and after release/load."
+doc_notes:
+  - "The official documentation describes scalar indexing and filtered query capabilities, but does not provide a per-operator formal proof of no-index/index equivalence."
+  - "This entry captures a validation strategy rather than a single surface syntax operator."
+verify_status: edge_validated
+observed_summary: "On the local 2.6.14 deployment, the probe observed identical ID sets in three phases—baseline, after index build, and after release/load—for ordinary scalar predicates over age and flag, JSON-path membership and range predicates, and JSON array-element path predicates such as `meta[\"a\"][0][\"b\"] == 1` and `exists(meta[\"a\"][0][\"b\"])`."
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/scalar_index_equivalence_operator.py"
+oracle_mapping: "This strategy compares only filtered ID sets, not ANN scores. The baseline no-index result is used as the reference set, and the same predicate is then re-run after scalar/JSON-path index creation and after reload; any difference is triaged by predicate shape and indexed field type, with pandas filtering available as a secondary reference."

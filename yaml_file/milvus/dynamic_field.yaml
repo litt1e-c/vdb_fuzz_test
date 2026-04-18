@@ -1,0 +1,32 @@
+operator_id: dynamic_field
+family: json_special
+syntax_examples:
+  - 'words >= 100'
+  - 'overview == "Great product"'
+  - 'dynamic_json["nested"]["value"] < 50'
+
+doc_status: operator_documented
+doc_source_urls:
+  - https://milvus.io/docs/enable-dynamic-field.md
+  - https://milvus.io/docs/filtered-search.md
+
+doc_supported_types:
+  - dynamic_field
+  - scalar_numeric
+  - scalar_text
+  - json_path_scalar
+
+doc_semantics: 'The current official Dynamic Field guide states that when dynamic field is enabled, extra keys are stored in the hidden `$meta` JSON field; non-JSON keys can be referenced directly by key name in filters, while keys storing JSON objects should be accessed with JSON path syntax.'
+doc_notes:
+  - 'The checked current docs explicitly show `overview == "Great product"`, `words >= 100`, and `dynamic_json["nested"]["value"] < 50` as valid filter expressions.'
+  - 'The checked current docs explain direct-key filtering, but do not spell out direct-key and `$meta[...]` equivalence for every operator; that part is locally validated rather than directly documented.'
+
+verify_status: edge_validated
+observed_summary: 'On the local 2.6.14 deployment, direct dynamic-field filters and their `$meta[...]` aliases matched on numeric comparison, string equality, nested JSON comparison, nested-path `is null`, and `exists(...)`. The same result sets also remained stable after building `$meta` JSON-path indexes for `words`, `overview`, and `dynamic_json["nested"]["value"]`, and after release/load.'
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: /home/caihao/compare_test/operator_test/milvus/dynamic_field_operator.py
+
+oracle_mapping: 'For validated dynamic-field keys, the oracle treats direct-key expressions such as `words >= 100` as aliases of the hidden `$meta` JSON path. Nested dynamic JSON keys are mapped through the same JSON-path helpers used for explicit JSON fields, and index-enabled runs are checked by result-set equivalence against the baseline no-index execution.'

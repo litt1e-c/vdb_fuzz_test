@@ -1,5 +1,5 @@
 operator_id: array_subscript_access
-family: array_filtering
+family: array_special
 syntax_examples:
   - 'arr_int[0] > 3'
   - 'arr_str[1] == "ops"'
@@ -10,7 +10,7 @@ doc_source_urls:
   - https://milvus.io/docs/id/basic-operators.md
   - https://milvus.io/docs/v2.5.x/nullable-and-default.md
 doc_supported_types:
-  - ARRAY
+  - array_field
 doc_semantics: "The checked official Basic Operators page shows bracket-based access on array fields in filter expressions, for example `history_temperatures[0] > 30`, indicating that basic comparison operators can be applied to indexed array elements."
 doc_notes:
   - "The checked official pages document bracket access only at the family/example level, not as a standalone operator specification."
@@ -20,7 +20,7 @@ verify_status: edge_validated
 observed_summary: "On the local 19532 deployment, `arr[idx]` comparisons on INT, VARCHAR, and BOOL array elements worked as expected, and out-of-range indexed comparisons returned no matches rather than raising an error. In contrast, `arr[idx] is null` and `arr[idx] is not null` were unsupported at execution time and failed with `unsupported data type: ARRAY` from QueryNode."
 oracle_support:
   - pandas
-  - PQS
+  - pqs
 case_refs: []
 repro_path: /home/caihao/compare_test/operator_test/milvus/array_subscript_access_operator.py
 

@@ -1,0 +1,28 @@
+operator_id: three_valued_logic
+family: logical
+syntax_examples:
+  - 'not ((c_null == true) and (c_false == true))'
+  - '(c_true == true) or (c_null == true)'
+  - 'meta["color"] != "blue"'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/boolean.md"
+doc_supported_types:
+  - scalar_bool
+  - json_field
+  - json_path_scalar
+doc_semantics: "The documentation describes boolean and comparison expressions, but does not provide a complete formal specification for NULL/UNKNOWN propagation or for missing-key behavior on JSON-path comparisons."
+doc_notes:
+  - "This entry separates normative checks from known-bug probes: normative checks must pass, while bug probes are used to track whether specific historical behaviors are still reproduced."
+verify_status: mismatch_observed
+observed_summary: "On the local 2.6.14 deployment, the normative `is null` / `not (is null)` checks passed, and two previously suspicious boolean probes did not reproduce. However, JSON missing-key inequality still diverged from SQL-style 3VL expectations: `meta[\"color\"] != \"blue\"` returned rows with missing-key or null JSON values instead of filtering them as UNKNOWN."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - issue47116
+  - issue47164
+  - issue48441
+repro_path: "/home/caihao/compare_test/operator_test/milvus/three_valued_logic_operator.py"
+oracle_mapping: "The pandas oracle models SQL-style 3VL with explicit null masks and guarded predicates: a null whole-field value is treated as UNKNOWN, while JSON-path missing-key and explicit-null cases are tracked separately according to observed engine behavior. Known 3VL-sensitive expressions are not promoted into the main random-positive pool; they remain isolated probes for classification."

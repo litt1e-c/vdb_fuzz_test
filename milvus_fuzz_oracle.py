@@ -14,6 +14,7 @@ import re
 import numpy as np
 import pandas as pd
 import json
+import subprocess
 from pymilvus import (
     connections, utility, FieldSchema, CollectionSchema, DataType, Collection, MilvusClient
 )
@@ -40,8 +41,8 @@ def display_path(path):
         return path
 
 # --- Configuration (User Specified) ---
-HOST = "127.0.0.1"
-PORT = "19532"           # 你的自定义端口
+HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+PORT = os.getenv("MILVUS_PORT", "19630")           # 默认使用稳定版 2.6.14 部署端口，可由环境变量覆盖
 COLLECTION_NAME = "fuzz_stable_v3"
 VECTOR_INDEX_NAME = "vector_idx"  # 显式命名向量索引，避免多索引时 AmbiguousIndexName
 N = 5000                 # 数据量（磁盘满了，先用 1000 测试功能）
@@ -57,10 +58,12 @@ QUERY_TIMEOUT = 30       # query / query_iterator RPC 超时（秒）
 SEARCH_TIMEOUT = 30      # search RPC 超时（秒）
 COMPACTION_TIMEOUT = 60  # compact / wait_for_compaction_completed 超时（秒）
 
-# 稳定的索引类型列表（移除不稳定或需要特殊配置的索引）
-ALL_INDEX_TYPES = [
-    "FLAT", "HNSW", "IVF_FLAT", "IVF_SQ8", "IVF_PQ", "DISKANN"
-]
+# 稳定的索引类型列表。默认不把 DISKANN 放进随机池：
+# 在本地稳定版 2.6.14 上它并不总是可用，随机命中只会把 source-level
+# coverage 烟测污染成“环境不兼容失败”，不利于论文式可解释实验。
+ALL_INDEX_TYPES = ["FLAT", "HNSW", "IVF_FLAT", "IVF_SQ8", "IVF_PQ"]
+if os.getenv("MILVUS_ENABLE_DISKANN", "0") == "1":
+    ALL_INDEX_TYPES.append("DISKANN")
 # 注意：INDEX_TYPE 等随机变量移到 run() 内部，在种子设置后初始化，保证可重复性
 INDEX_TYPE = None  # 延迟初始化
 
@@ -122,6 +125,16 @@ MAX_EVOLVED_FIELDS = 5
 # Oracle 稳定性保护：维护/删除后自动与 Milvus 对账，降低 pandas NOT FOUND 噪声
 # 若要保留“删除后幽灵行”这类 Milvus 问题用于缺陷挖掘，可设为 False。
 AUTO_ORACLE_RESYNC = True
+
+# Coverage / campaign scheduling knobs. Defaults preserve the historical cadence;
+# campaign scripts can lower these intervals to exercise maintenance paths in short runs.
+MAINT_COMPACTION_INTERVAL = 25
+VECTOR_INDEX_REBUILD_INTERVAL = 40
+SCALAR_INDEX_REBUILD_INTERVAL = 35
+DYNAMIC_OP_INTERVAL = 10
+SCHEMA_EVOLUTION_INTERVAL = 30
+EQUIV_PQS_DYNAMIC_OP_PROBABILITY = 0.20
+EQUIV_PQS_SCALAR_REBUILD_INTERVAL = 50
 
 # --- 边界值注入 ---
 # 按此概率在数据生成时将正常值替换为边界值（延迟初始化，在 run() 内种子设置后随机选取）
@@ -251,6 +264,64 @@ def milvus_json_path_exists(obj, keys):
             current = current[key]
 
     return milvus_json_value_has_content(current)
+
+
+_JSON_PATH_MISSING = object()
+
+
+def milvus_json_path_get(obj, keys, missing=_JSON_PATH_MISSING):
+    """Resolve a JSON path without applying Milvus exists/non-empty semantics."""
+    if milvus_is_empty(obj):
+        return missing
+
+    current = obj
+    for key in keys:
+        if hasattr(current, "item"):
+            try:
+                current = current.item()
+            except Exception:
+                return missing
+
+        if isinstance(key, int):
+            if not isinstance(current, list) or key < 0 or key >= len(current):
+                return missing
+            current = current[key]
+        else:
+            if not isinstance(current, dict) or key not in current:
+                return missing
+            current = current[key]
+
+    if hasattr(current, "tolist"):
+        try:
+            current = current.tolist()
+        except Exception:
+            pass
+    if hasattr(current, "item"):
+        try:
+            current = current.item()
+        except Exception:
+            pass
+    return current
+
+
+def milvus_json_array_length(obj, keys):
+    """
+    Model observed Milvus array_length(JSON path) behavior.
+
+    Top-level null/missing JSON fields behave as UNKNOWN/invalid for the
+    predicate, while missing nested paths and non-array nested values inside a
+    non-null JSON document are currently evaluated as length 0.
+    """
+    if milvus_is_empty(obj):
+        return None
+    value = milvus_json_path_get(obj, keys)
+    if value is _JSON_PATH_MISSING:
+        return 0
+    if isinstance(value, np.ndarray):
+        return len(value)
+    if isinstance(value, list):
+        return len(value)
+    return 0
 
 
 def milvus_int_add_is_safe_value(val, operand):
@@ -1603,6 +1674,138 @@ class OracleQueryGenerator:
             return left == right
         return type(left) == type(right) and left == right
 
+    def _gen_column_compare_oracle_expr(self, name, ftype, series):
+        if ftype not in [DataType.BOOL, DataType.VARCHAR] + ALL_INT_TYPES + ALL_FLOAT_TYPES:
+            return None
+
+        candidates = [
+            field for field in self.schema
+            if field["name"] != name and field["type"] == ftype
+        ]
+        if not candidates:
+            return None
+
+        other = random.choice(candidates)
+        other_name = other["name"]
+        other_series = self.df[other_name]
+        if ftype == DataType.BOOL:
+            op = random.choice(["==", "!="])
+        elif ftype in ALL_FLOAT_TYPES:
+            op = random.choice([">", "<", ">=", "<="])
+        else:
+            op = random.choice(["==", "!=", ">", "<", ">=", "<="])
+
+        def compare_pair(left, right, _op=op):
+            if left is None or right is None:
+                return None
+            if isinstance(left, float) and np.isnan(left):
+                return None
+            if isinstance(right, float) and np.isnan(right):
+                return None
+            try:
+                if _op == "==":
+                    return left == right
+                if _op == "!=":
+                    return left != right
+                if _op == ">":
+                    return left > right
+                if _op == "<":
+                    return left < right
+                if _op == ">=":
+                    return left >= right
+                if _op == "<=":
+                    return left <= right
+                return False
+            except Exception:
+                return False
+
+        raw_mask = pd.Series(
+            (compare_pair(left, right) for left, right in zip(series, other_series)),
+            index=series.index,
+            dtype="boolean",
+        )
+        guard = milvus_notnull_mask(series) & milvus_notnull_mask(other_series)
+        expr = f"({name} is not null and {other_name} is not null and ({name} {op} {other_name}))"
+        return expr, raw_mask & guard
+
+    def _gen_string_function_oracle_expr(self, name, series, value):
+        strategy = random.choice([
+            "empty",
+            "not_empty",
+            "starts_with_literal",
+            "starts_with_column",
+        ])
+
+        def check_empty(x, negated=False):
+            if x is None:
+                return None
+            if isinstance(x, float) and np.isnan(x):
+                return None
+            if not isinstance(x, str):
+                return False
+            result = x == ""
+            return (not result) if negated else result
+
+        def check_starts_with_literal(x, prefix):
+            if x is None:
+                return None
+            if isinstance(x, float) and np.isnan(x):
+                return None
+            if not isinstance(x, str):
+                return False
+            return x.startswith(prefix)
+
+        if strategy in {"empty", "not_empty"}:
+            negated = strategy == "not_empty"
+            expr = f"not empty({name})" if negated else f"empty({name})"
+            mask = series.apply(lambda x, _negated=negated: check_empty(x, _negated)).astype("boolean")
+            return expr, mask
+
+        if strategy == "starts_with_column":
+            candidates = [
+                field for field in self.schema
+                if field["name"] != name and field["type"] == DataType.VARCHAR
+            ]
+            if candidates:
+                other = random.choice(candidates)
+                other_name = other["name"]
+                other_series = self.df[other_name]
+
+                def check_starts_with_column(x, prefix):
+                    if x is None or prefix is None:
+                        return None
+                    if isinstance(x, float) and np.isnan(x):
+                        return None
+                    if isinstance(prefix, float) and np.isnan(prefix):
+                        return None
+                    if not isinstance(x, str) or not isinstance(prefix, str):
+                        return False
+                    return x.startswith(prefix)
+
+                raw_mask = pd.Series(
+                    (
+                        check_starts_with_column(x, prefix)
+                        for x, prefix in zip(series, other_series)
+                    ),
+                    index=series.index,
+                    dtype="boolean",
+                )
+                expr = f"starts_with({name}, {other_name})"
+                return expr, raw_mask
+
+        raw_val = str(self._to_native_scalar(value))
+        if raw_val == "":
+            prefix = ""
+        else:
+            prefix_len = random.randint(0, max(1, min(len(raw_val), 4)))
+            prefix = raw_val[:prefix_len]
+        escaped_prefix = self._escape_string_literal(prefix)
+        expr = f'starts_with({name}, "{escaped_prefix}")'
+        mask = series.apply(
+            lambda x, _prefix=prefix: check_starts_with_literal(x, _prefix)
+        ).astype("boolean")
+        return expr, mask
+
     def _build_membership_candidates(self, value, include_value=True):
         value = self._to_native_scalar(value)
         if value is None:
@@ -1618,7 +1821,9 @@ class OracleQueryGenerator:
             noise = [f"{base}_alt", self._random_string(max(3, len(base)), max(4, len(base) + 2))]
         elif isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)):
             base = int(value)
-            noise = [base + 1, base - 1 if base != -1 else base + 2]
+            raw_noise = [base + 1, base - 1 if base != -1 else base + 2]
+            int64_min, int64_max = -(2**63), 2**63 - 1
+            noise = [min(max(int(item), int64_min), int64_max) for item in raw_noise]
         elif isinstance(value, (float, np.floating)):
             base = float(value)
             delta = 1.0 if abs(base) < 1e6 else max(1.0, abs(base) * 0.01)
@@ -1729,7 +1934,35 @@ class OracleQueryGenerator:
         # 原始代码: 不使用 notnull_mask, 直接 return (expr, mask)
         # 现在: 所有 JSON 表达式包裹 (name is not null and (expr)), mask & notnull_mask
         notnull_mask = milvus_notnull_mask(series)
-        strategy = random.choice(["range", "nested", "index", "multi_key"])
+        def _format_json_path(keys):
+            path = name
+            for key in keys:
+                if isinstance(key, int):
+                    path += f"[{key}]"
+                else:
+                    safe_key = str(key).replace('\\', '\\\\').replace('"', '\"')
+                    path += f'["{safe_key}"]'
+            return path
+
+        json_path_candidates = [
+            ["price"],
+            ["config"],
+            ["config", "version"],
+            ["history"],
+            ["history", 0],
+            ["active"],
+            ["color"],
+            ["milvus_fuzz_missing_key"],
+        ]
+        strategy = random.choice([
+            "range",
+            "nested",
+            "index",
+            "multi_key",
+            "path_exists",
+            "path_nullability",
+            "array_length_path",
+        ])
 
         # --- 策略 1: Range ---
         if strategy == "range":
@@ -1808,6 +2041,66 @@ class OracleQueryGenerator:
             raw_mask = series.apply(check_multi).astype("boolean")
             # [WORKAROUND: NOT(UNKNOWN)] 原始: return (expr, raw_mask)
             return (f"({name} is not null and ({expr}))", raw_mask & notnull_mask)
+
+        # --- 策略 5: JSON path exists / is not null ---
+        elif strategy == "path_exists":
+            keys = random.choice(json_path_candidates)
+            path_expr = _format_json_path(keys)
+            use_function_syntax = random.random() < 0.7
+            expr = f"exists({path_expr})" if use_function_syntax else f"{path_expr} is not null"
+
+            def check_exists(x, _keys=keys):
+                return milvus_json_path_exists(x, _keys)
+
+            mask = series.apply(check_exists).astype("boolean")
+            return (expr, mask)
+
+        # --- 策略 6: JSON path is null ---
+        elif strategy == "path_nullability":
+            keys = random.choice(json_path_candidates)
+            path_expr = _format_json_path(keys)
+            expr = f"{path_expr} is null"
+
+            def check_is_null(x, _keys=keys):
+                return not milvus_json_path_exists(x, _keys)
+
+            mask = series.apply(check_is_null).astype("boolean")
+            return (expr, mask)
+
+        # --- 策略 7: array_length(JSON path) ---
+        elif strategy == "array_length_path":
+            keys = random.choice([
+                ["history"],
+                ["history", 0],
+                ["config"],
+                ["config", "version"],
+                ["milvus_fuzz_missing_key"],
+            ])
+            path_expr = _format_json_path(keys)
+            op = random.choice(["==", "!=", ">", ">=", "<", "<="])
+            target = random.choice([0, 1, 2, 3])
+            expr = f"array_length({path_expr}) {op} {target}"
+
+            def check_array_length(x, _keys=keys, _op=op, _target=target):
+                length = milvus_json_array_length(x, _keys)
+                if length is None:
+                    return None
+                if _op == "==":
+                    return length == _target
+                if _op == "!=":
+                    return length != _target
+                if _op == ">":
+                    return length > _target
+                if _op == ">=":
+                    return length >= _target
+                if _op == "<":
+                    return length < _target
+                if _op == "<=":
+                    return length <= _target
+                return False
+
+            mask = series.apply(check_array_length).astype("boolean")
+            return (expr, mask)
 
         # 兜底表达式，永远为真
         return ("id > 0", None)
@@ -1913,6 +2206,11 @@ class OracleQueryGenerator:
         name, ftype = f["name"], f["type"]
         series = self.df[name]
 
+        if random.random() < 0.08:
+            column_compare = self._gen_column_compare_oracle_expr(name, ftype, series)
+            if column_compare:
+                return column_compare
+
         # 1. Null Check
         # 【关键】使用 milvus_null_mask / milvus_notnull_mask 代替 pandas 原生方法
         # 以匹配当前观测到的 Milvus 字段级 null 语义
@@ -1997,8 +2295,34 @@ class OracleQueryGenerator:
 
         # 2. Value Comparison (分流处理)
         if ftype == DataType.BOOL:
+            # 已由 operator_test/milvus/bool_domain_rewrite_operator.py 验证：
+            # 在 nullable BOOL 上，Milvus 2.6.14 将完整布尔域列表和空列表做特殊重写。
+            # 这里仅建模这些窄模式，不把普通 NULL/UNKNOWN 语义泛化成二值逻辑。
+            if random.random() < 0.30:
+                strategy = random.choice([
+                    "domain_in",
+                    "domain_not_in",
+                    "not_domain_in",
+                    "empty_in",
+                    "empty_not_in",
+                ])
+                if strategy == "domain_in":
+                    expr = f"{name} in [true, false]"
+                    mask = milvus_notnull_mask(series)
+                elif strategy == "domain_not_in":
+                    expr = f"{name} not in [true, false]"
+                    mask = milvus_null_mask(series)
+                elif strategy == "not_domain_in":
+                    expr = f"not ({name} in [true, false])"
+                    mask = milvus_null_mask(series)
+                elif strategy == "empty_in":
+                    expr = f"{name} in []"
+                    mask = pd.Series([False] * len(series), index=series.index, dtype="boolean")
+                else:
+                    expr = f"{name} not in []"
+                    mask = milvus_notnull_mask(series)
             # 加入 in / not in 覆盖（等价于多值枚举）
-            if random.random() < 0.25:
+            elif random.random() < 0.25:
                 candidates = [True, False]
                 chosen = [random.choice(candidates)]
                 expr_in = f"{name} in [{str(chosen[0]).lower()}]"
@@ -2058,7 +2382,7 @@ class OracleQueryGenerator:
             mask = series.apply(safe_compare_scalar(op, val_float)).astype("boolean")
 
         elif ftype == DataType.VARCHAR:
-            op = random.choice(["==", "!=", ">", "<", "like", "in", "not in"])
+            op = random.choice(["==", "!=", ">", "<", "like", "in", "not in", "string_function"])
             if op == "like":
                 patterns = self._build_true_like_patterns(val)
                 if not patterns:
@@ -2086,6 +2410,8 @@ class OracleQueryGenerator:
                 else:
                     expr = f"not ({expr_in})"
                     mask = ~series.apply(safe_compare_scalar("in", raw_items)).astype("boolean")
+            elif op == "string_function":
+                return self._gen_string_function_oracle_expr(name, series, val)
             else:
                 expr = f'{name} {op} "{val}"'
                 mask = series.apply(safe_compare_scalar(op, val)).astype("boolean")
@@ -2965,9 +3291,17 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
 
     def _gen_guaranteed_false_expr(self):
         """
-        根据 Schema 构造一个【必然为假】但【计算复杂】的表达式。
-        用于替换简单的 id == -1，强制 Milvus 调动更多执行路径。
+        根据 Schema 构造一个【三值逻辑下严格为假】且【尽量复杂】的表达式。
+        关键点：避免使用“看似 false 但可能是 NULL”的分支直接参与等价变换。
         """
+        # 主键 id 在本脚本中始终为非负整数，因此该条件在 3VL 下严格为 False。
+        strict_false_guard = "(id < 0)"
+
+        def _force_false_under_3vl(candidate_expr: str) -> str:
+            # candidate 可能为 True/False/NULL。与 strict_false_guard 做 AND 后，
+            # 无论 candidate 为何值，最终都为 False（包括 candidate==NULL 的情形）。
+            return f"(({candidate_expr}) and {strict_false_guard})"
+
         # 随机选一个字段，不要每次都用 id
         field = random.choice(self.schema)
         name = field["name"]
@@ -2977,35 +3311,35 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
         if dtype == DataType.ARRAY:
             # 语义：数组长度小于 0 -> 恒假
             # 攻击点：强制触发 ArrayLength 算子
-            return f"array_length({name}) < 0"
+            return _force_false_under_3vl(f"array_length({name}) < 0")
 
         # 策略 2: 字符串不可能包含的特殊值 (针对 Varchar)
         elif dtype == DataType.VARCHAR:
             # 语义：等于一个极其复杂的随机串
             # 攻击点：强制触发字符串 Hash 或 Trie 树搜索
             complex_str = "fuzz_impossible_" + "".join(random.choices(string.ascii_letters, k=10))
-            return f'{name} == "{complex_str}"'
+            return _force_false_under_3vl(f'{name} == "{complex_str}"')
 
         # 策略 3: 数学矛盾 (针对 Int/Float)
         elif dtype in [DataType.INT64, DataType.INT32, DataType.INT16, DataType.INT8]:
             # 语义：(x > MAX) AND (x < MIN) -> 恒假
             # 攻击点：强制执行两次比较运算并做 AND 合并
-            return f"({name} > 200000 and {name} < -200000)"
+            return _force_false_under_3vl(f"({name} > 200000 and {name} < -200000)")
 
         # 策略 4: 浮点数 NaN 检测 (针对 Float/Double)
         elif dtype in [DataType.DOUBLE, DataType.FLOAT]:
             # 语义：两个很大的数做且运算，或者利用逻辑矛盾
             # 注意：Milvus 中 float == float 比较危险，用范围矛盾
-            return f"({name} > 1e20 and {name} < -1e20)"
-            
+            return _force_false_under_3vl(f"({name} > 1e20 and {name} < -1e20)")
+
         # 策略 5: JSON 包含不存在的 Key (针对 JSON)
         elif dtype == DataType.JSON:
              # 语义：JSON 包含一个极长的不存在 Key
              # 攻击点：强制解析 JSON 结构
-             return f'exists({name}["milvus_fuzz_ghost_key_v3"])'
+             return _force_false_under_3vl(f'exists({name}["milvus_fuzz_ghost_key_v3"])')
 
-        # 兜底：如果上面都没命中 (比如 Bool)，还是用 ID
-        return "id == -999999"
+        # 兜底：如果上面都没命中 (比如 Bool)，也返回 3VL 严格 false 条件
+        return strict_false_guard
 
     def mutate_expr(self, base_expr):
         """
@@ -3064,8 +3398,8 @@ class EquivalenceQueryGenerator(OracleQueryGenerator):
                 pass
 
         #6. 德·摩根定律包装 (De Morgan Wrapper)
-        # 逻辑: A <=> NOT ( (NOT A) OR (id == -1) )
-        # 假设 id 都是正数，(id == -1) 为 False
+        # 逻辑: A <=> NOT ( (NOT A) OR strict_false )
+        # strict_false 由 _gen_guaranteed_false_expr 构造，要求在 3VL 下严格为 False
         # 这迫使查询引擎执行：全集 - ( (全集 - A) U 空集 )
         complex_false = self._gen_guaranteed_false_expr()
         mutations.append({
@@ -3216,7 +3550,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
             print(f"\r⚖️  Test {i+1}/{rounds}...", end="", flush=True)
             
             # --- 【动态数据变动】每轮有 20% 概率触发 ---
-            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+            if enable_dynamic_ops and i > 0 and random.random() < EQUIV_PQS_DYNAMIC_OP_PROBABILITY:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
 
@@ -3295,7 +3629,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                         file_log(f"[Dynamic] Upsert failed: {e}")
 
             # --- 随机触发标量索引重建 ---
-            if i > 0 and i % 50 == 0:
+            if EQUIV_PQS_SCALAR_REBUILD_INTERVAL > 0 and i > 0 and i % EQUIV_PQS_SCALAR_REBUILD_INTERVAL == 0:
                 try:
                     mm.col.release()
                     file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
@@ -3311,7 +3645,7 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=True, consist
                         pass
 
             # --- Schema Evolution ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 try:
                     field_config = dm.evolve_schema_add_field()
                     if field_config:
@@ -3702,7 +4036,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
             print(f"\r⏳ Running Test {i+1}/{total_test} [CL={cl}]...          ", end="", flush=True)
 
             # --- 随机触发 compaction ---
-            if i > 0 and i % 25 == 0:
+            if MAINT_COMPACTION_INTERVAL > 0 and i > 0 and i % MAINT_COMPACTION_INTERVAL == 0:
                 try:
                     mm.col.compact(timeout=COMPACTION_TIMEOUT)
                     file_log(f"[Maintenance] Triggered compaction at round {i}")
@@ -3710,7 +4044,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                     file_log(f"[Maintenance] Compaction failed at round {i}: {e}")
 
             # --- 随机触发索引重建 ---
-            if i > 0 and i % 40 == 0:
+            if VECTOR_INDEX_REBUILD_INTERVAL > 0 and i > 0 and i % VECTOR_INDEX_REBUILD_INTERVAL == 0:
                 try:
                     # 选择一个不同于当前的索引类型
                     candidates = [t for t in ALL_INDEX_TYPES if t != CURRENT_INDEX_TYPE]
@@ -3791,7 +4125,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                         file_log(f"[Maintenance] Recovery failed at round {i}: {e2}")
 
             # --- 随机触发标量索引重建 ---
-            if i > 0 and i % 35 == 0:
+            if SCALAR_INDEX_REBUILD_INTERVAL > 0 and i > 0 and i % SCALAR_INDEX_REBUILD_INTERVAL == 0:
                 try:
                     mm.col.release()
                     file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
@@ -3813,7 +4147,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                         file_log(f"[Maintenance] Scalar rebuild recovery failed at round {i}: {e2}")
 
             # --- 动态插入/删除/Upsert ---
-            if enable_dynamic_ops and i > 0 and i % 10 == 0:
+            if enable_dynamic_ops and DYNAMIC_OP_INTERVAL > 0 and i > 0 and i % DYNAMIC_OP_INTERVAL == 0:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
                 file_log(f"[Dynamic] Starting op={op}, batch_count={batch_count} at round {i}")
@@ -3950,7 +4284,7 @@ def run(rounds = 100, seed=None, enable_dynamic_ops=True, consistency=None):
                         file_log(f"[Dynamic] Upsert failed: {e}")
 
             # --- Schema Evolution: 随机添加新字段 ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 try:
                     field_config = dm.evolve_schema_add_field()
                     if field_config:
@@ -4387,6 +4721,85 @@ class PQSQueryGenerator(OracleQueryGenerator):
             else:
                 return f"({expr_r} or {expr_l})"
 
+    def _gen_true_column_compare_expr(self, row, fname, ftype, val):
+        supported_types = [DataType.BOOL, DataType.VARCHAR] + ALL_INT_TYPES + ALL_FLOAT_TYPES
+        if ftype not in supported_types:
+            return None
+
+        candidates = [
+            field for field in self.schema
+            if field["name"] != fname and field["type"] == ftype
+        ]
+        random.shuffle(candidates)
+        for other in candidates:
+            other_name = other["name"]
+            try:
+                other_val = row[other_name]
+                if hasattr(other_val, "item"):
+                    other_val = other_val.item()
+            except Exception:
+                continue
+            if other_val is None:
+                continue
+            if isinstance(other_val, float) and np.isnan(other_val):
+                continue
+
+            if val == other_val:
+                op = "==" if ftype == DataType.BOOL else random.choice(["==", ">=", "<="])
+            else:
+                if ftype == DataType.BOOL:
+                    op = "!="
+                else:
+                    try:
+                        if val < other_val:
+                            op = random.choice(["<", "<=", "!="])
+                        else:
+                            op = random.choice([">", ">=", "!="])
+                    except Exception:
+                        op = "!="
+            return f"({fname} is not null and {other_name} is not null and ({fname} {op} {other_name}))"
+
+        return None
+
+    def _gen_true_string_function_expr(self, row, fname, val):
+        if not isinstance(val, str):
+            return None
+
+        strategies = []
+        if val == "":
+            strategies.append(f"empty({fname})")
+        else:
+            strategies.append(f"not empty({fname})")
+
+        prefix_len = random.randint(0, max(1, min(len(val), 4)))
+        prefix = self._escape_string_literal(val[:prefix_len])
+        strategies.append(f'starts_with({fname}, "{prefix}")')
+
+        varchar_candidates = [
+            field for field in self.schema
+            if field["name"] != fname and field["type"] == DataType.VARCHAR
+        ]
+        random.shuffle(varchar_candidates)
+        for other in varchar_candidates:
+            other_name = other["name"]
+            try:
+                other_val = row[other_name]
+                if hasattr(other_val, "item"):
+                    other_val = other_val.item()
+            except Exception:
+                continue
+            if other_val is None:
+                continue
+            if isinstance(other_val, float) and np.isnan(other_val):
+                continue
+            if isinstance(other_val, str) and val.startswith(other_val):
+                strategies.append(
+                    f"({fname} is not null and {other_name} is not null and starts_with({fname}, {other_name}))"
+                )
+                break
+
+        return random.choice(strategies)
+
     def gen_true_atomic_expr(self, row):
         """
         核心逻辑：针对单行数据，生成必真的原子条件
@@ -4414,6 +4827,11 @@ class PQSQueryGenerator(OracleQueryGenerator):
         if is_null:
             return f"{fname} is null"
 
+        if random.random() < 0.15:
+            column_compare = self._gen_true_column_compare_expr(row, fname, ftype, val)
+            if column_compare:
+                return column_compare
+
         # 2. 针对不同类型的必真构造
         if ftype == DataType.BOOL:
             return f"{fname} == {str(bool(val)).lower()}"
@@ -4434,6 +4852,10 @@ class PQSQueryGenerator(OracleQueryGenerator):
 
         # --- 集成高级 LIKE 测试 ---
         elif ftype == DataType.VARCHAR:
+            if random.random() < 0.35:
+                string_func = self._gen_true_string_function_expr(row, fname, val)
+                if string_func:
+                    return string_func
             if random.random() < 0.3:
                 res = self.gen_advanced_like(fname, val)
                 if res: return res
@@ -5101,7 +5523,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
 
         for i in range(rounds):
             # --- 【动态数据变动】每轮有 20% 概率触发 ---
-            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+            if enable_dynamic_ops and i > 0 and random.random() < EQUIV_PQS_DYNAMIC_OP_PROBABILITY:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
 
@@ -5182,7 +5604,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                         file_log(f"[Dynamic] Upsert failed: {e}")
 
             # --- 随机触发标量索引重建 ---
-            if i > 0 and i % 50 == 0:
+            if EQUIV_PQS_SCALAR_REBUILD_INTERVAL > 0 and i > 0 and i % EQUIV_PQS_SCALAR_REBUILD_INTERVAL == 0:
                 try:
                     mm.col.release()
                     file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
@@ -5198,7 +5620,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=True):
                         pass
 
             # --- Schema Evolution (PQS mode) ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 try:
                     field_config = dm.evolve_schema_add_field()
                     if field_config:
@@ -5449,7 +5871,7 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
 
             # --- 【动态数据变动】每轮有 20% 概率触发 ---
-            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+            if enable_dynamic_ops and i > 0 and random.random() < EQUIV_PQS_DYNAMIC_OP_PROBABILITY:
                 op = random.choices(["insert", "delete", "upsert"], weights=[0.4, 0.4, 0.2], k=1)[0]
                 batch_count = random.randint(1, 5)
                 if op == "insert":
@@ -5527,7 +5949,7 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                         file_log(f"[Dynamic] Upsert failed: {e}")
 
             # --- 随机触发标量索引重建 ---
-            if i > 0 and i % 25 == 0:
+            if EQUIV_PQS_SCALAR_REBUILD_INTERVAL > 0 and i > 0 and i % EQUIV_PQS_SCALAR_REBUILD_INTERVAL == 0:
                 try:
                     mm.col.release()
                     file_log(f"[Maintenance] Released collection for scalar index rebuild at round {i}")
@@ -5543,7 +5965,7 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
                         pass
 
             # --- Schema Evolution (GroupBy mode) ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 try:
                     field_config = dm.evolve_schema_add_field()
                     if field_config:
@@ -5710,11 +6132,53 @@ def run_groupby_test(rounds=50, seed=None, enable_dynamic_ops=True):
     else:
         print(f"🚫 GroupBy 测试发现 {len(errors)} 个问题！请查看日志。")
 
+
+def run_validated_scalar_probes(seed=None, operators="all", run_id=None):
+    """Run operator-validated scalar probes from the main Milvus fuzz entrypoint."""
+    suite_path = os.path.join(SCRIPT_DIR, "operator_test", "milvus", "scalar_focus_operator_suite.py")
+    if not os.path.exists(suite_path):
+        print(f"⚠️  Validated scalar probe suite not found: {suite_path}")
+        return 127
+
+    if run_id is None:
+        seed_token = "none" if seed is None else str(seed)
+        collection_token = re.sub(r"[^0-9A-Za-z_]+", "_", COLLECTION_NAME).strip("_") or "collection"
+        run_id = f"validated_scalar_{collection_token}_seed_{seed_token}"
+
+    command = [
+        sys.executable,
+        suite_path,
+        "--host",
+        HOST,
+        "--port",
+        str(PORT),
+        "--operators",
+        operators,
+        "--run-id",
+        run_id,
+    ]
+    env = os.environ.copy()
+    env["MILVUS_HOST"] = HOST
+    env["MILVUS_PORT"] = str(PORT)
+
+    print("\n" + "=" * 80)
+    print("🔬 Running validated scalar operator probes")
+    print(f"   Operators: {operators}")
+    print(f"   Run ID: {run_id}")
+    print(f"   Command: {' '.join(command)}")
+    print("=" * 80)
+    proc = subprocess.run(command, cwd=SCRIPT_DIR, env=env)
+    print(f"🔬 Validated scalar probes exit code: {proc.returncode}")
+    return int(proc.returncode)
+
+
 # 如果你想直接运行这个模式，可以在下面调用
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Milvus Fuzz Oracle")
     
     # Common arguments
+    parser.add_argument("--host", type=str, default=HOST, help="Milvus host")
+    parser.add_argument("--port", type=str, default=PORT, help="Milvus port")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
     parser.add_argument("--rounds", type=int, default=1000, help="Number of rounds for main/test modes")
     parser.add_argument("--collection", type=str, default="fuzz_stable_v3", help="Milvus collection name")
@@ -5735,6 +6199,30 @@ if __name__ == "__main__":
     group.add_argument("--groupby-test", action="store_true", help="Run GroupBy Test Mode")
 
     parser.add_argument("--pqs-rounds", type=int, default=None, help="Override rounds for PQS mode (default: use --rounds)")
+    parser.add_argument("--validated-probes", action="store_true",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--probe-operators", default="all",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--scalar-depth-profile",
+                        choices=[
+                            "default",
+                            "coverage-smoke",
+                            "scalar-deep",
+                            "oracle-scalar",
+                            "pqs-scalar",
+                            "equiv-scalar",
+                        ],
+                        default=os.getenv("MILVUS_SCALAR_DEPTH_PROFILE"),
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--compaction-interval", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--vector-index-rebuild-interval", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--scalar-index-rebuild-interval", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--dynamic-op-interval", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--schema-evolution-interval", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--equiv-pqs-dynamic-op-probability", type=float, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--equiv-pqs-scalar-rebuild-interval", type=int, default=None, help=argparse.SUPPRESS)
+    group.add_argument("--probe-only", action="store_true",
+                       help=argparse.SUPPRESS)
 
     args = parser.parse_args()
 
@@ -5743,8 +6231,101 @@ if __name__ == "__main__":
         random.seed(args.seed)
         np.random.seed(args.seed)
     
+    HOST = args.host
+    PORT = str(args.port)
     COLLECTION_NAME = args.collection
     enable_dynamic_ops = not args.no_dynamic_ops
+
+    depth_profiles = {
+        "default": {
+            "compaction": 25,
+            "vector_rebuild": 40,
+            "scalar_rebuild": 35,
+            "dynamic_op": 10,
+            "schema_evolution": 30,
+            "equiv_pqs_dyn_prob": 0.20,
+            "equiv_pqs_scalar_rebuild": 50,
+        },
+        "coverage-smoke": {
+            "compaction": 8,
+            "vector_rebuild": 0,
+            "scalar_rebuild": 8,
+            "dynamic_op": 4,
+            "schema_evolution": 8,
+            "equiv_pqs_dyn_prob": 0.35,
+            "equiv_pqs_scalar_rebuild": 10,
+        },
+        "oracle-scalar": {
+            "compaction": 15,
+            "vector_rebuild": 0,
+            "scalar_rebuild": 12,
+            "dynamic_op": 6,
+            "schema_evolution": 12,
+            "equiv_pqs_dyn_prob": 0.30,
+            "equiv_pqs_scalar_rebuild": 15,
+        },
+        "pqs-scalar": {
+            "compaction": 0,
+            "vector_rebuild": 0,
+            "scalar_rebuild": 0,
+            "dynamic_op": 0,
+            "schema_evolution": 18,
+            "equiv_pqs_dyn_prob": 0.18,
+            "equiv_pqs_scalar_rebuild": 12,
+        },
+        "equiv-scalar": {
+            "compaction": 0,
+            "vector_rebuild": 0,
+            "scalar_rebuild": 0,
+            "dynamic_op": 0,
+            "schema_evolution": 18,
+            "equiv_pqs_dyn_prob": 0.22,
+            "equiv_pqs_scalar_rebuild": 10,
+        },
+    }
+    depth_profiles["scalar-deep"] = depth_profiles["oracle-scalar"]
+
+    def infer_scalar_profile():
+        if args.scalar_depth_profile:
+            return args.scalar_depth_profile
+        if args.probe_only:
+            return "coverage-smoke"
+        if args.pqs or (args.pqs_rounds is not None and not args.equiv and not args.groupby_test):
+            return "pqs-scalar"
+        if args.equiv:
+            return "equiv-scalar"
+        if args.groupby_test:
+            return "default"
+        return "oracle-scalar"
+
+    scalar_profile_name = infer_scalar_profile()
+    if scalar_profile_name not in depth_profiles:
+        print(f"⚠️  Unknown MILVUS_SCALAR_DEPTH_PROFILE={scalar_profile_name!r}; falling back to oracle-scalar")
+        scalar_profile_name = "oracle-scalar"
+
+    profile = depth_profiles[scalar_profile_name]
+    MAINT_COMPACTION_INTERVAL = profile["compaction"]
+    VECTOR_INDEX_REBUILD_INTERVAL = profile["vector_rebuild"]
+    SCALAR_INDEX_REBUILD_INTERVAL = profile["scalar_rebuild"]
+    DYNAMIC_OP_INTERVAL = profile["dynamic_op"]
+    SCHEMA_EVOLUTION_INTERVAL = profile["schema_evolution"]
+    EQUIV_PQS_DYNAMIC_OP_PROBABILITY = profile["equiv_pqs_dyn_prob"]
+    EQUIV_PQS_SCALAR_REBUILD_INTERVAL = profile["equiv_pqs_scalar_rebuild"]
+
+    if args.compaction_interval is not None:
+        MAINT_COMPACTION_INTERVAL = args.compaction_interval
+    if args.vector_index_rebuild_interval is not None:
+        VECTOR_INDEX_REBUILD_INTERVAL = args.vector_index_rebuild_interval
+    if args.scalar_index_rebuild_interval is not None:
+        SCALAR_INDEX_REBUILD_INTERVAL = args.scalar_index_rebuild_interval
+    if args.dynamic_op_interval is not None:
+        DYNAMIC_OP_INTERVAL = args.dynamic_op_interval
+    if args.schema_evolution_interval is not None:
+        SCHEMA_EVOLUTION_INTERVAL = args.schema_evolution_interval
+    if args.equiv_pqs_dynamic_op_probability is not None:
+        EQUIV_PQS_DYNAMIC_OP_PROBABILITY = max(0.0, min(1.0, args.equiv_pqs_dynamic_op_probability))
+    if args.equiv_pqs_scalar_rebuild_interval is not None:
+        EQUIV_PQS_SCALAR_REBUILD_INTERVAL = args.equiv_pqs_scalar_rebuild_interval
 
     if args.chaos:
         CHAOS_RATE = 0.1
@@ -5756,14 +6337,30 @@ if __name__ == "__main__":
     # 2. Determine Mode and Execute
     print("=" * 80)
     print(f"🚀 Milvus Fuzz Oracle Startup")
+    print(f"   Target: {HOST}:{PORT}")
     print(f"   Collection: {COLLECTION_NAME}")
     print(f"   Seed: {args.seed if args.seed is not None else '(Random)'}")
     print(f"   Metric: {args.metric if args.metric else '(Random from L2/IP/COSINE)'}")
     print(f"   Dynamic Ops: {enable_dynamic_ops}")
+    print(f"   Scalar Strategy: {scalar_profile_name}")
     print(f"   Chaos Rate: {CHAOS_RATE}")
     print(f"   Consistency: {args.consistency if args.consistency else '(Random)'}")
+    print(
+        f"   Maintenance: compaction={MAINT_COMPACTION_INTERVAL}, "
+        f"vector_rebuild={VECTOR_INDEX_REBUILD_INTERVAL}, scalar_rebuild={SCALAR_INDEX_REBUILD_INTERVAL}, "
+        f"dynamic_op={DYNAMIC_OP_INTERVAL}, schema_evolution={SCHEMA_EVOLUTION_INTERVAL}, "
+        f"equiv_pqs_dyn_prob={EQUIV_PQS_DYNAMIC_OP_PROBABILITY:.2f}, "
+        f"equiv_pqs_scalar_rebuild={EQUIV_PQS_SCALAR_REBUILD_INTERVAL}"
+    )
 
     pqs_rounds = args.pqs_rounds if args.pqs_rounds is not None else args.rounds
+    if args.probe_only:
+        print(f"   Mode: Validated Scalar Probes")
+        print(f"   Operators: {args.probe_operators}")
+        print("=" * 80)
+        probe_rc = run_validated_scalar_probes(seed=args.seed, operators=args.probe_operators)
+        sys.exit(probe_rc)
+
     if args.pqs or (args.pqs_rounds is not None and not args.equiv and not args.groupby_test):
         print(f"   Mode: PQS (Predicate Query Search)")
         print(f"   Rounds: {pqs_rounds}")
@@ -5787,3 +6384,8 @@ if __name__ == "__main__":
         print(f"   Rounds: {args.rounds}")
         print("=" * 80)
         run(rounds=args.rounds, seed=args.seed, enable_dynamic_ops=enable_dynamic_ops, consistency=args.consistency)
+
+    if args.validated_probes:
+        probe_rc = run_validated_scalar_probes(seed=args.seed, operators=args.probe_operators)
+        if probe_rc != 0:
+            print(f"⚠️  Validated scalar probes failed with exit code {probe_rc}; main fuzz mode already completed.")

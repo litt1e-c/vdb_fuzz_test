@@ -1,5 +1,5 @@
 operator_id: array_length
-family: array
+family: array_special
 syntax_examples:
   - 'array_length(history_temperatures) == 0'
   - 'array_length(history_temperatures) <= 2'

@@ -1,0 +1,39 @@
+operator_id: column_compare
+family: comparison
+syntax_examples:
+  - "a < b"
+  - "score_left == score_right"
+  - "name_a != name_b"
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/filtered-search.md"
+doc_supported_types:
+  - scalar_numeric
+  - scalar_text
+  - scalar_bool
+doc_semantics: >-
+  Field-to-field comparison predicates compare two scalar columns row by row.
+  Rows with NULL on either side evaluate to UNKNOWN for the bare comparison and
+  therefore are not returned unless the surrounding expression explicitly
+  matches another predicate.
+doc_notes:
+  - "Milvus 2.6.14 accepts column-to-column comparison syntax for numeric, VARCHAR, and BOOL scalar fields."
+  - "Ordering comparisons on BOOL are locally observed as `true > false`; this is validated but not generalized beyond the tested deployment."
+  - "The operator checks result-set equivalence before scalar index creation, after INVERTED indexes, and after release/load."
+verify_status: edge_validated
+observed_summary: >-
+  On a fixed nullable dataset, INT64, DOUBLE, VARCHAR, and BOOL column-to-column
+  comparisons matched expected row IDs for equality, inequality, ordering,
+  logical AND/OR composition, and `not` over a nullable comparison. The result
+  sets remained stable after scalar index creation and after release/load.
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/column_compare_operator.py"
+oracle_mapping: >-
+  The pandas oracle compares the two columns row by row using Python scalar
+  ordering/equality for non-null values and maps any NULL operand to UNKNOWN.
+  For negated comparisons, UNKNOWN remains UNKNOWN; null-safe negation is only
+  generated when explicit `is not null` guards are present.

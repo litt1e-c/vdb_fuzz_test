@@ -1,0 +1,28 @@
+operator_id: json_array_contains_family
+family: other
+syntax_examples:
+  - 'json_contains(meta["tags"], "sale")'
+  - 'json_contains_all(meta["mixed"], [1, "1"])'
+  - 'array_contains_any(arr_s, ["green", "yellow"])'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/json-operators.md"
+  - "https://milvus.io/docs/array-operators.md"
+  - "https://milvus.io/docs/basic-operators.md"
+doc_supported_types:
+  - json_field
+  - json_path_scalar
+  - array_field
+doc_semantics: "Milvus documents JSON_CONTAINS/ALL/ANY for JSON fields and ARRAY_CONTAINS/ALL/ANY for ARRAY fields. The documented semantics are existential membership, all-members containment, and any-member containment over JSON or ARRAY values."
+doc_notes:
+  - "The local validation intentionally covers JSON subarray membership and mixed-type JSON query lists because those execute different internal branches from homogeneous scalar membership."
+  - "The observed probe also checks result stability after ARRAY and JSON scalar index creation attempts plus release/load."
+verify_status: edge_validated
+observed_summary: "On the local Milvus 2.6.14 deployment, the combined JSON/ARRAY contains-family probe returned the expected ID sets for scalar membership, subarray membership, mixed-type JSON query lists, and ARRAY membership across baseline, post-index, and reload phases. Whole-JSON-field inverted indexing may be unavailable depending on server configuration, but unsupported index builds did not affect result stability."
+oracle_support:
+  - pandas
+  - pqs
+case_refs:
+  - json_array_contains_family_operator
+repro_path: "/home/caihao/compare_test/operator_test/milvus/json_array_contains_family_operator.py"
+oracle_mapping: "The oracle is a fixed-dataset result-set oracle. Each contains-family predicate is compared against a manually enumerated expected ID set, with null and missing-path rows treated according to the observed Milvus three-valued behavior for JSON/ARRAY membership predicates."

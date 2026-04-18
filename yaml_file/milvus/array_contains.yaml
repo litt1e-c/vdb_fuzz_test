@@ -1,5 +1,5 @@
 operator_id: array_contains
-family: array
+family: array_special
 syntax_examples:
   - 'array_contains(history_temperatures, 23)'
   - 'array_contains(tags, "pop")'

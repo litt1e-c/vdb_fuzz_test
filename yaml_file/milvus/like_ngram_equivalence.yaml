@@ -1,0 +1,35 @@
+operator_id: like_ngram_equivalence
+family: text_search
+syntax_examples:
+  - 'content like "a%"'
+  - 'content like "%dmi%"'
+  - 'meta["body"] like "tokyo%"'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/scalar_index.md"
+  - "https://milvus.io/docs/basic-operators.md"
+doc_supported_types:
+  - scalar_text
+  - json_path_scalar
+doc_semantics: "For VARCHAR fields and JSON-path LIKE predicates, creating an NGRAM index should preserve result-set equivalence with the no-index path. When the literal length is shorter than min_gram, the engine may fall back to a full scan, but the returned IDs should remain unchanged."
+doc_notes:
+  - "Milvus' official scalar expression test README documents NGRAM as a LIKE optimization path and explicitly states that queries shorter than min_gram fall back to full scan."
+  - "JSON NGRAM indexing requires json_path and json_cast_type: varchar."
+verify_status: edge_validated
+observed_summary: >-
+  On a fixed dataset, VARCHAR and JSON-path LIKE predicates over `meta["body"]`
+  returned identical ID sets in three phases: before NGRAM index creation,
+  after NGRAM index creation, and after release/load. The checked cases cover
+  prefix, suffix, infix, single-character wildcard, short-prefix fallback
+  below min_gram, and ASCII text examples.
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/like_ngram_equivalence_operator.py"
+oracle_mapping: >-
+  This validation uses result-set equivalence instead of ANN scores: the same
+  LIKE predicate is executed before indexing, after NGRAM indexing, and after
+  reload, and all three ID sets must match. For patterns shorter than
+  min_gram, the no-index result is used as the reference for the documented
+  fallback path.

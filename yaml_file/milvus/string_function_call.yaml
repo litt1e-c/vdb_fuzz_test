@@ -1,0 +1,39 @@
+operator_id: string_function_call
+family: text_search
+syntax_examples:
+  - 'empty(content)'
+  - 'starts_with(content, "ad")'
+  - 'starts_with(content, prefix)'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/basic-operators.md"
+  - "https://milvus.io/docs/filtered-search.md"
+doc_supported_types:
+  - scalar_text
+doc_semantics: >-
+  Milvus expression parsing supports scalar function-call predicates. The
+  locally observed string functions are `empty(VARCHAR)` and
+  `starts_with(VARCHAR, VARCHAR)`. They return UNKNOWN for NULL arguments,
+  which means NULL rows are not returned by a bare positive predicate.
+doc_notes:
+  - "The concrete `empty` and `starts_with` function implementations are present in the Milvus 2.6.14 C++ expression function factory."
+  - "JSON-path arguments are not currently accepted by these functions on the tested 2.6.14 deployment; attempts such as `empty(meta[\"body\"])` are rejected as unsupported function signatures."
+  - "This operator intentionally treats JSON-path function calls as out of scope for the main fuzzer until Milvus documents or implements VARCHAR casts for JSON path values."
+verify_status: edge_validated
+observed_summary: >-
+  On a fixed nullable VARCHAR dataset, `empty`, `not empty`, literal-prefix
+  `starts_with`, column-prefix `starts_with`, empty-prefix behavior, Unicode
+  text, emoji text, whitespace prefixes, and logical combinations were
+  validated. The same result sets were observed before scalar index creation,
+  after INVERTED indexes on both VARCHAR fields, and after release/load.
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/string_function_call_operator.py"
+oracle_mapping: >-
+  The pandas oracle maps `empty(x)` to `x == ""` for non-null strings and maps
+  `starts_with(x, p)` to Python `str.startswith` when both arguments are
+  non-null strings. NULL arguments map to UNKNOWN, so positive predicates omit
+  those rows and explicit `is not null` guards are used when negating function
+  predicates.

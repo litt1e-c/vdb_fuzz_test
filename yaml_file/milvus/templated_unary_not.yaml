@@ -1,0 +1,44 @@
+operator_id: templated_unary_not
+family: logical
+syntax_examples:
+  - 'int_field > {x}'
+  - 'not (int_field > {x})'
+  - 'not (meta["num"] > {x})'
+doc_status: family_documented
+doc_source_urls:
+  - "https://milvus.io/docs/filtered-search.md"
+  - "https://milvus.io/docs/basic-operators.md"
+doc_supported_types:
+  - scalar_numeric
+  - json_path_scalar
+  - array_field
+doc_semantics: "Milvus documents filter-expression templates for parameterized filtering; substituting a placeholder with a concrete value should preserve the same predicate semantics as the corresponding literal expression, including when the completed predicate is wrapped by unary NOT."
+doc_notes:
+  - "The checked documentation describes templated filtering at the feature level, but does not spell out special cases for unary NOT over templated predicates."
+  - "Local validation therefore uses literal-vs-templated equivalence as the normative reference, rather than relying on an external SQL oracle for every null case."
+  - "The expanded probe now covers scalar comparisons, JSON-path comparisons, array_length predicates, and JSON/array contains-family predicates."
+verify_status: mismatch_observed
+observed_summary: >-
+  Direct templated predicates such as `int_field in {vals}`, `int_field > {x}`,
+  `(int_field > {x}) and ...`, `meta["num"] > {x}`, `array_length(arr_i) > {n}`,
+  `json_contains_any(meta["nums"], {vals})`, `array_contains_any(arr_i, {vals})`,
+  and `json_contains(meta["tags"], {v})` matched their literal counterparts on
+  the sampled fixed dataset. In contrast, wrapping the same templated predicates
+  with unary `not (...)` produced either wrong result sets or execution errors.
+  Integer comparison paths reproduced `GenericValue::kInt64Val` assertion-style
+  failures, arithmetic/array-length paths reproduced `VAL_NOT_SET` in
+  `BinaryArithOpEvalRangeExpr.cpp`, and JSON/array contains-family predicates
+  returned over-broad result sets such as all non-error rows instead of the
+  correct complement.
+oracle_support:
+  - pandas
+  - pqs
+case_refs: []
+repro_path: "/home/caihao/compare_test/operator_test/milvus/templated_unary_not_operator.py"
+oracle_mapping: >-
+  The oracle first instantiates a literal reference expression by replacing the
+  template placeholder with the concrete test value, then compares that literal
+  query against the templated query with `expr_params`. For unary-NOT probes,
+  the sound reference is therefore `not (literal_predicate)` rather than a
+  handwritten SQL model, which keeps the check focused on template filling and
+  parser/executor equivalence.

@@ -10,7 +10,7 @@ doc_source_urls:
   - "https://milvus.io/docs/boolean.md"
   - "https://milvus.io/docs/basic-operators.md"
 doc_supported_types:
-  - boolean_predicates
+  - unknown
 doc_semantics: "AND combines multiple conditions into a single filter and matches rows only when both subconditions are satisfied; the checked official pages include scalar and JSON-path examples using AND."
 doc_notes:
   - "The checked Filtering Explained page lists AND as a logical operator for combining multiple conditions."

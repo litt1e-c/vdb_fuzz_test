@@ -1,3 +1,4 @@
+import os
 import time
 from pymilvus import (
     Collection,
@@ -9,8 +10,8 @@ from pymilvus import (
 )
 
 
-HOST = "127.0.0.1"
-PORT = "19531"
+HOST = os.getenv("MILVUS_HOST", "127.0.0.1")
+PORT = os.getenv("MILVUS_PORT", "19531")
 COLLECTION_NAME = "not_operator_validation"
 
 
