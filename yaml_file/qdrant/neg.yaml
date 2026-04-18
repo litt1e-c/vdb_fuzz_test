@@ -1,26 +1,23 @@
 operator_id: neg
-family: formula_expression
+family: arithmetic
 syntax_examples:
-  - '{"formula":{"neg":"price"}}'
-  - '{"formula":{"neg":"missing_input"},"defaults":{"missing_input":2.0}}'
-  - '{"formula":{"neg":0.0}}'
-
+- '{"formula":{"neg":"price"}}'
+- '{"formula":{"neg":"missing_input"},"defaults":{"missing_input":2.0}}'
+- '{"formula":{"neg":0.0}}'
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/search-relevance/
-  - https://api.qdrant.tech/api-reference/search/query-points
+- https://qdrant.tech/documentation/concepts/search-relevance/
+- https://api.qdrant.tech/api-reference/search/query-points
 doc_supported_types:
-  - numeric_expression
-doc_semantics: "The checked official search-relevance page lists `neg` as an arithmetic expression that negates an expression within FormulaQuery-based rescoring."
+- scalar_numeric
+doc_semantics: The checked official search-relevance page lists `neg` as an arithmetic expression that negates an expression within FormulaQuery-based rescoring.
 doc_notes:
-  - "The checked concept page does not clearly specify signed-zero formatting, overflow handling, or output precision."
-  - "The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error."
-  - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
-
+- The checked concept page does not clearly specify signed-zero formatting, overflow handling, or output precision.
+- 'The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error.'
+- The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: unary negation flipped sign, negating zero was semantically zero, defaults could supply a missing input, missing inputs without defaults were rejected, and a query containing one overflowing negated candidate was rejected as a whole rather than returning only the finite rows. REST and Python `:memory:` sometimes rendered zero as `-0.0`, while gRPC rendered `0.0`."
+observed_summary: 'On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: unary negation flipped sign, negating zero was semantically zero, defaults could supply a missing input, missing inputs without defaults were rejected, and a query containing one overflowing negated candidate was rejected as a whole rather than returning only the finite rows. REST and Python `:memory:` sometimes rendered zero as `-0.0`, while gRPC rendered `0.0`.'
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/neg_operator.py
-
-oracle_mapping: "`neg` would be mapped to a numeric oracle by evaluating the input expression over the prefetched candidate set, applying unary minus, treating signed zero as ordinary zero for comparison, comparing finite scores with float tolerance, and rejecting missing inputs without defaults or overflowing/non-finite results rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `neg`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim."
+repro_path: ~/compare_test/operator_test/qdrant/formula/neg_operator.py
+oracle_mapping: '`neg` would be mapped to a numeric oracle by evaluating the input expression over the prefetched candidate set, applying unary minus, treating signed zero as ordinary zero for comparison, comparing finite scores with float tolerance, and rejecting missing inputs without defaults or overflowing/non-finite results rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `neg`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim.'

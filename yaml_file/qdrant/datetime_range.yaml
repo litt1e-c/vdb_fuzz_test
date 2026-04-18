@@ -1,30 +1,25 @@
 operator_id: datetime_range
-family: range_condition
+family: range
 syntax_examples:
-  - '{"key":"created_at","range":{"gte":"2024-01-01T00:00:00Z","lt":"2024-02-01T00:00:00Z"}}'
-  - '{"key":"created_at","range":{"gte":"2024-01-01T01:00:00+01:00","lte":"2024-01-01T01:00:00+01:00"}}'
-  - '{"key":"updated_at","range":{"gte":"2024-01-01","lte":"2024-01-01"}}'
-
+- '{"key":"created_at","range":{"gte":"2024-01-01T00:00:00Z","lt":"2024-02-01T00:00:00Z"}}'
+- '{"key":"created_at","range":{"gte":"2024-01-01T01:00:00+01:00","lte":"2024-01-01T01:00:00+01:00"}}'
+- '{"key":"updated_at","range":{"gte":"2024-01-01","lte":"2024-01-01"}}'
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/filtering/
-  - https://qdrant.tech/documentation/concepts/payload/
+- https://qdrant.tech/documentation/concepts/filtering/
+- https://qdrant.tech/documentation/concepts/payload/
 doc_supported_types:
-  - datetime
-doc_semantics: "`datetime_range` constrains datetime payload values with conjunctive `gt`, `gte`, `lt`, and `lte` bounds; the checked docs say there is no need to convert datetimes to Unix timestamps because Qdrant parses supported datetime strings and compares them after converting dates to UTC, and array payloads satisfy the filter if at least one value matches."
+- scalar_datetime
+doc_semantics: '`datetime_range` constrains datetime payload values with conjunctive `gt`, `gte`, `lt`, and `lte` bounds; the checked docs say there is no need to convert datetimes to Unix timestamps because Qdrant parses supported datetime strings and compares them after converting dates to UTC, and array payloads satisfy the filter if at least one value matches.'
 doc_notes:
-  - "Available as of v1.8.0."
-  - "The checked payload docs say supported datetime inputs include date-only values, inputs without a timezone suffix (treated as UTC), lowercase or space-separated `t`/`z`, and timezone offsets written as `Z`, `±HH:MM`, `±HHMM`, or `±HH`."
-  - "The checked payload docs state that a filter is not satisfied when the stored value type does not fit the filtering condition."
-
+- Available as of v1.8.0.
+- The checked payload docs say supported datetime inputs include date-only values, inputs without a timezone suffix (treated as UTC), lowercase or space-separated `t`/`z`, and timezone offsets written as `Z`, `±HH:MM`, `±HHMM`, or `±HH`.
+- The checked payload docs state that a filter is not satisfied when the stored value type does not fit the filtering condition.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched the tested `gt`/`gte`/`lt`/`lte` datetime semantics, normalized equivalent instants across `Z` and `+01:00`, accepted the tested documented `space +0000` storage form and date-only query literal, matched datetime arrays when one element satisfied the range, and excluded missing/null plus the tested integer type-mismatch row."
+observed_summary: On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched the tested `gt`/`gte`/`lt`/`lte` datetime semantics, normalized equivalent instants across `Z` and `+01:00`, accepted the tested documented `space +0000` storage form and date-only query literal, matched datetime arrays when one element satisfied the range, and excluded missing/null plus the tested integer type-mismatch row.
 oracle_support:
-  - scalar canonical UTC datetime payload ranges
-  - "`gt`/`gte`/`lt`/`lte` DatetimeRange predicates"
-  - PQS closed-interval datetime predicates for generated scalar datetime fields
-  - missing/null and tested type-mismatched rows treated as non-matches in the validated subset
+- pqs
+- pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/datetime_range_operator.py
-
-oracle_mapping: "`datetime_range` is mapped to pandas/PQS by parsing generated scalar UTC datetime strings and query bounds with `pd.to_datetime(..., utc=True)` and applying conjunctive `gt`/`gte`/`lt`/`lte`; missing/null and tested non-datetime rows are treated as non-matches, and current main fuzzer coverage is limited to scalar canonical UTC datetime payloads while array any-element behavior is locally validated but not yet generated. This is our oracle assumption, not an official claim."
+repro_path: ~/compare_test/operator_test/qdrant/datetime_range_operator.py
+oracle_mapping: '`datetime_range` is mapped to pandas/PQS by parsing generated scalar UTC datetime strings and query bounds with `pd.to_datetime(..., utc=True)` and applying conjunctive `gt`/`gte`/`lt`/`lte`; missing/null and tested non-datetime rows are treated as non-matches, and current main fuzzer coverage is limited to scalar canonical UTC datetime payloads while array any-element behavior is locally validated but not yet generated. This is our oracle assumption, not an official claim.'

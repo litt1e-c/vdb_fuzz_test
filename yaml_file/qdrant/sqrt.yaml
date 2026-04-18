@@ -1,26 +1,23 @@
 operator_id: sqrt
-family: formula_expression
+family: arithmetic
 syntax_examples:
-  - '{"formula":{"sqrt":"price"}}'
-  - '{"formula":{"sqrt":"missing_input"},"defaults":{"missing_input":25.0}}'
-  - '{"formula":{"sqrt":"neg_price"}}'
-
+- '{"formula":{"sqrt":"price"}}'
+- '{"formula":{"sqrt":"missing_input"},"defaults":{"missing_input":25.0}}'
+- '{"formula":{"sqrt":"neg_price"}}'
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/search-relevance/
-  - https://api.qdrant.tech/api-reference/search/query-points
+- https://qdrant.tech/documentation/concepts/search-relevance/
+- https://api.qdrant.tech/api-reference/search/query-points
 doc_supported_types:
-  - numeric_expression
-doc_semantics: "The checked official search-relevance page lists `sqrt` as an arithmetic expression that computes the square root of an expression within FormulaQuery-based rescoring."
+- scalar_numeric
+doc_semantics: The checked official search-relevance page lists `sqrt` as an arithmetic expression that computes the square root of an expression within FormulaQuery-based rescoring.
 doc_notes:
-  - "The checked concept page does not clearly specify negative-input handling, overflow/non-finite score handling, or output precision."
-  - "The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error."
-  - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
-
+- The checked concept page does not clearly specify negative-input handling, overflow/non-finite score handling, or output precision.
+- 'The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error.'
+- The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: finite non-negative inputs worked, `sqrt(0)` returned 0, defaults could supply a missing input, negative inputs were rejected, and a query containing one square-root result too large for the tested finite score range was rejected as a whole rather than returning only the finite rows."
+observed_summary: 'On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: finite non-negative inputs worked, `sqrt(0)` returned 0, defaults could supply a missing input, negative inputs were rejected, and a query containing one square-root result too large for the tested finite score range was rejected as a whole rather than returning only the finite rows.'
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/sqrt_operator.py
-
-oracle_mapping: "`sqrt` would be mapped to a numeric oracle by evaluating the input expression over the prefetched candidate set, accepting only the currently validated non-negative finite subset, comparing finite scores with float tolerance, and rejecting negative-input or non-finite results rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `sqrt`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim."
+repro_path: ~/compare_test/operator_test/qdrant/formula/sqrt_operator.py
+oracle_mapping: '`sqrt` would be mapped to a numeric oracle by evaluating the input expression over the prefetched candidate set, accepting only the currently validated non-negative finite subset, comparing finite scores with float tolerance, and rejecting negative-input or non-finite results rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `sqrt`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim.'

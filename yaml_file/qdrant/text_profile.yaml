@@ -1,29 +1,25 @@
 operator_id: text_profile
 family: text_search
 syntax_examples:
-  - '{"key":"title","match":{"text":"acao"}} with TextIndexParams(tokenizer=WORD, lowercase=true, ascii_folding=true)'
-  - '{"key":"title","match":{"text":"ROBO"}} with TextIndexParams(tokenizer=PREFIX, lowercase=true, min_token_len=1, max_token_len=4)'
-  - '{"key":"title","match":{"text":"the"}} with TextIndexParams(tokenizer=PREFIX, stopwords.custom=["the"])'
-  - '{"key":"title","match":{"text":"interest"}} with TextIndexParams(tokenizer=WORD, stemmer={type:snowball,language:english})'
-
+- '{"key":"title","match":{"text":"acao"}} with TextIndexParams(tokenizer=WORD, lowercase=true, ascii_folding=true)'
+- '{"key":"title","match":{"text":"ROBO"}} with TextIndexParams(tokenizer=PREFIX, lowercase=true, min_token_len=1, max_token_len=4)'
+- '{"key":"title","match":{"text":"the"}} with TextIndexParams(tokenizer=PREFIX, stopwords.custom=["the"])'
 doc_status: family_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/indexing/
-  - https://qdrant.tech/documentation/concepts/filtering/
+- https://qdrant.tech/documentation/concepts/indexing/
+- https://qdrant.tech/documentation/concepts/filtering/
 doc_supported_types:
-  - scalar_text
-doc_semantics: "Official Qdrant documentation describes text index parameters such as tokenizer, lowercase normalization, ascii folding, stopwords, and stemming for indexed text fields."
+- scalar_text
+doc_semantics: Official Qdrant documentation describes text index parameters such as tokenizer, lowercase normalization, ascii folding, stopwords, and stemming for indexed text fields.
 doc_notes:
-  - "This YAML entry groups several documented text-index profile knobs under one deterministic validation target."
-  - "The intent is to justify future main-fuzzer extensions with deterministic operator evidence, not to fuzz undocumented text semantics directly."
-  - "Phrase matching stays in `text_indexed.yaml`; this file focuses on tokenizer/profile behavior."
-  - "The PREFIX stopword case is intentionally kept because Qdrant source comments/tests state that query-side prefix tokenization should not drop partial stopword prefixes."
-  - "Case-sensitive custom stopwords with lowercase=false were investigated separately and currently live in `history_find_bug/qdrant/poc_qdrant_text_case_sensitive_stopwords_transport_mismatch.py` because REST and gRPC disagreed on the local setup."
-
+- This YAML entry groups several documented text-index profile knobs under one deterministic validation target.
+- The intent is to justify future main-fuzzer extensions with deterministic operator evidence, not to fuzz undocumented text semantics directly.
+- Phrase matching stays in `text_indexed.yaml`; this file focuses on tokenizer/profile behavior.
+- The PREFIX stopword case is intentionally kept because Qdrant source comments/tests state that query-side prefix tokenization should not drop partial stopword prefixes.
+- Case-sensitive custom stopwords with lowercase=false were investigated separately and currently live in `history_find_bug/qdrant/poc_qdrant_text_case_sensitive_stopwords_transport_mismatch.py` because REST and gRPC disagreed on the local setup.
 verify_status: edge_validated
-observed_summary: "This operator is designed to validate explainable text-profile behaviors across REST and gRPC before those behaviors are considered for inclusion in the main random scalar oracle."
+observed_summary: This operator is designed to validate explainable text-profile behaviors across REST and gRPC before those behaviors are considered for inclusion in the main random scalar oracle.
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/text_profile_operator.py
-
-oracle_mapping: "`text_profile` does not use the generic pandas/PQS oracle. It uses deterministic per-profile fixtures with explicit expected IDs so tokenizer/profile failures are reproducible, explainable, and limited to a sound subset."
+repro_path: ~/compare_test/operator_test/qdrant/text_profile_operator.py
+oracle_mapping: '`text_profile` does not use the generic pandas/PQS oracle. It uses deterministic per-profile fixtures with explicit expected IDs so tokenizer/profile failures are reproducible, explainable, and limited to a sound subset.'

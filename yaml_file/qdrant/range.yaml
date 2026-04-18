@@ -27,6 +27,6 @@ oracle_support:
 case_refs:
   - poc_qdrant_issue8538_int64_float_precision_loss
   - poc_qdrant_issue8617_float32_min_boundary_filtering
-repro_path: /home/caihao/compare_test/operator_test/qdrant/range_operator.py
+repro_path: ~/compare_test/operator_test/qdrant/range_operator.py
 
 oracle_mapping: "`range` maps to pandas/PQS numeric comparison with conjunctive `gt`/`gte`/`lt`/`lte` bounds. Scalar rows match by direct comparison, array rows match when any numeric element satisfies the range, and missing/null or tested type-mismatched rows are treated as non-matches. The default random fuzzer excludes known unstable int64 extremes, keeps historically interesting float boundary literals separately tagged as boundary candidates, and models official datetime ranges under the separate `datetime_range` operator."

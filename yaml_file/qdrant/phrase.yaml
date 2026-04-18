@@ -1,29 +1,25 @@
 operator_id: phrase
-family: match_condition
+family: phrase_search
 syntax_examples:
-  - '{"key":"description","match":{"phrase":"brown fox"}}'
-  - '{"key":"title","match":{"phrase":"quick brown"}}'
-  - '{"key":"title","match":{"phrase":"needle token"}}'
-
+- '{"key":"description","match":{"phrase":"brown fox"}}'
+- '{"key":"title","match":{"phrase":"quick brown"}}'
+- '{"key":"title","match":{"phrase":"needle token"}}'
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/filtering/
-  - https://qdrant.tech/documentation/concepts/indexing/
+- https://qdrant.tech/documentation/concepts/filtering/
+- https://qdrant.tech/documentation/concepts/indexing/
 doc_supported_types:
-  - string
-doc_semantics: "`phrase` is documented as a full-text match condition for exact token-phrase comparison within a text field; with a full-text index, the index must have `phrase_matching` enabled, and without a full-text index the condition works as exact substring matching."
+- scalar_text
+doc_semantics: '`phrase` is documented as a full-text match condition for exact token-phrase comparison within a text field; with a full-text index, the index must have `phrase_matching` enabled, and without a full-text index the condition works as exact substring matching.'
 doc_notes:
-  - "Available as of v1.15.0."
-  - "The checked docs state that phrase conditions will not match anything if the full-text index has phrase matching disabled."
-  - "The current fuzzer does not create full-text indexes for STRING fields, so indexed phrase-token semantics are outside current implementation scope."
-
+- Available as of v1.15.0.
+- The checked docs state that phrase conditions will not match anything if the full-text index has phrase matching disabled.
+- The current fuzzer does not create full-text indexes for STRING fields, so indexed phrase-token semantics are outside current implementation scope.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched `MatchPhrase` on present scalar string values as exact contiguous substring matching without a full-text index; reversed or non-contiguous phrases did not match, and missing/null plus the tested non-string row did not satisfy ordinary `phrase` predicates."
+observed_summary: On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched `MatchPhrase` on present scalar string values as exact contiguous substring matching without a full-text index; reversed or non-contiguous phrases did not match, and missing/null plus the tested non-string row did not satisfy ordinary `phrase` predicates.
 oracle_support:
-  - scalar STRING MatchPhrase without full-text index
-  - MatchPhrase generation in the main oracle workflow
-  - MatchPhrase generation in the PQS workflow
+- pqs
+- pandas
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/phrase_operator.py
-
-oracle_mapping: "`phrase` is mapped to pandas/PQS as exact contiguous substring containment on present scalar string values, with missing/null and tested non-string rows treated as non-matches; current fuzzer coverage is limited to the no-full-text-index subset on STRING fields because the fuzzer still creates KEYWORD indexes rather than full-text indexes. This is our oracle assumption, not an official claim."
+repro_path: ~/compare_test/operator_test/qdrant/phrase_operator.py
+oracle_mapping: '`phrase` is mapped to pandas/PQS as exact contiguous substring containment on present scalar string values, with missing/null and tested non-string rows treated as non-matches; current fuzzer coverage is limited to the no-full-text-index subset on STRING fields because the fuzzer still creates KEYWORD indexes rather than full-text indexes. This is our oracle assumption, not an official claim.'

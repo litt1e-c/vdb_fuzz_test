@@ -29,6 +29,6 @@ verify_status: edge_validated
 observed_summary: "On the local validated setup, REST and gRPC both returned the same deterministic answers for keyword, integer, float, bool, datetime, uuid, integer-array, and composite scalar filters before indexing, after explicit payload index creation, and after deleting/recreating those indexes; `scroll`, `count`, and exact `query_points` agreed on the same fixture."
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/filter_index_equivalence_operator.py
+repro_path: ~/compare_test/operator_test/qdrant/filter_index_equivalence_operator.py
 
 oracle_mapping: "`filter_index_equivalence` does not use the generic pandas/PQS oracle. It uses a deterministic fixed-fixture oracle with precomputed expected ID sets and checks that `scroll`, exact `count`, and exact `query_points` stay unchanged across no-index, indexed, and rebuilt-index states. The scope is intentionally limited to documented scalar/filter behavior, not undocumented storage internals."

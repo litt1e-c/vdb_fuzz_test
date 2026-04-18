@@ -44,7 +44,7 @@ DEFAULT_OUTPUT_DIR = Path.home() / "qdrant_artifacts" / "figures" / "qdrant"
 SERIF_PREAMBLE = r"""
 \usepackage{newtxtext,newtxmath}
 \usepackage{pgfplots}
-\usepackage{pgfplotstable}
+\usetikzlibrary{calc}
 \pgfplotsset{compat=1.18}
 \definecolor{timelinecoverage}{HTML}{E76F51}
 \definecolor{timelinelines}{HTML}{264653}
@@ -240,6 +240,8 @@ def prepare_timeline_rows(
     rows: list[dict[str, str]],
     metric_group: str,
     x_field: str,
+    *,
+    prepend_origin: bool,
 ) -> list[dict[str, object]]:
     if metric_group == "overall":
         percent_field = "overall_line_percent"
@@ -254,6 +256,9 @@ def prepare_timeline_rows(
 
     prepared: list[dict[str, object]] = []
     for row in rows:
+        coverage_available = str(row.get("coverage_available", "")).strip().lower()
+        if coverage_available and coverage_available not in {"yes", "true", "1"}:
+            continue
         prepared.append(
             {
                 "x": float_or_zero(row.get(x_field)),
@@ -264,7 +269,47 @@ def prepare_timeline_rows(
             }
         )
     prepared.sort(key=lambda item: (float(item["x"]), str(item["job_name"])))
+    if prepend_origin and prepared:
+        first = prepared[0]
+        first_x = float(first["x"])
+        first_percent = float(first["coverage_percent"])
+        first_lines = int(first["covered_lines"])
+        needs_origin = first_x > 0.0 or first_percent > 0.0 or first_lines > 0
+        if needs_origin:
+            prepared.insert(
+                0,
+                {
+                    "x": 0.0,
+                    "coverage_percent": 0.0,
+                    "covered_lines": 0,
+                    "job_name": "origin",
+                    "job_result": "ORIGIN",
+                },
+            )
     return prepared
+
+
+def expand_step_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    if not rows:
+        return []
+    expanded: list[dict[str, object]] = [dict(rows[0])]
+    previous = rows[0]
+    for current in rows[1:]:
+        current_x = float(current["x"])
+        previous_x = float(previous["x"])
+        if current_x > previous_x:
+            expanded.append(
+                {
+                    "x": current_x,
+                    "coverage_percent": previous["coverage_percent"],
+                    "covered_lines": previous["covered_lines"],
+                    "job_name": current.get("job_name", ""),
+                    "job_result": current.get("job_result", ""),
+                }
+            )
+        expanded.append(dict(current))
+        previous = current
+    return expanded
 
 
 def write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, object]]) -> None:
@@ -281,6 +326,8 @@ def render_timeline_tex(
     title: str,
     subtitle: str,
     x_label: str,
+    x_min: float,
+    x_max: float,
     y_left_max: float,
     y_right_max: int,
     last_x: float,
@@ -290,6 +337,17 @@ def render_timeline_tex(
     title_tex = latex_escape(title)
     subtitle_tex = latex_escape(subtitle)
     x_label_tex = latex_escape(x_label)
+    last_lines_label = latex_escape(f"{int(last_lines):,}")
+    subtitle_block = ""
+    if subtitle.strip():
+        subtitle_block = rf"""
+\node[
+    anchor=north west,
+    font=\scriptsize\itshape,
+    text=chartsubtle,
+    align=left
+] at ($(current bounding box.north west)+(0.12,-0.28)$) {{{subtitle_tex}}};
+"""
     return rf"""
 \documentclass[tikz,border=4pt]{{standalone}}
 {SERIF_PREAMBLE}
@@ -297,18 +355,22 @@ def render_timeline_tex(
 \begin{{tikzpicture}}
 \begin{{axis}}[
     width=13.6cm,
-    height=7.1cm,
+    height=7.8cm,
     axis x line*=bottom,
     axis y line*=left,
-    xmin=0,
+    xmin={x_min:.3f},
+    xmax={x_max:.3f},
     ymin=0,
     ymax={y_left_max:.2f},
+    enlarge x limits={{abs=1.25}},
+    enlarge y limits={{upper, value=0.08}},
     xlabel={{{x_label_tex}}},
-    ylabel={{}},
-    xlabel style={{font=\small}},
+    ylabel={{Coverage (\%)}},
+    xlabel style={{font=\small,text=charttext}},
+    ylabel style={{font=\small,text={TIMELINE_COLOR_COVERAGE}}},
     tick label style={{font=\small,text=chartsubtle}},
     title={{{title_tex}}},
-    title style={{font=\large\bfseries,text=charttext,yshift=0.1em}},
+    title style={{font=\large\bfseries,text=charttext,yshift=-0.2em}},
     grid=major,
     grid style={{draw=chartgrid}},
     major grid style={{draw=chartgrid}},
@@ -320,53 +382,92 @@ def render_timeline_tex(
     xmajorgrids=true,
     x grid style={{draw=chartgrid,dash pattern=on 3pt off 4pt}},
     y grid style={{draw=chartgrid}},
+    legend columns=2,
+    legend cell align=left,
+    legend style={{
+        at={{(0.02,0.98)}},
+        anchor=north west,
+        font=\small,
+        draw=chartgrid,
+        fill=white,
+        fill opacity=0.94,
+        text opacity=1,
+        rounded corners=2pt,
+        /tikz/every even column/.style={{column sep=0.8cm}},
+    }},
+    scaled y ticks=false,
     clip=false,
 ]
 \addplot[
     color={TIMELINE_COLOR_COVERAGE},
     mark=*,
-    mark size=2.7pt,
-    line width=2.6pt,
+    mark size=2.2pt,
+    line width=2.4pt,
     line cap=round,
     line join=round,
 ] table [x=x, y=coverage_percent, col sep=comma] {{{outputs.data_path.as_posix()}}};
-\node[anchor=west,font=\bfseries\footnotesize,text={TIMELINE_COLOR_COVERAGE},xshift=8pt] at (axis cs:{last_x:.6f},{last_percent:.6f}) {{{last_percent:.2f}\%}};
+\addlegendentry{{Coverage (\%)}}
+\addlegendimage{{color={TIMELINE_COLOR_LINES},line width=2.4pt,mark=*,mark size=2.2pt}}
+\addlegendentry{{Covered statements}}
+\node[
+    anchor=west,
+    font=\bfseries\scriptsize,
+    text={TIMELINE_COLOR_COVERAGE},
+    xshift=8pt,
+    yshift=6pt,
+    fill=white,
+    fill opacity=0.9,
+    text opacity=1,
+    rounded corners=2pt,
+    inner xsep=3pt,
+    inner ysep=2pt,
+] at (axis cs:{last_x:.6f},{last_percent:.6f}) {{{last_percent:.2f}\%}};
 \end{{axis}}
 
 \begin{{axis}}[
     width=13.6cm,
-    height=7.1cm,
+    height=7.8cm,
     axis x line=none,
     axis y line*=right,
-    xmin=0,
+    xmin={x_min:.3f},
+    xmax={x_max:.3f},
     ymin=0,
     ymax={y_right_max},
-    ylabel={{}},
+    enlarge x limits={{abs=1.25}},
+    enlarge y limits={{upper, value=0.08}},
+    ylabel={{Covered statements}},
+    ylabel style={{font=\small,text={TIMELINE_COLOR_LINES}}},
     tick label style={{font=\small,text=chartsubtle}},
     ymajorgrids=false,
     line width=1.2pt,
     axis line style={{charttext}},
+    scaled y ticks=false,
+    yticklabel style={{/pgf/number format/fixed,/pgf/number format/1000 sep={{,}}}},
     clip=false,
 ]
 \addplot[
     color={TIMELINE_COLOR_LINES},
     mark=*,
-    mark size=2.7pt,
-    line width=2.6pt,
+    mark size=2.2pt,
+    line width=2.4pt,
     line cap=round,
     line join=round,
 ] table [x=x, y=covered_lines, col sep=comma] {{{outputs.data_path.as_posix()}}};
-\node[anchor=west,font=\bfseries\footnotesize,text={TIMELINE_COLOR_LINES},xshift=8pt,yshift=7pt] at (axis cs:{last_x:.6f},{int(last_lines)}) {{{int(last_lines)}}};
+\node[
+    anchor=west,
+    font=\bfseries\scriptsize,
+    text={TIMELINE_COLOR_LINES},
+    xshift=8pt,
+    yshift=-8pt,
+    fill=white,
+    fill opacity=0.9,
+    text opacity=1,
+    rounded corners=2pt,
+    inner xsep=3pt,
+    inner ysep=2pt,
+] at (axis cs:{last_x:.6f},{int(last_lines)}) {{{last_lines_label}}};
 \end{{axis}}
-
-\node[anchor=north,font=\small\itshape,text=chartsubtle] at (6.8,6.42) {{{subtitle_tex}}};
-\node[anchor=south west,font=\bfseries\footnotesize,text={TIMELINE_COLOR_COVERAGE}] at (0.18,5.98) {{Coverage (\%)}};
-\node[anchor=south east,font=\bfseries\footnotesize,text={TIMELINE_COLOR_LINES}] at (13.43,5.98) {{Covered lines}};
-\draw[{TIMELINE_COLOR_COVERAGE},line width=2.6pt] (10.15,5.78) -- (10.85,5.78);
-\node[anchor=west,font=\normalsize,text=charttext] at (11.05,5.78) {{Coverage (\%)}};
-\draw[{TIMELINE_COLOR_LINES},line width=2.6pt] (10.15,5.44) -- (10.85,5.44);
-\node[anchor=west,font=\normalsize,text=charttext] at (11.05,5.44) {{Covered lines}};
-
+{subtitle_block}
 \end{{tikzpicture}}
 \end{{document}}
 """
@@ -380,7 +481,12 @@ def generate_timeline_figure(args: argparse.Namespace) -> FigureOutputs:
             row["elapsed_minutes"] = f"{float_or_zero(row.get('suite_elapsed_seconds')) / 60.0:.6f}"
 
     x_field, x_label = choose_timeline_x_field(rows, args.x_field)
-    prepared = prepare_timeline_rows(rows, args.metric_group, x_field)
+    prepared = prepare_timeline_rows(
+        rows,
+        args.metric_group,
+        x_field,
+        prepend_origin=args.prepend_origin,
+    )
     if len(prepared) < 2:
         raise SystemExit(f"not enough timeline points for figure: {timeline_csv}")
 
@@ -395,9 +501,19 @@ def generate_timeline_figure(args: argparse.Namespace) -> FigureOutputs:
         png_path=output_dir / f"{basename}.png",
     )
 
-    write_csv_rows(outputs.data_path, ["x", "coverage_percent", "covered_lines", "job_name", "job_result"], prepared)
+    plot_rows = expand_step_rows(prepared)
+    write_csv_rows(outputs.data_path, ["x", "coverage_percent", "covered_lines", "job_name", "job_result"], plot_rows)
     max_percent = max(float(item["coverage_percent"]) for item in prepared)
     max_lines = max(int(item["covered_lines"]) for item in prepared)
+    first_x = float(prepared[0]["x"])
+    last_x = float(prepared[-1]["x"])
+    if first_x > 0.0 and not args.prepend_origin:
+        left_pad = min(5.0, max(1.0, 0.08 * max(last_x - first_x, 1.0)))
+        x_min = max(0.0, first_x - left_pad)
+    else:
+        x_min = 0.0
+    right_pad = min(5.0, max(1.0, 0.05 * max(last_x - x_min, 1.0)))
+    x_max = last_x + right_pad
     y_left_max = max(5.0, round(max_percent * 1.18 + 0.5, 1))
     y_right_max = max(100, int(max_lines * 1.15) + 1)
     last_point = prepared[-1]
@@ -424,6 +540,8 @@ def generate_timeline_figure(args: argparse.Namespace) -> FigureOutputs:
         title=title,
         subtitle=subtitle,
         x_label=x_label,
+        x_min=x_min,
+        x_max=x_max,
         y_left_max=y_left_max,
         y_right_max=y_right_max,
         last_x=last_x,
@@ -597,6 +715,11 @@ def build_parser() -> argparse.ArgumentParser:
     timeline.add_argument("--timeline-csv", required=True, help="Path to coverage_timeline.csv")
     timeline.add_argument("--metric-group", default="scalar_target", help="Coverage group prefix, e.g. scalar_target or overall")
     timeline.add_argument("--x-field", default="auto", help="X-axis field; auto prefers elapsed_minutes, then suite_elapsed_seconds, then step_index")
+    timeline.add_argument(
+        "--prepend-origin",
+        action="store_true",
+        help="Insert a synthetic origin point when the first timeline snapshot starts later than zero",
+    )
     timeline.add_argument("--title", default=None, help="Optional custom title")
     timeline.add_argument("--subtitle", default=None, help="Optional custom subtitle")
     timeline.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Directory for PDF/SVG/PNG/TEX outputs")

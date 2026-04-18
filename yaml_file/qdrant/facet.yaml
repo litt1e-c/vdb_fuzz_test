@@ -1,27 +1,24 @@
 operator_id: facet
 family: other
 syntax_examples:
-  - 'client.facet(collection_name="items", key="brand", limit=10, exact=true)'
-  - 'client.facet(collection_name="items", key="size", facet_filter=Filter(...), exact=true)'
-
+- client.facet(collection_name="items", key="brand", limit=10, exact=true)
+- client.facet(collection_name="items", key="size", facet_filter=Filter(...), exact=true)
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/payload/
-  - https://qdrant.tech/documentation/concepts/filtering/
+- https://qdrant.tech/documentation/concepts/payload/
+- https://qdrant.tech/documentation/concepts/filtering/
 doc_supported_types:
-  - scalar_text
-  - scalar_numeric
-  - scalar_bool
-doc_semantics: "Official Qdrant documentation describes faceting over indexed payload keys, optionally under an additional filter, and returning counts for the most frequent values."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+doc_semantics: Official Qdrant documentation describes faceting over indexed payload keys, optionally under an additional filter, and returning counts for the most frequent values.
 doc_notes:
-  - "This validation target is centered on the documented facet API rather than a generic boolean filter operator."
-  - "The validation scope is limited to indexed scalar fields with deterministic small fixtures."
-  - "Array, missing-field, null, shard, and approximate large-cardinality behaviors are intentionally outside this operator test."
-
+- This validation target is centered on the documented facet API rather than a generic boolean filter operator.
+- The validation scope is limited to indexed scalar fields with deterministic small fixtures.
+- Array, missing-field, null, shard, and approximate large-cardinality behaviors are intentionally outside this operator test.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1/v1.17-compatible API surface, REST and gRPC both returned expected keyword, integer, bool, filtered, and limited facet counts on a deterministic scalar fixture."
+observed_summary: On local Qdrant v1.17.0 with qdrant-client v1.16.1/v1.17-compatible API surface, REST and gRPC both returned expected keyword, integer, bool, filtered, and limited facet counts on a deterministic scalar fixture.
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/facet_operator.py
-
-oracle_mapping: "`facet` does not use the generic pandas/PQS oracle. It uses a deterministic count oracle over present indexed scalar values after applying the same validated scalar filter, while deliberately excluding approximate, distributed, missing/null, and array facet semantics."
+repro_path: ~/compare_test/operator_test/qdrant/facet_operator.py
+oracle_mapping: '`facet` does not use the generic pandas/PQS oracle. It uses a deterministic count oracle over present indexed scalar values after applying the same validated scalar filter, while deliberately excluding approximate, distributed, missing/null, and array facet semantics.'

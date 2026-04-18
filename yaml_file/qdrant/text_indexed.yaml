@@ -20,6 +20,6 @@ verify_status: edge_validated
 observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.16.1/v1.17-compatible API surface, REST and gRPC both matched single WORD tokens, did not match partial tokens, and matched contiguous phrases when phrase_matching=true."
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/text_indexed_operator.py
+repro_path: ~/compare_test/operator_test/qdrant/text_indexed_operator.py
 
 oracle_mapping: "`text_indexed` does not use the generic pandas/PQS oracle. It uses a deterministic token oracle over lowercase WORD tokens plus contiguous phrase token sequences, with the sound subset limited to the indexed-text cases validated here."

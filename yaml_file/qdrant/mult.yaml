@@ -1,26 +1,23 @@
 operator_id: mult
-family: formula_expression
+family: arithmetic
 syntax_examples:
-  - '{"formula":{"mult":["price","weight"]}}'
-  - '{"formula":{"mult":[0.0,"missing_factor"]}}'
-  - '{"formula":{"mult":["missing_factor",2.0]},"defaults":{"missing_factor":3.0}}'
-
+- '{"formula":{"mult":["price","weight"]}}'
+- '{"formula":{"mult":[0.0,"missing_factor"]}}'
+- '{"formula":{"mult":["missing_factor",2.0]},"defaults":{"missing_factor":3.0}}'
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/search-relevance/
-  - https://api.qdrant.tech/api-reference/search/query-points
+- https://qdrant.tech/documentation/concepts/search-relevance/
+- https://api.qdrant.tech/api-reference/search/query-points
 doc_supported_types:
-  - numeric_expression
-doc_semantics: "The checked official search-relevance page lists `mult` as an arithmetic expression that multiplies an array of expressions within FormulaQuery-based rescoring, and it states that multiplication and division are lazily evaluated so if a `0` is encountered the rest of the operations do not execute."
+- scalar_numeric
+doc_semantics: The checked official search-relevance page lists `mult` as an arithmetic expression that multiplies an array of expressions within FormulaQuery-based rescoring, and it states that multiplication and division are lazily evaluated so if a `0` is encountered the rest of the operations do not execute.
 doc_notes:
-  - "The checked concept page does not clearly specify whether lazy multiplication is order-sensitive, how underflow is handled, or how overflow/non-finite scores are handled."
-  - "The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error."
-  - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
-
+- The checked concept page does not clearly specify whether lazy multiplication is order-sensitive, how underflow is handled, or how overflow/non-finite scores are handled.
+- 'The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error.'
+- The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary multiplication worked, negative factors propagated sign, a zero factor short-circuited evaluation when encountered before a later missing factor, a missing factor before a later zero still raised an error, defaults could supply a missing factor, very small products underflowed to 0 without an error, and a query containing one overflowing product was rejected as a whole rather than returning only the finite rows."
+observed_summary: 'On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: ordinary multiplication worked, negative factors propagated sign, a zero factor short-circuited evaluation when encountered before a later missing factor, a missing factor before a later zero still raised an error, defaults could supply a missing factor, very small products underflowed to 0 without an error, and a query containing one overflowing product was rejected as a whole rather than returning only the finite rows.'
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/mult_operator.py
-
-oracle_mapping: "`mult` would be mapped to a numeric oracle by evaluating factors left-to-right over the prefetched candidate set, short-circuiting to 0 only once an actual zero factor is encountered, allowing finite sign propagation and tiny products that underflow to 0, comparing finite scores with float tolerance, and rejecting missing-before-zero or overflowing/non-finite products rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `mult`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim."
+repro_path: ~/compare_test/operator_test/qdrant/formula/mult_operator.py
+oracle_mapping: '`mult` would be mapped to a numeric oracle by evaluating factors left-to-right over the prefetched candidate set, short-circuiting to 0 only once an actual zero factor is encountered, allowing finite sign propagation and tiny products that underflow to 0, comparing finite scores with float tolerance, and rejecting missing-before-zero or overflowing/non-finite products rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `mult`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim.'

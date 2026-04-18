@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import http.client
 import json
+import math
 import os
 import re
 import shlex
@@ -47,6 +50,7 @@ DEFAULT_FORMULA_OPERATOR = SCRIPT_DIR / "operator_test" / "qdrant" / "formula" /
 DEFAULT_SCALAR_OPERATOR = SCRIPT_DIR / "operator_test" / "qdrant" / "scalar_operator_suite.py"
 DEFAULT_PERSISTENT_INDEX_OPERATOR = SCRIPT_DIR / "operator_test" / "qdrant" / "persistent_index_operator.py"
 DEFAULT_IGNORE_REGEX = r"(/\.cargo/|/rustc/|/registry/src/|/cargo/registry/|/usr/share/cargo/registry/|/git/checkouts/|/\.cargo-local/)"
+DEFAULT_FIGURE_SCRIPT = SCRIPT_DIR / "gen_qdrant_timeline_figure.py"
 DEFAULT_EXPERIMENT_ROOT = Path(
     os.environ.get("QDRANT_EXPERIMENT_ROOT", str(Path.home() / "qdrant_artifacts"))
 ).expanduser().resolve()
@@ -491,6 +495,8 @@ def port_ready(host: str, port: int, timeout_seconds: float) -> bool:
                 pass
             except TimeoutError:
                 pass
+            except (ConnectionError, OSError, http.client.HTTPException):
+                pass
         time.sleep(1.0)
     return False
 
@@ -552,7 +558,7 @@ def build_suite_command(
     return cmd
 
 
-def run_command(command: list[str], log_path: Path) -> tuple[int, float]:
+def run_command(command: list[str], log_path: Path, timeout_seconds: float | None = None) -> tuple[int, float]:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     started = time.time()
     with log_path.open("w", encoding="utf-8") as fout:
@@ -561,8 +567,26 @@ def run_command(command: list[str], log_path: Path) -> tuple[int, float]:
             cwd=str(SCRIPT_DIR),
             stdout=fout,
             stderr=subprocess.STDOUT,
+            start_new_session=True,
         )
-        exit_code = proc.wait()
+        try:
+            exit_code = proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            fout.write(f"\n[TIMEOUT] command exceeded {timeout_seconds:.1f}s; terminating process group\n")
+            fout.flush()
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                proc.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.wait(timeout=10)
+            exit_code = 124
     return exit_code, time.time() - started
 
 
@@ -662,11 +686,11 @@ def build_targeted_oracle_command(
         str(args.grpc_port),
         "--prefer-grpc",
         "--read-consistency",
-        "random",
+        args.read_consistency,
         "--write-ordering",
-        "random",
-        "--evo-null-sync",
-        "--include-known-int64-boundaries",
+        args.write_ordering,
+        "--scalar-depth-profile",
+        "oracle-scalar",
         "--log-dir",
         str(oracle_log_dir),
     ]
@@ -770,6 +794,906 @@ def build_persistent_index_command(
         str(state_path),
     ]
     return cmd
+
+
+def stable_hash_value(*parts: object) -> int:
+    payload = "|".join(str(part) for part in parts).encode("utf-8")
+    digest = hashlib.sha256(payload).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=False)
+
+
+def stable_seed(*parts: object, modulo: int = 2**31 - 1) -> int:
+    value = stable_hash_value(*parts)
+    if modulo > 0:
+        value %= modulo
+    return value or 1
+
+
+def build_budget_oracle_command(
+    python_bin: str,
+    oracle_path: Path,
+    args: argparse.Namespace,
+    *,
+    mode: str,
+    rounds: int,
+    seed: int,
+    rows: int,
+    dim: int,
+    batch_size: int,
+    sleep_interval: float,
+    log_dir: Path,
+    run_id: str,
+    prefer_grpc: bool = False,
+    read_consistency: str = "random",
+    write_ordering: str = "random",
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    cmd = [python_bin, str(oracle_path)]
+    mode_flag = {
+        "oracle": "--oracle",
+        "equiv": "--equiv",
+        "pqs": "--pqs",
+        "group": "--group",
+    }.get(mode)
+    if mode_flag is None:
+        raise ValueError(f"unsupported oracle mode: {mode}")
+    cmd.append(mode_flag)
+    if mode == "pqs":
+        cmd += ["--pqs-rounds", str(rounds)]
+    else:
+        cmd += ["--rounds", str(rounds)]
+    cmd += [
+        "--seed",
+        str(seed),
+        "-N",
+        str(rows),
+        "--dim",
+        str(dim),
+        "--batch-size",
+        str(batch_size),
+        "--sleep-interval",
+        str(sleep_interval),
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--grpc-port",
+        str(args.grpc_port),
+        "--read-consistency",
+        read_consistency,
+        "--write-ordering",
+        write_ordering,
+        "--log-dir",
+        str(log_dir),
+        "--run-id",
+        run_id,
+    ]
+    if prefer_grpc:
+        cmd.append("--prefer-grpc")
+    if extra_args:
+        cmd.extend(extra_args)
+    return cmd
+
+
+def build_budget_vector_command(
+    python_bin: str,
+    vector_runner: Path,
+    args: argparse.Namespace,
+    *,
+    rounds: int,
+    seed: int,
+    rows: int,
+    dim: int,
+    dynamic: bool,
+    log_dir: Path,
+    run_id: str,
+    prefer_grpc: bool = False,
+    extra_args: list[str] | None = None,
+) -> list[str]:
+    cmd = [
+        python_bin,
+        str(vector_runner),
+        "--host",
+        args.host,
+        "--port",
+        str(args.port),
+        "--grpc-port",
+        str(args.grpc_port),
+        "--rounds",
+        str(rounds),
+        "--seed",
+        str(seed),
+        "-N",
+        str(rows),
+        "--dim",
+        str(dim),
+        "--log-dir",
+        str(log_dir),
+        "--run-id",
+        run_id,
+    ]
+    if dynamic:
+        cmd.append("--dynamic")
+    if prefer_grpc:
+        cmd.append("--prefer-grpc")
+    if extra_args:
+        cmd.extend(extra_args)
+    return cmd
+
+
+def select_budget_template(
+    templates: list[dict[str, object]],
+    *,
+    budget_seed: int,
+    index: int,
+    schedule: str,
+) -> dict[str, object]:
+    if schedule == "cycle":
+        return templates[(index - 1) % len(templates)]
+    if schedule == "random":
+        weights: list[int] = [max(1, int(template.get("weight") or 1)) for template in templates]
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            template_index = stable_hash_value("qdrant-budget-template", budget_seed, index, len(templates)) % len(templates)
+            return templates[template_index]
+        pick = stable_hash_value("qdrant-budget-template", budget_seed, index, len(templates), total_weight) % total_weight
+        for template, weight in zip(templates, weights):
+            if pick < weight:
+                return template
+            pick -= weight
+        return templates[-1]
+    raise ValueError(f"unsupported budget schedule: {schedule}")
+
+
+def materialize_budget_job_spec(
+    template: dict[str, object],
+    *,
+    global_index: int,
+    budget_seed: int,
+    args: argparse.Namespace,
+    python_bin: str,
+    oracle_path: Path,
+    vector_runner: Path,
+    scalar_operator_runner: Path,
+    persistent_index_runner: Path,
+    facet_operator_runner: Path,
+    text_indexed_operator_runner: Path,
+    text_profile_operator_runner: Path,
+    formula_operator_runner: Path,
+    log_dir: Path,
+    persistent_index_state_path: Path,
+) -> dict[str, object]:
+    template_type = str(template["type"])
+    template_name = str(template["name"])
+    label = f"{global_index:03d}_{slugify(template_name, max_len=48)}"
+    run_id = f"{args.run_id or 'qdrant-cov'}-budget-{label}"
+    log_path = log_dir / "budget_jobs" / f"{label}.log"
+    estimated_seconds = float(template.get("estimated_seconds") or 0.0)
+    timeout_seconds = float(
+        template.get("timeout_seconds")
+        or (max(120.0, estimated_seconds * 3.0, estimated_seconds + 120.0) if estimated_seconds > 0 else 0.0)
+    )
+    blocking = bool(template.get("blocking", False))
+    restart_server_after = bool(template.get("restart_server_after", False))
+    extra_args = list(template.get("extra_args") or [])
+
+    if template_type == "oracle":
+        seed = int(template.get("seed") or stable_seed("qdrant-budget-oracle-seed", budget_seed, template_name, global_index))
+        command = build_budget_oracle_command(
+            python_bin=python_bin,
+            oracle_path=oracle_path,
+            args=args,
+            mode=str(template["mode"]),
+            rounds=int(template["rounds"]),
+            seed=seed,
+            rows=int(template["rows"]),
+            dim=int(template["dim"]),
+            batch_size=int(template.get("batch_size") or 200),
+            sleep_interval=float(template.get("sleep_interval") or 0.0),
+            log_dir=log_dir / "oracle_logs" / "budget" / label,
+            run_id=run_id,
+            prefer_grpc=bool(template.get("prefer_grpc", False)),
+            read_consistency=str(template.get("read_consistency") or "random"),
+            write_ordering=str(template.get("write_ordering") or "random"),
+            extra_args=extra_args,
+        )
+        analyzer = analyze_oracle_log
+    elif template_type == "vector":
+        seed = int(template.get("seed") or stable_seed("qdrant-budget-vector-seed", budget_seed, template_name, global_index))
+        command = build_budget_vector_command(
+            python_bin=python_bin,
+            vector_runner=vector_runner,
+            args=args,
+            rounds=int(template["rounds"]),
+            seed=seed,
+            rows=int(template["rows"]),
+            dim=int(template["dim"]),
+            dynamic=bool(template.get("dynamic", False)),
+            log_dir=log_dir / "vector_logs" / "budget" / label,
+            run_id=run_id,
+            prefer_grpc=bool(template.get("prefer_grpc", False)),
+            extra_args=extra_args,
+        )
+        analyzer = analyze_vector_log
+    elif template_type == "operator":
+        runner_key = str(template["runner_key"])
+        operator_runner = {
+            "scalar": scalar_operator_runner,
+            "facet": facet_operator_runner,
+            "text_indexed": text_indexed_operator_runner,
+            "text_profile": text_profile_operator_runner,
+            "formula": formula_operator_runner,
+        }.get(runner_key)
+        if operator_runner is None:
+            raise ValueError(f"unsupported operator runner_key: {runner_key}")
+        command = build_operator_command(
+            python_bin=python_bin,
+            operator_runner=operator_runner,
+            args=args,
+            raw_args=shlex.join(extra_args) if extra_args else None,
+            run_id=run_id,
+        )
+        analyzer = analyze_operator_log
+    elif template_type == "persistent":
+        command = build_persistent_index_command(
+            python_bin=python_bin,
+            operator_runner=persistent_index_runner,
+            args=args,
+            phase=str(template["phase"]),
+            state_path=persistent_index_state_path,
+            raw_args=shlex.join(extra_args) if extra_args else None,
+            run_id=run_id,
+        )
+        analyzer = analyze_operator_log
+    else:
+        raise ValueError(f"unsupported budget template type: {template_type}")
+
+    return {
+        "name": template_name,
+        "command": command,
+        "log_path": log_path,
+        "analyzer": analyzer,
+        "blocking": blocking,
+        "restart_server_after": restart_server_after,
+        "estimated_seconds": estimated_seconds,
+        "timeout_seconds": timeout_seconds or None,
+    }
+
+
+def build_budget_job_specs(
+    *,
+    args: argparse.Namespace,
+    python_bin: str,
+    oracle_path: Path,
+    vector_runner: Path,
+    scalar_operator_runner: Path,
+    persistent_index_runner: Path,
+    facet_operator_runner: Path,
+    text_indexed_operator_runner: Path,
+    text_profile_operator_runner: Path,
+    formula_operator_runner: Path,
+    log_dir: Path,
+    persistent_index_state_path: Path,
+) -> tuple[list[dict[str, object]], int]:
+    run_id = args.run_id or "qdrant-cov"
+    budget_seed = int(args.budget_seed) if args.budget_seed is not None else stable_seed("qdrant-budget-seed", run_id)
+    profile_by_mode = {
+        "oracle": "oracle-scalar",
+        "pqs": "pqs-scalar",
+        "equiv": "equiv-scalar",
+        "group": "group-scalar",
+    }
+    effective_experimental_scalar_operators = (
+        "robustness" if args.experimental_scalar_operators is None else str(args.experimental_scalar_operators).strip()
+    )
+    if not effective_experimental_scalar_operators:
+        effective_experimental_scalar_operators = None
+
+    def normalize_budget_oracle_templates(templates: list[dict[str, object]]) -> None:
+        for template in templates:
+            if template.get("type") != "oracle":
+                continue
+            if str(template.get("read_consistency") or "random") == "random":
+                template["read_consistency"] = args.read_consistency
+            if str(template.get("write_ordering") or "random") == "random":
+                template["write_ordering"] = args.write_ordering
+            extra_args = list(template.get("extra_args") or [])
+            template_name = str(template.get("name") or "")
+            if "int64" not in template_name:
+                extra_args = [item for item in extra_args if item != "--include-known-int64-boundaries"]
+            extra_args = [item for item in extra_args if item != "--evo-null-sync"]
+            if "--scalar-depth-profile" not in extra_args:
+                profile = profile_by_mode.get(str(template.get("mode")), "oracle-scalar")
+                extra_args.extend(["--scalar-depth-profile", profile])
+            if args.budget_oracle_args:
+                extra_args.extend(shlex.split(args.budget_oracle_args))
+            template["extra_args"] = extra_args
+
+    preheat_templates: list[dict[str, object]] = [
+        {
+            "type": "oracle",
+            "name": "budget-preheat-oracle-rest-core",
+            "mode": "oracle",
+            "rounds": 10,
+            "rows": 1200,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--evo-null-sync", "--include-known-int64-boundaries"],
+            "estimated_seconds": 90,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-preheat-oracle-grpc-core",
+            "mode": "oracle",
+            "rounds": 10,
+            "rows": 1200,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": True,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--evo-null-sync", "--include-known-int64-boundaries"],
+            "estimated_seconds": 90,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-preheat-oracle-rest-payload-mutations",
+            "mode": "oracle",
+            "rounds": 10,
+            "rows": 1000,
+            "dim": 128,
+            "batch_size": 180,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--payload-mutations"],
+            "estimated_seconds": 80,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-preheat-oracle-rest-paged",
+            "mode": "oracle",
+            "rounds": 8,
+            "rows": 1000,
+            "dim": 128,
+            "batch_size": 180,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--scroll-mode", "paged"],
+            "estimated_seconds": 120,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-preheat-pqs-rest-dynamic",
+            "mode": "pqs",
+            "rounds": 8,
+            "rows": 900,
+            "dim": 128,
+            "batch_size": 180,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic"],
+            "estimated_seconds": 110,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-preheat-group-rest-dynamic",
+            "mode": "group",
+            "rounds": 8,
+            "rows": 1000,
+            "dim": 128,
+            "batch_size": 180,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic"],
+            "estimated_seconds": 85,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-preheat-equiv-rest-dynamic",
+            "mode": "equiv",
+            "rounds": 3,
+            "rows": 600,
+            "dim": 128,
+            "batch_size": 160,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic"],
+            "estimated_seconds": 150,
+            "blocking": False,
+        },
+    ]
+
+    if not args.skip_vector:
+        preheat_templates.extend(
+            [
+                {
+                    "type": "vector",
+                    "name": "budget-preheat-vector-rest-dynamic",
+                    "rounds": 40,
+                    "rows": 1300,
+                    "dim": 96,
+                    "dynamic": True,
+                    "prefer_grpc": False,
+                    "estimated_seconds": 35,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-preheat-vector-grpc-dynamic",
+                    "rounds": 40,
+                    "rows": 1300,
+                    "dim": 96,
+                    "dynamic": True,
+                    "prefer_grpc": True,
+                    "estimated_seconds": 35,
+                    "blocking": False,
+                },
+            ]
+        )
+
+    if not args.skip_scalar_operator:
+        preheat_templates.append(
+            {
+                "type": "operator",
+                "name": "budget-preheat-scalar-operator-suite",
+                "runner_key": "scalar",
+                "estimated_seconds": 25,
+                "blocking": True,
+            }
+        )
+        if effective_experimental_scalar_operators:
+            experimental_scalar_extra_args = ["--operators", effective_experimental_scalar_operators]
+            if args.experimental_scalar_args:
+                experimental_scalar_extra_args.extend(shlex.split(args.experimental_scalar_args))
+            preheat_templates.append(
+                {
+                    "type": "operator",
+                    "name": "budget-preheat-scalar-robustness",
+                    "runner_key": "scalar",
+                    "extra_args": experimental_scalar_extra_args,
+                    "estimated_seconds": 15,
+                    "blocking": bool(args.experimental_scalar_blocking),
+                }
+            )
+    if not args.skip_facet_operator:
+        preheat_templates.append(
+            {
+                "type": "operator",
+                "name": "budget-preheat-facet-operator",
+                "runner_key": "facet",
+                "estimated_seconds": 8,
+                "blocking": True,
+            }
+        )
+    if not args.skip_text_indexed_operator:
+        preheat_templates.append(
+            {
+                "type": "operator",
+                "name": "budget-preheat-text-indexed-operator",
+                "runner_key": "text_indexed",
+                "estimated_seconds": 8,
+                "blocking": True,
+            }
+        )
+    if not args.skip_text_profile_operator:
+        preheat_templates.append(
+            {
+                "type": "operator",
+                "name": "budget-preheat-text-profile-operator",
+                "runner_key": "text_profile",
+                "estimated_seconds": 8,
+                "blocking": True,
+            }
+        )
+    if not args.skip_formula_operator:
+        preheat_templates.append(
+            {
+                "type": "operator",
+                "name": "budget-preheat-formula-operator",
+                "runner_key": "formula",
+                "estimated_seconds": 12,
+                "blocking": True,
+            }
+        )
+    if not args.skip_persistent_index:
+        preheat_templates.extend(
+            [
+                {
+                    "type": "persistent",
+                    "name": "budget-preheat-persistent-index-prepare",
+                    "phase": "prepare",
+                    "estimated_seconds": 12,
+                    "blocking": True,
+                    "restart_server_after": True,
+                },
+                {
+                    "type": "persistent",
+                    "name": "budget-preheat-persistent-index-verify",
+                    "phase": "verify",
+                    "estimated_seconds": 12,
+                    "blocking": True,
+                },
+            ]
+        )
+
+    fill_templates: list[dict[str, object]] = [
+        {
+            "type": "oracle",
+            "name": "budget-fill-oracle-rest-core",
+            "mode": "oracle",
+            "rounds": 12,
+            "rows": 1500,
+            "dim": 128,
+            "batch_size": 220,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--evo-null-sync", "--include-known-int64-boundaries"],
+            "estimated_seconds": 120,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-oracle-grpc-core",
+            "mode": "oracle",
+            "rounds": 12,
+            "rows": 1500,
+            "dim": 128,
+            "batch_size": 220,
+            "sleep_interval": 0.0,
+            "prefer_grpc": True,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--evo-null-sync", "--include-known-int64-boundaries"],
+            "estimated_seconds": 120,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-oracle-rest-payload-mutations",
+            "mode": "oracle",
+            "rounds": 12,
+            "rows": 1400,
+            "dim": 128,
+            "batch_size": 220,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--payload-mutations"],
+            "estimated_seconds": 100,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-oracle-grpc-payload-mutations",
+            "mode": "oracle",
+            "rounds": 12,
+            "rows": 1400,
+            "dim": 128,
+            "batch_size": 220,
+            "sleep_interval": 0.0,
+            "prefer_grpc": True,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--payload-mutations"],
+            "estimated_seconds": 100,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-oracle-rest-paged",
+            "mode": "oracle",
+            "rounds": 10,
+            "rows": 1200,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--scroll-mode", "paged"],
+            "estimated_seconds": 140,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-pqs-rest-dynamic",
+            "mode": "pqs",
+            "rounds": 10,
+            "rows": 1000,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic"],
+            "estimated_seconds": 140,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-pqs-grpc-dynamic",
+            "mode": "pqs",
+            "rounds": 10,
+            "rows": 1000,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": True,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic"],
+            "estimated_seconds": 130,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-group-rest-dynamic",
+            "mode": "group",
+            "rounds": 10,
+            "rows": 1100,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic"],
+            "estimated_seconds": 95,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-equiv-rest-dynamic",
+            "mode": "equiv",
+            "rounds": 4,
+            "rows": 750,
+            "dim": 128,
+            "batch_size": 180,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic"],
+            "estimated_seconds": 190,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-oracle-rest-chaos",
+            "mode": "oracle",
+            "rounds": 10,
+            "rows": 1000,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--dynamic", "--chaos-rate", "0.2"],
+            "estimated_seconds": 95,
+            "blocking": False,
+        },
+        {
+            "type": "oracle",
+            "name": "budget-fill-oracle-rest-int64",
+            "mode": "oracle",
+            "rounds": 10,
+            "rows": 1100,
+            "dim": 128,
+            "batch_size": 200,
+            "sleep_interval": 0.0,
+            "prefer_grpc": False,
+            "read_consistency": "random",
+            "write_ordering": "random",
+            "extra_args": ["--include-known-int64-boundaries"],
+            "estimated_seconds": 80,
+            "blocking": False,
+        },
+    ]
+
+    if not args.skip_vector:
+        fill_templates.extend(
+            [
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-rest-dynamic",
+                    "rounds": 60,
+                    "rows": 1400,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": False,
+                    "estimated_seconds": 45,
+                    "weight": 1,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-grpc-dynamic",
+                    "rounds": 60,
+                    "rows": 1400,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": True,
+                    "estimated_seconds": 45,
+                    "weight": 1,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-rest-static",
+                    "rounds": 48,
+                    "rows": 1200,
+                    "dim": 96,
+                    "dynamic": False,
+                    "prefer_grpc": False,
+                    "estimated_seconds": 30,
+                    "weight": 1,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-rest-dynamic-r150",
+                    "rounds": 150,
+                    "rows": 1500,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": False,
+                    "estimated_seconds": 95,
+                    "weight": 3,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-grpc-dynamic-r150",
+                    "rounds": 150,
+                    "rows": 1500,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": True,
+                    "estimated_seconds": 95,
+                    "weight": 3,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-rest-dynamic-r300",
+                    "rounds": 300,
+                    "rows": 1600,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": False,
+                    "estimated_seconds": 180,
+                    "weight": 5,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-grpc-dynamic-r300",
+                    "rounds": 300,
+                    "rows": 1600,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": True,
+                    "estimated_seconds": 180,
+                    "weight": 5,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-rest-dynamic-r500",
+                    "rounds": 500,
+                    "rows": 1600,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": False,
+                    "estimated_seconds": 300,
+                    "weight": 6,
+                    "blocking": False,
+                },
+                {
+                    "type": "vector",
+                    "name": "budget-fill-vector-grpc-dynamic-r500",
+                    "rounds": 500,
+                    "rows": 1600,
+                    "dim": 128,
+                    "dynamic": True,
+                    "prefer_grpc": True,
+                    "estimated_seconds": 300,
+                    "weight": 6,
+                    "blocking": False,
+                },
+            ]
+        )
+
+    normalize_budget_oracle_templates(preheat_templates)
+    normalize_budget_oracle_templates(fill_templates)
+
+    job_specs: list[dict[str, object]] = []
+    for index, template in enumerate(preheat_templates, start=1):
+        job_specs.append(
+            materialize_budget_job_spec(
+                template,
+                global_index=index,
+                budget_seed=budget_seed,
+                args=args,
+                python_bin=python_bin,
+                oracle_path=oracle_path,
+                vector_runner=vector_runner,
+                scalar_operator_runner=scalar_operator_runner,
+                persistent_index_runner=persistent_index_runner,
+                facet_operator_runner=facet_operator_runner,
+                text_indexed_operator_runner=text_indexed_operator_runner,
+                text_profile_operator_runner=text_profile_operator_runner,
+                formula_operator_runner=formula_operator_runner,
+                log_dir=log_dir,
+                persistent_index_state_path=persistent_index_state_path,
+            )
+        )
+
+    fill_index = 1
+    planned_fill_jobs = int(
+        math.ceil(
+            (float(args.time_budget_seconds) / max(0.5, float(args.budget_min_fill_job_seconds)))
+            * float(args.budget_fill_overprovision)
+        )
+    )
+    min_fill_jobs = max(len(fill_templates) * 2, planned_fill_jobs)
+    max_planned_jobs = max(len(preheat_templates) + 1, int(args.budget_max_planned_jobs))
+    target_total_jobs = min(max_planned_jobs, len(preheat_templates) + max(1, min_fill_jobs))
+    while len(job_specs) < target_total_jobs:
+        template = select_budget_template(
+            fill_templates,
+            budget_seed=budget_seed,
+            index=fill_index,
+            schedule=args.budget_schedule,
+        )
+        job_specs.append(
+            materialize_budget_job_spec(
+                template,
+                global_index=len(job_specs) + 1,
+                budget_seed=budget_seed,
+                args=args,
+                python_bin=python_bin,
+                oracle_path=oracle_path,
+                vector_runner=vector_runner,
+                scalar_operator_runner=scalar_operator_runner,
+                persistent_index_runner=persistent_index_runner,
+                facet_operator_runner=facet_operator_runner,
+                text_indexed_operator_runner=text_indexed_operator_runner,
+                text_profile_operator_runner=text_profile_operator_runner,
+                formula_operator_runner=formula_operator_runner,
+                log_dir=log_dir,
+                persistent_index_state_path=persistent_index_state_path,
+            )
+        )
+        fill_index += 1
+
+    return job_specs, budget_seed
 
 
 def resolve_binary_path(args: argparse.Namespace, qdrant_src: Path) -> Path:
@@ -1112,12 +2036,160 @@ def build_case_results_rows(job_results: list[dict[str, object]], scalar_suite_c
     return rows
 
 
+def expected_figure_outputs(output_dir: Path, basename: str) -> list[Path]:
+    return [
+        output_dir / f"{basename}.tex",
+        output_dir / f"{basename}.data.csv",
+        output_dir / f"{basename}.pdf",
+        output_dir / f"{basename}.svg",
+        output_dir / f"{basename}.png",
+    ]
+
+
+def generate_qdrant_figure_artifacts(
+    *,
+    python_bin: str,
+    figure_script: Path,
+    summary_json_path: Path,
+    timeline_csv_path: Path | None,
+    output_dir: Path,
+    manifest_path: Path,
+    log_path: Path,
+) -> dict[str, object]:
+    manifest: dict[str, object] = {
+        "enabled": True,
+        "ok": False,
+        "script": str(figure_script),
+        "output_dir": str(output_dir),
+        "manifest_path": str(manifest_path),
+        "log_path": str(log_path),
+        "figures": [],
+        "failed": [],
+    }
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if not figure_script.exists():
+        manifest["detail"] = f"figure script not found: {figure_script}"
+        write_summary_json(manifest_path, manifest)
+        return manifest
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    figure_specs: list[dict[str, object]] = []
+    if timeline_csv_path and timeline_csv_path.exists():
+        figure_specs.extend(
+            [
+                {
+                    "name": "scalar-target-timeline",
+                    "basename": "fig_qdrant_scalar_timeline",
+                    "command": [
+                        python_bin,
+                        str(figure_script),
+                        "timeline",
+                        "--timeline-csv",
+                        str(timeline_csv_path),
+                        "--metric-group",
+                        "scalar_target",
+                        "--prepend-origin",
+                        "--x-field",
+                        "auto",
+                        "--output-dir",
+                        str(output_dir),
+                        "--basename",
+                        "fig_qdrant_scalar_timeline",
+                    ],
+                },
+                {
+                    "name": "overall-timeline",
+                    "basename": "fig_qdrant_overall_timeline",
+                    "command": [
+                        python_bin,
+                        str(figure_script),
+                        "timeline",
+                        "--timeline-csv",
+                        str(timeline_csv_path),
+                        "--metric-group",
+                        "overall",
+                        "--prepend-origin",
+                        "--x-field",
+                        "auto",
+                        "--output-dir",
+                        str(output_dir),
+                        "--basename",
+                        "fig_qdrant_overall_timeline",
+                    ],
+                },
+            ]
+        )
+    if summary_json_path.exists():
+        figure_specs.append(
+            {
+                "name": "scalar-subsystem-summary",
+                "basename": "fig_qdrant_scalar_subsystem_summary",
+                "command": [
+                    python_bin,
+                    str(figure_script),
+                    "summary-groups",
+                    "--summary-json",
+                    str(summary_json_path),
+                    "--output-dir",
+                    str(output_dir),
+                    "--basename",
+                    "fig_qdrant_scalar_subsystem_summary",
+                ],
+            }
+        )
+
+    if not figure_specs:
+        manifest["detail"] = "no timeline CSV or summary JSON available for figure generation"
+        write_summary_json(manifest_path, manifest)
+        return manifest
+
+    with log_path.open("w", encoding="utf-8") as flog:
+        for spec in figure_specs:
+            command = list(spec["command"])
+            basename = str(spec["basename"])
+            expected_outputs = expected_figure_outputs(output_dir, basename)
+            flog.write(f"$ {shlex.join(command)}\n")
+            proc = subprocess.run(command, capture_output=True, text=True)
+            if proc.stdout:
+                flog.write(proc.stdout)
+                if not proc.stdout.endswith("\n"):
+                    flog.write("\n")
+            if proc.stderr:
+                flog.write(proc.stderr)
+                if not proc.stderr.endswith("\n"):
+                    flog.write("\n")
+            flog.write(f"[returncode] {proc.returncode}\n\n")
+            entry = {
+                "name": spec["name"],
+                "basename": basename,
+                "command": shlex.join(command),
+                "returncode": proc.returncode,
+                "expected_outputs": [str(path) for path in expected_outputs],
+                "outputs": [str(path) for path in expected_outputs if path.exists()],
+            }
+            manifest["figures"].append(entry)
+            if proc.returncode != 0:
+                manifest["failed"].append(entry)
+
+    manifest["ok"] = bool(manifest["figures"]) and not bool(manifest["failed"])
+    manifest["detail"] = (
+        "figure generation complete"
+        if manifest["ok"]
+        else "figure generation completed with failures; inspect log_path"
+    )
+    write_summary_json(manifest_path, manifest)
+    return manifest
+
+
 def write_summary_markdown(path: Path, payload: dict) -> None:
     coverage = payload.get("coverage", {})
     jobs = payload.get("jobs", [])
     scalar_groups = coverage.get("scalar_groups", {})
     blocking_failures = payload.get("blocking_failures", [])
     non_blocking_failures = payload.get("non_blocking_failures", [])
+    figure_artifacts = payload.get("figure_artifacts", {})
 
     lines = [
         "# Qdrant Coverage Experiment Summary",
@@ -1129,6 +2201,11 @@ def write_summary_markdown(path: Path, payload: dict) -> None:
         f"- Suite time: `{fmt_duration(float(payload.get('suite_elapsed_seconds', 0.0)))}`",
         f"- Total time: `{fmt_duration(float(payload.get('total_elapsed_seconds', 0.0)))}`",
     ]
+    if payload.get("time_budget_seconds") is not None:
+        lines.append(f"- Time budget: `{fmt_duration(float(payload.get('time_budget_seconds', 0.0)))}`")
+        lines.append(f"- Budget schedule: `{payload.get('budget_schedule', 'random')}`")
+        if payload.get("budget_seed") is not None:
+            lines.append(f"- Budget seed: `{payload.get('budget_seed')}`")
     if blocking_failures:
         lines.append(f"- Blocking failures: `{', '.join(blocking_failures)}`")
     if non_blocking_failures:
@@ -1137,6 +2214,10 @@ def write_summary_markdown(path: Path, payload: dict) -> None:
         lines.append(f"- Coverage timeline: `{payload['coverage_timeline_csv']}`")
     if payload.get("coverage_metrics_json"):
         lines.append(f"- Coverage metrics: `{payload['coverage_metrics_json']}`")
+    if isinstance(figure_artifacts, dict) and figure_artifacts.get("manifest_path"):
+        lines.append(f"- Figure manifest: `{figure_artifacts['manifest_path']}`")
+    if isinstance(figure_artifacts, dict) and figure_artifacts.get("output_dir"):
+        lines.append(f"- Figure output dir: `{figure_artifacts['output_dir']}`")
     lines.extend(
         [
             "",
@@ -1171,6 +2252,22 @@ def write_summary_markdown(path: Path, payload: dict) -> None:
                 f"{group.get('function_percent', 0.0):.2f}% | {group.get('region_percent', 0.0):.2f}% | "
                 f"{group.get('file_count', 0)} |"
             )
+
+    if isinstance(figure_artifacts, dict) and figure_artifacts.get("figures"):
+        lines.extend(
+            [
+                "",
+                "## Figures",
+                "",
+                "| Figure | Status | Outputs |",
+                "| --- | --- | --- |",
+            ]
+        )
+        for figure in figure_artifacts.get("figures", []):
+            outputs = figure.get("outputs", [])
+            output_text = "<br>".join(f"`{item}`" for item in outputs) if outputs else ""
+            status = "PASS" if int(figure.get("returncode", 1)) == 0 else "FAIL"
+            lines.append(f"| `{figure.get('name')}` | `{status}` | {output_text} |")
 
     lines.extend(
         [
@@ -1252,12 +2349,44 @@ def stop_server(process: subprocess.Popen | None) -> None:
     process.wait(timeout=10)
 
 
+def can_launch_job(
+    job_specs: list[dict[str, object]],
+    candidate_job_idx: int,
+    *,
+    deadline: float | None,
+    now: float,
+    launch_guard_seconds: float = 8.0,
+) -> tuple[bool, str | None]:
+    if candidate_job_idx > len(job_specs):
+        return False, "all planned jobs completed"
+    if deadline is None:
+        return True, None
+
+    remaining_seconds = deadline - now
+    if remaining_seconds <= 0:
+        return False, f"Time budget reached; stopping after completed job {candidate_job_idx - 1}."
+
+    estimated_seconds = float(job_specs[candidate_job_idx - 1].get("estimated_seconds") or 0.0)
+    guard_seconds = max(0.0, float(launch_guard_seconds))
+    launch_threshold = max(guard_seconds, min(20.0, estimated_seconds * 0.1))
+    if estimated_seconds > 0 and remaining_seconds < launch_threshold:
+        return (
+            False,
+            f"Budget remaining {fmt_duration(remaining_seconds)} is below "
+            f"launch threshold for {job_specs[candidate_job_idx - 1].get('name')} "
+            f"(~{fmt_duration(estimated_seconds)}); stopping.",
+        )
+
+    return True, None
+
+
 def print_report_summary(log_dir: Path, summary_path: Path, payload: dict) -> int:
     suite_ok = payload.get("suite_passed", False)
     cov_summary = payload.get("coverage", {})
     jobs = payload.get("jobs", [])
     blocking_failures = payload.get("blocking_failures", [])
     non_blocking_failures = payload.get("non_blocking_failures", [])
+    figure_artifacts = payload.get("figure_artifacts", {})
     print(f"\n{BOLD}{'=' * 76}{RESET}")
     print(f"{BOLD}Qdrant Coverage Summary{RESET}")
     print(f"{'=' * 76}")
@@ -1271,8 +2400,17 @@ def print_report_summary(log_dir: Path, summary_path: Path, payload: dict) -> in
         print(f"  Timeline:    {payload['coverage_timeline_csv']}")
     if payload.get("coverage_metrics_json"):
         print(f"  Cov JSON:    {payload['coverage_metrics_json']}")
+    if isinstance(figure_artifacts, dict) and figure_artifacts.get("manifest_path"):
+        print(f"  Figures:     {figure_artifacts['manifest_path']}")
+    if isinstance(figure_artifacts, dict) and figure_artifacts.get("output_dir"):
+        print(f"  Figure dir:  {figure_artifacts['output_dir']}")
     if "suite_elapsed_seconds" in payload:
         print(f"  Suite time:  {fmt_duration(float(payload['suite_elapsed_seconds']))}")
+    if payload.get("time_budget_seconds") is not None:
+        print(f"  Budget:      {fmt_duration(float(payload['time_budget_seconds']))}")
+        print(f"  Schedule:    {payload.get('budget_schedule', 'random')}")
+        if payload.get("budget_seed") is not None:
+            print(f"  Budget seed: {payload.get('budget_seed')}")
     print(f"  Suite:       {colorize(bool(suite_ok), 'PASS' if suite_ok else 'FAIL')}")
     if blocking_failures:
         print(f"  Blocking:    {', '.join(blocking_failures)}")
@@ -1389,6 +2527,11 @@ def main() -> int:
         help="Distance mode for the targeted scalar smoke pass",
     )
     parser.add_argument("--targeted-oracle-args", default=None, help="Additional raw args appended to the targeted scalar smoke command")
+    parser.add_argument(
+        "--budget-oracle-args",
+        default=None,
+        help="Additional raw args appended to every time-budget direct oracle/PQS/equiv/group command",
+    )
     parser.add_argument("--skip-vector", action="store_true", help="Skip the vector smoke pass")
     parser.add_argument("--vector-seed", type=int, default=424242, help="Seed for the vector smoke pass")
     parser.add_argument("--vector-rounds", type=int, default=60, help="Rounds for the vector smoke pass")
@@ -1410,7 +2553,11 @@ def main() -> int:
     parser.add_argument(
         "--experimental-scalar-operators",
         default=None,
-        help="Comma-separated extra scalar operators to run as a second scalar operator pass (for example: heterogeneous_payload)",
+        help=(
+            "Comma-separated extra scalar operators, or a scalar_operator_suite.py group "
+            "name, to run as a second scalar operator pass. Default auto-runs 'robustness'; "
+            "pass an empty string to disable."
+        ),
     )
     parser.add_argument(
         "--experimental-scalar-args",
@@ -1436,13 +2583,109 @@ def main() -> int:
         action="store_true",
         help="Restart Qdrant after each top-level job, collect cumulative LLVM coverage snapshots, and write coverage_timeline.csv",
     )
+    parser.add_argument(
+        "--coverage-timeline-interval-jobs",
+        type=int,
+        default=1,
+        help="Collect coverage timeline snapshots every N completed jobs when --coverage-timeline is enabled",
+    )
+    parser.add_argument(
+        "--coverage-timeline-min-interval-seconds",
+        type=float,
+        default=0.0,
+        help="Minimum wall-clock seconds between coverage timeline snapshots",
+    )
+    parser.add_argument(
+        "--coverage-timeline-dense-jobs",
+        type=int,
+        default=12,
+        help="During the early phase, collect timeline snapshots after every completed job for this many jobs",
+    )
+    parser.add_argument(
+        "--coverage-timeline-dense-minutes",
+        type=float,
+        default=20.0,
+        help="During the early phase, collect timeline snapshots after every completed job for this many minutes",
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print commands and paths without executing")
     parser.add_argument(
         "--coverage-report-only",
         action="store_true",
         help="Skip launch/fuzz execution and only merge/generate coverage artifacts from an existing cov dir",
     )
+    parser.add_argument(
+        "--time-budget-seconds",
+        type=float,
+        default=None,
+        help="Enable coverage-first budget scheduling and stop after roughly this many seconds",
+    )
+    parser.add_argument(
+        "--budget-schedule",
+        choices=["cycle", "random"],
+        default="random",
+        help="How budget-mode fill jobs are selected after the initial all-mode preheat",
+    )
+    parser.add_argument(
+        "--budget-seed",
+        type=int,
+        default=None,
+        help="Deterministic seed used for budget-mode job selection and per-job derived seeds",
+    )
+    parser.add_argument(
+        "--budget-min-fill-job-seconds",
+        type=float,
+        default=2.0,
+        help="Planner assumption for the shortest expected fill job duration; smaller means more planned random jobs",
+    )
+    parser.add_argument(
+        "--budget-fill-overprovision",
+        type=float,
+        default=1.25,
+        help="Planner multiplier on top of the min fill job estimate when pre-generating random fill jobs",
+    )
+    parser.add_argument(
+        "--budget-max-planned-jobs",
+        type=int,
+        default=5000,
+        help="Hard cap for pre-generated budget jobs (preheat + random fill)",
+    )
+    parser.add_argument(
+        "--budget-launch-guard-seconds",
+        type=float,
+        default=8.0,
+        help="Do not launch a new job when remaining budget is below this guard (or 10%% estimate up to 20s)",
+    )
+    parser.add_argument("--figure-script", default=str(DEFAULT_FIGURE_SCRIPT), help="Publication-style figure generator path")
+    parser.add_argument("--figure-output-dir", default=None, help="Optional explicit output dir for generated figure assets")
+    parser.add_argument("--skip-figures", action="store_true", help="Skip coverage figure generation")
     args = parser.parse_args()
+    if args.time_budget_seconds is not None and args.time_budget_seconds <= 0:
+        print(f"{RED}--time-budget-seconds must be positive.{RESET}")
+        return 2
+    if args.coverage_timeline_interval_jobs <= 0:
+        print(f"{RED}--coverage-timeline-interval-jobs must be positive.{RESET}")
+        return 2
+    if args.coverage_timeline_min_interval_seconds < 0:
+        print(f"{RED}--coverage-timeline-min-interval-seconds must be non-negative.{RESET}")
+        return 2
+    if args.coverage_timeline_dense_jobs < 0:
+        print(f"{RED}--coverage-timeline-dense-jobs must be non-negative.{RESET}")
+        return 2
+    if args.coverage_timeline_dense_minutes < 0:
+        print(f"{RED}--coverage-timeline-dense-minutes must be non-negative.{RESET}")
+        return 2
+    if args.budget_min_fill_job_seconds <= 0:
+        print(f"{RED}--budget-min-fill-job-seconds must be positive.{RESET}")
+        return 2
+    if args.budget_fill_overprovision <= 0:
+        print(f"{RED}--budget-fill-overprovision must be positive.{RESET}")
+        return 2
+    if args.budget_max_planned_jobs <= 0:
+        print(f"{RED}--budget-max-planned-jobs must be positive.{RESET}")
+        return 2
+    if args.budget_launch_guard_seconds < 0:
+        print(f"{RED}--budget-launch-guard-seconds must be non-negative.{RESET}")
+        return 2
     extra_tool_roots = [
         Path(args.experiment_root).expanduser(),
         Path(args.experiment_root).expanduser() / "qdrant_log",
@@ -1466,6 +2709,7 @@ def main() -> int:
     text_indexed_operator_runner = Path(args.text_indexed_operator_runner).expanduser().resolve()
     text_profile_operator_runner = Path(args.text_profile_operator_runner).expanduser().resolve()
     formula_operator_runner = Path(args.formula_operator_runner).expanduser().resolve()
+    figure_script = Path(args.figure_script).expanduser().resolve()
 
     if not args.qdrant_src:
         print(f"{RED}--qdrant-src is required (or set QDRANT_SRC).{RESET}")
@@ -1484,6 +2728,13 @@ def main() -> int:
     cov_dir = Path(args.cov_dir).expanduser().resolve() if args.cov_dir else (cov_root / run_id)
     storage_dir = data_root / run_id
     artifacts_dir = log_dir / "artifacts"
+    figure_output_dir = (
+        Path(args.figure_output_dir).expanduser().resolve()
+        if args.figure_output_dir
+        else (artifacts_dir / "figures")
+    )
+    figure_manifest_path = artifacts_dir / "plot_manifest.json"
+    figure_log_path = artifacts_dir / "figure_generation.log"
     if not args.qdrant_target_dir:
         args.qdrant_target_dir = str(cov_root / "target")
     binary_path = resolve_binary_path(args, qdrant_src)
@@ -1535,6 +2786,20 @@ def main() -> int:
             ["row_type", "name", "seed", "actual_seed", "result", "elapsed_seconds", "detail", "log_path", "command", "reproduce_command", "blocking"],
             [],
         )
+        if args.skip_figures:
+            payload["figure_artifacts"] = {"enabled": False, "detail": "skipped by --skip-figures"}
+        else:
+            timeline_csv_candidate = log_dir / "coverage_timeline.csv"
+            payload["figure_artifacts"] = generate_qdrant_figure_artifacts(
+                python_bin=args.python_bin,
+                figure_script=figure_script,
+                summary_json_path=summary_path,
+                timeline_csv_path=timeline_csv_candidate if timeline_csv_candidate.exists() else None,
+                output_dir=figure_output_dir,
+                manifest_path=figure_manifest_path,
+                log_path=figure_log_path,
+            )
+        summary_path = write_summary_json_compat(log_dir, payload)
         write_summary_markdown(summary_md_path, payload)
         return print_report_summary(log_dir, summary_path, payload)
 
@@ -1577,184 +2842,204 @@ def main() -> int:
     scalar_suite_case_results_csv = log_dir / "scalar_suite_case_results.csv"
     persistent_index_state_path = log_dir / "persistent_index_state.json"
 
-    job_specs: list[dict[str, object]] = []
-    suite_cmd = build_suite_command(
-        args.python_bin,
-        runner,
-        args,
-        oracle_log_dir=scalar_oracle_log_dir,
-        run_id=f"{run_id}-matrix",
-        log_dir=scalar_suite_runner_log_dir,
-        summary_json=scalar_suite_summary_json,
-        case_results_csv=scalar_suite_case_results_csv,
-    )
-    job_specs.append(
-        {
-            "name": "scalar-suite",
-            "command": suite_cmd,
-            "log_path": log_dir / "scalar_suite.log",
-            "analyzer": analyze_suite_log,
-            "summary_json": str(scalar_suite_summary_json),
-            "case_results_csv": str(scalar_suite_case_results_csv),
-            "blocking": True,
-        }
-    )
-    if not args.skip_targeted_oracle:
+    budget_seed: int | None = None
+    if args.time_budget_seconds is not None:
+        job_specs, budget_seed = build_budget_job_specs(
+            args=args,
+            python_bin=args.python_bin,
+            oracle_path=oracle_path,
+            vector_runner=vector_runner,
+            scalar_operator_runner=scalar_operator_runner,
+            persistent_index_runner=persistent_index_runner,
+            facet_operator_runner=facet_operator_runner,
+            text_indexed_operator_runner=text_indexed_operator_runner,
+            text_profile_operator_runner=text_profile_operator_runner,
+            formula_operator_runner=formula_operator_runner,
+            log_dir=log_dir,
+            persistent_index_state_path=persistent_index_state_path,
+        )
+    else:
+        job_specs = []
+        suite_cmd = build_suite_command(
+            args.python_bin,
+            runner,
+            args,
+            oracle_log_dir=scalar_oracle_log_dir,
+            run_id=f"{run_id}-matrix",
+            log_dir=scalar_suite_runner_log_dir,
+            summary_json=scalar_suite_summary_json,
+            case_results_csv=scalar_suite_case_results_csv,
+        )
         job_specs.append(
             {
-                "name": "scalar-targeted",
-                "command": build_targeted_oracle_command(args.python_bin, oracle_path, args, targeted_oracle_log_dir),
-                "log_path": log_dir / "scalar_targeted.log",
-                "analyzer": analyze_oracle_log,
+                "name": "scalar-suite",
+                "command": suite_cmd,
+                "log_path": log_dir / "scalar_suite.log",
+                "analyzer": analyze_suite_log,
+                "summary_json": str(scalar_suite_summary_json),
+                "case_results_csv": str(scalar_suite_case_results_csv),
                 "blocking": True,
             }
         )
-    if not args.skip_vector:
-        job_specs.append(
-            {
-                "name": "vector-smoke",
-                "command": build_vector_command(args.python_bin, vector_runner, args, vector_inner_log_dir),
-                "log_path": log_dir / "vector_smoke.log",
-                "analyzer": analyze_vector_log,
-                "blocking": True,
-            }
+        if not args.skip_targeted_oracle:
+            job_specs.append(
+                {
+                    "name": "scalar-targeted",
+                    "command": build_targeted_oracle_command(args.python_bin, oracle_path, args, targeted_oracle_log_dir),
+                    "log_path": log_dir / "scalar_targeted.log",
+                    "analyzer": analyze_oracle_log,
+                    "blocking": True,
+                }
+            )
+        if not args.skip_vector:
+            job_specs.append(
+                {
+                    "name": "vector-smoke",
+                    "command": build_vector_command(args.python_bin, vector_runner, args, vector_inner_log_dir),
+                    "log_path": log_dir / "vector_smoke.log",
+                    "analyzer": analyze_vector_log,
+                    "blocking": True,
+                }
+            )
+        if not args.skip_scalar_operator:
+            job_specs.append(
+                {
+                    "name": "scalar-operator-suite",
+                    "command": build_operator_command(
+                        args.python_bin,
+                        scalar_operator_runner,
+                        args,
+                        raw_args=args.scalar_operator_args,
+                        run_id=f"{run_id}-scalar-operators",
+                    ),
+                    "log_path": log_dir / "scalar_operator_suite.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": True,
+                }
+            )
+        effective_experimental_scalar_operators = (
+            "robustness" if args.experimental_scalar_operators is None else str(args.experimental_scalar_operators).strip()
         )
-    if not args.skip_scalar_operator:
-        job_specs.append(
-            {
-                "name": "scalar-operator-suite",
-                "command": build_operator_command(
-                    args.python_bin,
-                    scalar_operator_runner,
-                    args,
-                    raw_args=args.scalar_operator_args,
-                    run_id=f"{run_id}-scalar-operators",
-                ),
-                "log_path": log_dir / "scalar_operator_suite.log",
-                "analyzer": analyze_operator_log,
-                "blocking": True,
-            }
-        )
-    if args.experimental_scalar_operators:
-        experimental_scalar_parts = ["--operators", args.experimental_scalar_operators]
-        if args.experimental_scalar_args:
-            experimental_scalar_parts.extend(shlex.split(args.experimental_scalar_args))
-        job_specs.append(
-            {
-                "name": "scalar-operator-experimental",
-                "command": build_operator_command(
-                    args.python_bin,
-                    scalar_operator_runner,
-                    args,
-                    raw_args=shlex.join(experimental_scalar_parts),
-                    run_id=f"{run_id}-scalar-operators-experimental",
-                ),
-                "log_path": log_dir / "scalar_operator_experimental.log",
-                "analyzer": analyze_operator_log,
-                "blocking": bool(args.experimental_scalar_blocking),
-            }
-        )
-    if not args.skip_persistent_index:
-        persistent_run_id = f"{run_id}-persistent-index"
-        job_specs.append(
-            {
-                "name": "persistent-index-prepare",
-                "command": build_persistent_index_command(
-                    args.python_bin,
-                    persistent_index_runner,
-                    args,
-                    phase="prepare",
-                    state_path=persistent_index_state_path,
-                    raw_args=args.persistent_index_args,
-                    run_id=persistent_run_id,
-                ),
-                "log_path": log_dir / "persistent_index_prepare.log",
-                "analyzer": analyze_operator_log,
-                "blocking": True,
-                "restart_server_after": True,
-            }
-        )
-        job_specs.append(
-            {
-                "name": "persistent-index-verify",
-                "command": build_persistent_index_command(
-                    args.python_bin,
-                    persistent_index_runner,
-                    args,
-                    phase="verify",
-                    state_path=persistent_index_state_path,
-                    raw_args=args.persistent_index_args,
-                    run_id=persistent_run_id,
-                ),
-                "log_path": log_dir / "persistent_index_verify.log",
-                "analyzer": analyze_operator_log,
-                "blocking": True,
-            }
-        )
-    if not args.skip_facet_operator:
-        job_specs.append(
-            {
-                "name": "facet-operator",
-                "command": build_operator_command(
-                    args.python_bin,
-                    facet_operator_runner,
-                    args,
-                    raw_args=args.facet_operator_args,
-                    run_id=f"{run_id}-facet",
-                ),
-                "log_path": log_dir / "facet_operator.log",
-                "analyzer": analyze_operator_log,
-                "blocking": True,
-            }
-        )
-    if not args.skip_text_indexed_operator:
-        job_specs.append(
-            {
-                "name": "text-indexed-operator",
-                "command": build_operator_command(
-                    args.python_bin,
-                    text_indexed_operator_runner,
-                    args,
-                    raw_args=args.text_indexed_operator_args,
-                    run_id=f"{run_id}-text-indexed",
-                ),
-                "log_path": log_dir / "text_indexed_operator.log",
-                "analyzer": analyze_operator_log,
-                "blocking": True,
-            }
-        )
-    if not args.skip_text_profile_operator:
-        job_specs.append(
-            {
-                "name": "text-profile-operator",
-                "command": build_operator_command(
-                    args.python_bin,
-                    text_profile_operator_runner,
-                    args,
-                    raw_args=args.text_profile_operator_args,
-                    run_id=f"{run_id}-text-profile",
-                ),
-                "log_path": log_dir / "text_profile_operator.log",
-                "analyzer": analyze_operator_log,
-                "blocking": True,
-            }
-        )
-    if not args.skip_formula_operator:
-        job_specs.append(
-            {
-                "name": "formula-operator",
-                "command": build_operator_command(
-                    args.python_bin,
-                    formula_operator_runner,
-                    args,
-                    raw_args=args.formula_operator_args,
-                    run_id=f"{run_id}-formula",
-                ),
-                "log_path": log_dir / "formula_operator.log",
-                "analyzer": analyze_operator_log,
-                "blocking": True,
-            }
-        )
+        if effective_experimental_scalar_operators:
+            experimental_scalar_parts = ["--operators", effective_experimental_scalar_operators]
+            if args.experimental_scalar_args:
+                experimental_scalar_parts.extend(shlex.split(args.experimental_scalar_args))
+            job_specs.append(
+                {
+                    "name": "scalar-operator-experimental",
+                    "command": build_operator_command(
+                        args.python_bin,
+                        scalar_operator_runner,
+                        args,
+                        raw_args=shlex.join(experimental_scalar_parts),
+                        run_id=f"{run_id}-scalar-operators-experimental",
+                    ),
+                    "log_path": log_dir / "scalar_operator_experimental.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": bool(args.experimental_scalar_blocking),
+                }
+            )
+        if not args.skip_persistent_index:
+            persistent_run_id = f"{run_id}-persistent-index"
+            job_specs.append(
+                {
+                    "name": "persistent-index-prepare",
+                    "command": build_persistent_index_command(
+                        args.python_bin,
+                        persistent_index_runner,
+                        args,
+                        phase="prepare",
+                        state_path=persistent_index_state_path,
+                        raw_args=args.persistent_index_args,
+                        run_id=persistent_run_id,
+                    ),
+                    "log_path": log_dir / "persistent_index_prepare.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": True,
+                    "restart_server_after": True,
+                }
+            )
+            job_specs.append(
+                {
+                    "name": "persistent-index-verify",
+                    "command": build_persistent_index_command(
+                        args.python_bin,
+                        persistent_index_runner,
+                        args,
+                        phase="verify",
+                        state_path=persistent_index_state_path,
+                        raw_args=args.persistent_index_args,
+                        run_id=persistent_run_id,
+                    ),
+                    "log_path": log_dir / "persistent_index_verify.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": True,
+                }
+            )
+        if not args.skip_facet_operator:
+            job_specs.append(
+                {
+                    "name": "facet-operator",
+                    "command": build_operator_command(
+                        args.python_bin,
+                        facet_operator_runner,
+                        args,
+                        raw_args=args.facet_operator_args,
+                        run_id=f"{run_id}-facet",
+                    ),
+                    "log_path": log_dir / "facet_operator.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": True,
+                }
+            )
+        if not args.skip_text_indexed_operator:
+            job_specs.append(
+                {
+                    "name": "text-indexed-operator",
+                    "command": build_operator_command(
+                        args.python_bin,
+                        text_indexed_operator_runner,
+                        args,
+                        raw_args=args.text_indexed_operator_args,
+                        run_id=f"{run_id}-text-indexed",
+                    ),
+                    "log_path": log_dir / "text_indexed_operator.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": True,
+                }
+            )
+        if not args.skip_text_profile_operator:
+            job_specs.append(
+                {
+                    "name": "text-profile-operator",
+                    "command": build_operator_command(
+                        args.python_bin,
+                        text_profile_operator_runner,
+                        args,
+                        raw_args=args.text_profile_operator_args,
+                        run_id=f"{run_id}-text-profile",
+                    ),
+                    "log_path": log_dir / "text_profile_operator.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": True,
+                }
+            )
+        if not args.skip_formula_operator:
+            job_specs.append(
+                {
+                    "name": "formula-operator",
+                    "command": build_operator_command(
+                        args.python_bin,
+                        formula_operator_runner,
+                        args,
+                        raw_args=args.formula_operator_args,
+                        run_id=f"{run_id}-formula",
+                    ),
+                    "log_path": log_dir / "formula_operator.log",
+                    "analyzer": analyze_operator_log,
+                    "blocking": True,
+                }
+            )
 
     server_log_path = log_dir / "server.log"
 
@@ -1778,8 +3063,30 @@ def main() -> int:
     print(f"  Cov dir:     {cov_dir}")
     print(f"  Binary:      {binary_path}")
     print(f"  Log dir:     {log_dir}")
-    for job in job_specs:
+    if args.time_budget_seconds is not None:
+        print(f"  Budget:      {fmt_duration(float(args.time_budget_seconds))}")
+        print(f"  Schedule:    {args.budget_schedule}")
+        print(f"  Budget seed: {budget_seed}")
+        print(
+            f"  Planner:     min-job {args.budget_min_fill_job_seconds:g}s, "
+            f"overprovision x{args.budget_fill_overprovision:g}, "
+            f"max-jobs {args.budget_max_planned_jobs}"
+        )
+        print(f"  Guard:       launch guard {args.budget_launch_guard_seconds:g}s")
+        print(f"  Budget mode: coverage-first preheat + seeded fill")
+    if args.coverage_timeline:
+        print(
+            f"  Timeline:    dense<=jobs:{args.coverage_timeline_dense_jobs}, "
+            f"dense<=mins:{args.coverage_timeline_dense_minutes:g}, "
+            f"late every {args.coverage_timeline_interval_jobs} jobs + {args.coverage_timeline_min_interval_seconds:g}s"
+        )
+    preview_job_specs = job_specs
+    if args.time_budget_seconds is not None and len(job_specs) > 24:
+        preview_job_specs = job_specs[:24]
+    for job in preview_job_specs:
         print(f"  Job cmd:     {job['name']} -> {' '.join(job['command'])}")
+    if preview_job_specs is not job_specs:
+        print(f"  Job cmd:     ... {len(job_specs) - len(preview_job_specs)} more planned budget jobs")
     print(f"{CYAN}{'-' * 76}{RESET}")
 
     if args.dry_run:
@@ -1814,6 +3121,9 @@ def main() -> int:
     coverage_timeline_csv_path = log_dir / "coverage_timeline.csv"
     coverage_metrics_path = log_dir / "coverage_metrics.json"
     started = time.time()
+    deadline = (started + float(args.time_budget_seconds)) if args.time_budget_seconds is not None else None
+    last_timeline_snapshot_time = started
+    last_timeline_snapshot_job_idx = 0
 
     try:
         print(f"\n{CYAN}Starting coverage-enabled Qdrant...{RESET}")
@@ -1846,13 +3156,25 @@ def main() -> int:
             )
 
         for job_idx, job in enumerate(job_specs, start=1):
+            if job_idx > 1:
+                can_run, stop_reason = can_launch_job(
+                    job_specs,
+                    job_idx,
+                    deadline=deadline,
+                    now=time.time(),
+                    launch_guard_seconds=args.budget_launch_guard_seconds,
+                )
+                if not can_run:
+                    print(f"{YELLOW}{stop_reason}{RESET}")
+                    break
             name = str(job["name"])
             command = list(job["command"])
             log_path = Path(job["log_path"])
             analyzer = job["analyzer"]
             blocking = bool(job.get("blocking", True))
+            timeout_seconds = float(job["timeout_seconds"]) if job.get("timeout_seconds") else None
             print(f"{CYAN}Running {name}...{RESET}")
-            exit_code, elapsed = run_command(command, log_path)
+            exit_code, elapsed = run_command(command, log_path, timeout_seconds=timeout_seconds)
             passed, detail = analyzer(log_path)
             result = {
                 "name": name,
@@ -1863,10 +3185,37 @@ def main() -> int:
                 "detail": detail if exit_code == 0 else f"exit={exit_code}, {detail}",
                 "elapsed_seconds": elapsed,
                 "blocking": blocking,
+                "timeout_seconds": timeout_seconds,
             }
             job_results.append(result)
             print(f"    -> {job_status_text(result)} ({fmt_duration(elapsed)}) {result['detail']}")
-            should_restart_after_job = bool(args.coverage_timeline or job.get("restart_server_after"))
+            now_after_job = time.time()
+            should_start_next_job, _ = can_launch_job(
+                job_specs,
+                job_idx + 1,
+                deadline=deadline,
+                now=now_after_job,
+                launch_guard_seconds=args.budget_launch_guard_seconds,
+            )
+            take_timeline_snapshot = False
+            if args.coverage_timeline and should_start_next_job:
+                jobs_since_snapshot = job_idx - last_timeline_snapshot_job_idx
+                wall_since_snapshot = now_after_job - last_timeline_snapshot_time
+                dense_phase_enabled = args.coverage_timeline_dense_jobs > 0 or args.coverage_timeline_dense_minutes > 0
+                dense_job_phase = args.coverage_timeline_dense_jobs > 0 and job_idx <= args.coverage_timeline_dense_jobs
+                dense_time_phase = (
+                    args.coverage_timeline_dense_minutes > 0
+                    and (now_after_job - started) <= args.coverage_timeline_dense_minutes * 60.0
+                )
+                in_dense_phase = dense_phase_enabled and (dense_job_phase or dense_time_phase)
+                if in_dense_phase:
+                    take_timeline_snapshot = True
+                else:
+                    take_timeline_snapshot = (
+                        jobs_since_snapshot >= args.coverage_timeline_interval_jobs
+                        and wall_since_snapshot >= args.coverage_timeline_min_interval_seconds
+                    )
+            should_restart_after_job = bool(job.get("restart_server_after")) or take_timeline_snapshot
             if should_restart_after_job:
                 print(f"{CYAN}Restarting coverage-enabled Qdrant after {name}...{RESET}")
                 stop_server(server_proc)
@@ -1874,7 +3223,7 @@ def main() -> int:
                 if server_log_handle is not None:
                     server_log_handle.close()
                     server_log_handle = None
-                if args.coverage_timeline:
+                if take_timeline_snapshot:
                     snapshot_dir = artifacts_dir / "timeline" / f"{job_idx:02d}_{slugify(name, max_len=48)}"
                     snapshot_cov = collect_llvm_coverage_snapshot(
                         qdrant_src=qdrant_src,
@@ -1900,7 +3249,9 @@ def main() -> int:
                             snapshot_dir=snapshot_dir,
                         )
                     )
-                if job_idx < len(job_specs):
+                    last_timeline_snapshot_time = time.time()
+                    last_timeline_snapshot_job_idx = job_idx
+                if should_start_next_job:
                     server_proc, server_log_handle = start_server(
                         launcher=launcher,
                         run_id=run_id,
@@ -1935,6 +3286,39 @@ def main() -> int:
     write_coverage_metrics_json(coverage_metrics_path, cov_summary)
 
     suite_elapsed = sum(float(job["elapsed_seconds"]) for job in job_results)
+    if args.coverage_timeline:
+        last_job = job_results[-1] if job_results else None
+        last_row = coverage_timeline_rows[-1] if coverage_timeline_rows else None
+        scalar_target = (
+            cov_summary.get("scalar_groups", {}).get("scalar_target", {})
+            if isinstance(cov_summary.get("scalar_groups"), dict)
+            else {}
+        )
+        final_scalar_line_percent = round(float(scalar_target.get("line_percent") or 0.0), 2)
+        final_overall_covered_lines = int(cov_summary.get("covered_lines") or 0)
+        needs_final_row = last_job is not None or bool(coverage_timeline_rows)
+        if isinstance(last_row, dict):
+            needs_final_row = (
+                str(last_row.get("event")) != "final"
+                or int(last_row.get("overall_covered_lines") or 0) != final_overall_covered_lines
+                or float(last_row.get("scalar_target_line_percent") or 0.0) != final_scalar_line_percent
+            )
+        if needs_final_row:
+            coverage_timeline_rows.append(
+                build_timeline_row(
+                    step_index=len(job_results) + 1,
+                    job_index=len(job_results),
+                    event="final",
+                    job_name=str(last_job["name"]) if last_job else "suite_final",
+                    job_result=job_result_label(last_job) if last_job else ("PASS" if cov_summary.get("available") else "FAIL"),
+                    blocking=True,
+                    job_elapsed_seconds=float(last_job["elapsed_seconds"]) if last_job else 0.0,
+                    suite_elapsed_seconds=suite_elapsed,
+                    wall_elapsed_seconds=time.time() - started,
+                    coverage=cov_summary,
+                    snapshot_dir=None,
+                )
+            )
     blocking_failures = [str(job["name"]) for job in job_results if bool(job.get("blocking", True)) and not bool(job["passed"])]
     non_blocking_failures = [str(job["name"]) for job in job_results if not bool(job.get("blocking", True)) and not bool(job["passed"])]
     suite_passed = bool(job_results) and not blocking_failures
@@ -1961,6 +3345,9 @@ def main() -> int:
         "cov_dir": str(cov_dir),
         "storage_dir": str(storage_dir),
         "binary_path": str(binary_path),
+        "time_budget_seconds": float(args.time_budget_seconds) if args.time_budget_seconds is not None else None,
+        "budget_schedule": args.budget_schedule if args.time_budget_seconds is not None else None,
+        "budget_seed": budget_seed,
         "suite_passed": suite_passed,
         "suite_elapsed_seconds": suite_elapsed,
         "total_elapsed_seconds": time.time() - started,
@@ -1983,6 +3370,19 @@ def main() -> int:
         ["row_type", "name", "seed", "actual_seed", "result", "elapsed_seconds", "detail", "log_path", "command", "reproduce_command", "blocking"],
         case_rows,
     )
+    if args.skip_figures:
+        payload["figure_artifacts"] = {"enabled": False, "detail": "skipped by --skip-figures"}
+    else:
+        payload["figure_artifacts"] = generate_qdrant_figure_artifacts(
+            python_bin=args.python_bin,
+            figure_script=figure_script,
+            summary_json_path=summary_path,
+            timeline_csv_path=coverage_timeline_csv_path if coverage_timeline_rows else None,
+            output_dir=figure_output_dir,
+            manifest_path=figure_manifest_path,
+            log_path=figure_log_path,
+        )
+    summary_path = write_summary_json_compat(log_dir, payload)
     write_summary_markdown(summary_md_path, payload)
 
     print(f"\n{BOLD}{'=' * 76}{RESET}")
@@ -1995,6 +3395,8 @@ def main() -> int:
     print(f"  Summary:     {summary_path}")
     print(f"  Summary MD:  {summary_md_path}")
     print(f"  Case CSV:    {case_results_csv_path}")
+    if isinstance(payload.get("figure_artifacts"), dict) and payload["figure_artifacts"].get("manifest_path"):
+        print(f"  Figures:     {payload['figure_artifacts']['manifest_path']}")
     if blocking_failures:
         print(f"  Blocking:    {', '.join(blocking_failures)}")
     if non_blocking_failures:

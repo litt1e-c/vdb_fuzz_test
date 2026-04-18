@@ -43,6 +43,9 @@ from qdrant_client.http.models import (
     SearchParams,
     NestedCondition, Nested,
     MinShould,
+    FormulaQuery, Prefetch,
+    AbsExpression, DivExpression, DivParams, ExpExpression, LnExpression, Log10Expression,
+    MultExpression, NegExpression, PowExpression, PowParams, SqrtExpression, SumExpression,
 )
 
 # --- Configuration (User Specified) ---
@@ -76,12 +79,55 @@ FORCED_DISTANCE_TYPE = None
 INDEX_TYPE = "hnsw"  # Qdrant 主要使用 HNSW
 VECTOR_CHECK_RATIO = None  # 延迟初始化
 VECTOR_TOPK = None          # 延迟初始化
+VECTOR_CHECK_RATIO_RANGE = (0.2, 0.8)
+VECTOR_TOPK_RANGE = (50, 200)
+
+PAYLOAD_INDEX_REBUILD_INTERVAL = 50
+DYNAMIC_OP_INTERVAL = 10
+SCHEMA_EVOLUTION_INTERVAL = 30
+EQUIV_PQS_DYNAMIC_OP_PROBABILITY = 0.20
+GROUP_DYNAMIC_OP_PROBABILITY = 0.20
+ORACLE_DEPTH_RANGE = (1, 15)
+EQUIV_DEPTH_RANGE = (1, 12)
+PQS_DEPTH_RANGE = (5, 13)
+FORMULA_ORACLE_PROBABILITY = 0.16
+FORMULA_PQS_PROBABILITY = 0.20
+
+SCALAR_DEPTH_PROFILE = "default"
+SCHEMA_STYLE = "random"
+NULL_RATIO_RANGE = (0.05, 0.15)
+BOUNDARY_INJECTION_RATE_RANGE = (0.08, 0.22)
+ARRAY_CAPACITY_RANGE = (5, 50)
+JSON_MAX_DEPTH_RANGE = (1, 5)
+INT_RANGE_RANGE = (5000, 100000)
+DOUBLE_SCALE_RANGE = (100, 10000)
+SCHEMA_EXTRA_FIELDS_RANGE = (3, 20)
+
+FORMULA_MAX_ABS_INPUT = 1e6
+FORMULA_SAFE_EXP_MIN = -12.0
+FORMULA_SAFE_EXP_MAX = 10.0
+FORMULA_SAFE_LOG_MIN = 1e-6
+FORMULA_SAFE_SCORE_LIMIT = float(np.finfo(np.float32).max) / 8.0
+FORMULA_SCORE_TOLERANCE = 1e-5
+
+PREFERRED_INDEX_PROFILE = {
+    "INT": "integer_default",
+    "FLOAT": "float_default",
+    "BOOL": "bool_default",
+    "STRING": "keyword_default",
+    "UUID": "uuid_default",
+    "DATETIME": "datetime_default",
+    "GEO": "geo_default",
+    "ARRAY_INT": "integer_default",
+    "ARRAY_STR": "keyword_default",
+    "ARRAY_FLOAT": "float_default",
+}
 
 def _init_vector_check_config():
     """在种子设置后调用，确保 VECTOR_CHECK_RATIO/VECTOR_TOPK 可复现"""
     global VECTOR_CHECK_RATIO, VECTOR_TOPK
-    VECTOR_CHECK_RATIO = random.uniform(0.2, 0.8)
-    VECTOR_TOPK = random.randint(50, 200)
+    VECTOR_CHECK_RATIO = random.uniform(*VECTOR_CHECK_RATIO_RANGE)
+    VECTOR_TOPK = random.randint(*VECTOR_TOPK_RANGE)
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -94,6 +140,225 @@ LOG_DIR = DEFAULT_LOG_DIR
 RUN_ID = None
 DISTANCE_ARG = "random"
 SCROLL_MODE = "mixed"
+
+
+QDRANT_SCALAR_DEPTH_PROFILES = {
+    "default": {
+        "schema_style": "random",
+        "null_ratio_range": (0.05, 0.15),
+        "boundary_rate_range": (0.08, 0.22),
+        "array_capacity_range": (5, 50),
+        "json_max_depth_range": (1, 5),
+        "int_range_range": (5000, 100000),
+        "double_scale_range": (100, 10000),
+        "schema_extra_fields_range": (3, 20),
+        "payload_index_rebuild_interval": 50,
+        "dynamic_op_interval": 10,
+        "schema_evolution_interval": 30,
+        "equiv_pqs_dynamic_op_probability": 0.20,
+        "group_dynamic_op_probability": 0.20,
+        "oracle_depth_range": (1, 15),
+        "equiv_depth_range": (1, 12),
+        "pqs_depth_range": (5, 13),
+        "formula_oracle_probability": 0.08,
+        "formula_pqs_probability": 0.10,
+        "vector_check_ratio_range": (0.2, 0.8),
+        "vector_topk_range": (50, 200),
+    },
+    "coverage-smoke": {
+        "schema_style": "operator-backed",
+        "null_ratio_range": (0.08, 0.12),
+        "boundary_rate_range": (0.10, 0.18),
+        "array_capacity_range": (6, 10),
+        "json_max_depth_range": (2, 3),
+        "int_range_range": (4000, 12000),
+        "double_scale_range": (200, 1200),
+        "schema_extra_fields_range": (0, 1),
+        "payload_index_rebuild_interval": 8,
+        "dynamic_op_interval": 4,
+        "schema_evolution_interval": 8,
+        "equiv_pqs_dynamic_op_probability": 0.30,
+        "group_dynamic_op_probability": 0.25,
+        "oracle_depth_range": (1, 10),
+        "equiv_depth_range": (1, 8),
+        "pqs_depth_range": (4, 9),
+        "formula_oracle_probability": 0.20,
+        "formula_pqs_probability": 0.24,
+        "vector_check_ratio_range": (0.35, 0.55),
+        "vector_topk_range": (64, 96),
+    },
+    "oracle-scalar": {
+        "schema_style": "operator-backed",
+        "null_ratio_range": (0.08, 0.12),
+        "boundary_rate_range": (0.10, 0.18),
+        "array_capacity_range": (8, 12),
+        "json_max_depth_range": (2, 3),
+        "int_range_range": (5000, 20000),
+        "double_scale_range": (200, 2000),
+        "schema_extra_fields_range": (0, 2),
+        "payload_index_rebuild_interval": 18,
+        "dynamic_op_interval": 6,
+        "schema_evolution_interval": 12,
+        "equiv_pqs_dynamic_op_probability": 0.20,
+        "group_dynamic_op_probability": 0.18,
+        "oracle_depth_range": (2, 14),
+        "equiv_depth_range": (1, 10),
+        "pqs_depth_range": (5, 12),
+        "formula_oracle_probability": 0.24,
+        "formula_pqs_probability": 0.20,
+        "vector_check_ratio_range": (0.35, 0.55),
+        "vector_topk_range": (80, 120),
+    },
+    "pqs-scalar": {
+        "schema_style": "operator-backed",
+        "null_ratio_range": (0.08, 0.12),
+        "boundary_rate_range": (0.10, 0.18),
+        "array_capacity_range": (8, 12),
+        "json_max_depth_range": (2, 3),
+        "int_range_range": (5000, 20000),
+        "double_scale_range": (200, 2000),
+        "schema_extra_fields_range": (0, 2),
+        "payload_index_rebuild_interval": 16,
+        "dynamic_op_interval": 8,
+        "schema_evolution_interval": 12,
+        "equiv_pqs_dynamic_op_probability": 0.18,
+        "group_dynamic_op_probability": 0.18,
+        "oracle_depth_range": (2, 12),
+        "equiv_depth_range": (1, 9),
+        "pqs_depth_range": (6, 12),
+        "formula_oracle_probability": 0.16,
+        "formula_pqs_probability": 0.30,
+        "vector_check_ratio_range": (0.30, 0.45),
+        "vector_topk_range": (80, 110),
+    },
+    "equiv-scalar": {
+        "schema_style": "operator-backed",
+        "null_ratio_range": (0.08, 0.12),
+        "boundary_rate_range": (0.10, 0.18),
+        "array_capacity_range": (8, 12),
+        "json_max_depth_range": (2, 3),
+        "int_range_range": (5000, 20000),
+        "double_scale_range": (200, 2000),
+        "schema_extra_fields_range": (0, 2),
+        "payload_index_rebuild_interval": 18,
+        "dynamic_op_interval": 10,
+        "schema_evolution_interval": 12,
+        "equiv_pqs_dynamic_op_probability": 0.22,
+        "group_dynamic_op_probability": 0.18,
+        "oracle_depth_range": (2, 12),
+        "equiv_depth_range": (2, 10),
+        "pqs_depth_range": (5, 10),
+        "formula_oracle_probability": 0.14,
+        "formula_pqs_probability": 0.16,
+        "vector_check_ratio_range": (0.30, 0.45),
+        "vector_topk_range": (80, 110),
+    },
+    "group-scalar": {
+        "schema_style": "operator-backed",
+        "null_ratio_range": (0.08, 0.12),
+        "boundary_rate_range": (0.10, 0.18),
+        "array_capacity_range": (8, 12),
+        "json_max_depth_range": (2, 3),
+        "int_range_range": (5000, 20000),
+        "double_scale_range": (200, 2000),
+        "schema_extra_fields_range": (0, 2),
+        "payload_index_rebuild_interval": 18,
+        "dynamic_op_interval": 8,
+        "schema_evolution_interval": 12,
+        "equiv_pqs_dynamic_op_probability": 0.20,
+        "group_dynamic_op_probability": 0.15,
+        "oracle_depth_range": (2, 12),
+        "equiv_depth_range": (1, 9),
+        "pqs_depth_range": (5, 10),
+        "formula_oracle_probability": 0.12,
+        "formula_pqs_probability": 0.12,
+        "vector_check_ratio_range": (0.30, 0.45),
+        "vector_topk_range": (80, 110),
+    },
+}
+
+
+def apply_scalar_depth_profile(profile_name: str) -> str:
+    global SCALAR_DEPTH_PROFILE, SCHEMA_STYLE
+    global NULL_RATIO_RANGE, BOUNDARY_INJECTION_RATE_RANGE
+    global ARRAY_CAPACITY_RANGE, JSON_MAX_DEPTH_RANGE, INT_RANGE_RANGE, DOUBLE_SCALE_RANGE
+    global SCHEMA_EXTRA_FIELDS_RANGE, PAYLOAD_INDEX_REBUILD_INTERVAL, DYNAMIC_OP_INTERVAL
+    global SCHEMA_EVOLUTION_INTERVAL, EQUIV_PQS_DYNAMIC_OP_PROBABILITY, GROUP_DYNAMIC_OP_PROBABILITY
+    global ORACLE_DEPTH_RANGE, EQUIV_DEPTH_RANGE, PQS_DEPTH_RANGE
+    global FORMULA_ORACLE_PROBABILITY, FORMULA_PQS_PROBABILITY
+    global VECTOR_CHECK_RATIO_RANGE, VECTOR_TOPK_RANGE
+
+    if profile_name not in QDRANT_SCALAR_DEPTH_PROFILES:
+        profile_name = "oracle-scalar"
+
+    profile = QDRANT_SCALAR_DEPTH_PROFILES[profile_name]
+    SCALAR_DEPTH_PROFILE = profile_name
+    SCHEMA_STYLE = str(profile["schema_style"])
+    NULL_RATIO_RANGE = tuple(profile["null_ratio_range"])
+    BOUNDARY_INJECTION_RATE_RANGE = tuple(profile["boundary_rate_range"])
+    ARRAY_CAPACITY_RANGE = tuple(profile["array_capacity_range"])
+    JSON_MAX_DEPTH_RANGE = tuple(profile["json_max_depth_range"])
+    INT_RANGE_RANGE = tuple(profile["int_range_range"])
+    DOUBLE_SCALE_RANGE = tuple(profile["double_scale_range"])
+    SCHEMA_EXTRA_FIELDS_RANGE = tuple(profile["schema_extra_fields_range"])
+    PAYLOAD_INDEX_REBUILD_INTERVAL = int(profile["payload_index_rebuild_interval"])
+    DYNAMIC_OP_INTERVAL = int(profile["dynamic_op_interval"])
+    SCHEMA_EVOLUTION_INTERVAL = int(profile["schema_evolution_interval"])
+    EQUIV_PQS_DYNAMIC_OP_PROBABILITY = float(profile["equiv_pqs_dynamic_op_probability"])
+    GROUP_DYNAMIC_OP_PROBABILITY = float(profile["group_dynamic_op_probability"])
+    ORACLE_DEPTH_RANGE = tuple(profile["oracle_depth_range"])
+    EQUIV_DEPTH_RANGE = tuple(profile["equiv_depth_range"])
+    PQS_DEPTH_RANGE = tuple(profile["pqs_depth_range"])
+    FORMULA_ORACLE_PROBABILITY = float(profile["formula_oracle_probability"])
+    FORMULA_PQS_PROBABILITY = float(profile["formula_pqs_probability"])
+    VECTOR_CHECK_RATIO_RANGE = tuple(profile["vector_check_ratio_range"])
+    VECTOR_TOPK_RANGE = tuple(profile["vector_topk_range"])
+    return profile_name
+
+
+def infer_scalar_depth_profile(mode: str, requested: str | None) -> str:
+    if requested:
+        return requested
+    if mode == "pqs":
+        return "pqs-scalar"
+    if mode == "equiv":
+        return "equiv-scalar"
+    if mode == "group":
+        return "group-scalar"
+    return "oracle-scalar"
+
+
+def compare_score_dicts(
+    actual_scores: dict[int, float],
+    expected_scores: dict[int, float],
+    *,
+    tolerance: float = FORMULA_SCORE_TOLERANCE,
+    sample_limit: int = 5,
+) -> tuple[bool, str]:
+    actual_ids = set(actual_scores)
+    expected_ids = set(expected_scores)
+    if actual_ids != expected_ids:
+        missing = sample_ids(expected_ids - actual_ids, sample_limit)
+        extra = sample_ids(actual_ids - expected_ids, sample_limit)
+        detail_parts = []
+        if missing:
+            detail_parts.append(f"missing={missing}")
+        if extra:
+            detail_parts.append(f"extra={extra}")
+        return False, "id-set mismatch" + (f" ({'; '.join(detail_parts)})" if detail_parts else "")
+
+    mismatches: list[str] = []
+    for point_id in sorted(expected_ids):
+        actual = float(actual_scores[point_id])
+        expected = float(expected_scores[point_id])
+        if not math.isclose(actual, expected, rel_tol=tolerance, abs_tol=tolerance):
+            mismatches.append(f"{point_id}:{actual:.6g}!={expected:.6g}")
+            if len(mismatches) >= sample_limit:
+                break
+
+    if mismatches:
+        return False, "score mismatch [" + ", ".join(mismatches) + "]"
+    return True, ""
 
 
 def ensure_log_dir():
@@ -292,6 +557,22 @@ def build_reproduce_command(mode: str, seed, rounds: int, enable_dynamic_ops: bo
         str(WRITE_ORDERING),
         "--log-dir",
         LOG_DIR,
+        "--scalar-depth-profile",
+        SCALAR_DEPTH_PROFILE,
+        "--payload-index-rebuild-interval",
+        str(PAYLOAD_INDEX_REBUILD_INTERVAL),
+        "--dynamic-op-interval",
+        str(DYNAMIC_OP_INTERVAL),
+        "--schema-evolution-interval",
+        str(SCHEMA_EVOLUTION_INTERVAL),
+        "--equiv-pqs-dynamic-op-probability",
+        str(EQUIV_PQS_DYNAMIC_OP_PROBABILITY),
+        "--group-dynamic-op-probability",
+        str(GROUP_DYNAMIC_OP_PROBABILITY),
+        "--formula-oracle-probability",
+        str(FORMULA_ORACLE_PROBABILITY),
+        "--formula-pqs-probability",
+        str(FORMULA_PQS_PROBABILITY),
     ]
     if PREFER_GRPC:
         cmd.append("--prefer-grpc")
@@ -340,9 +621,23 @@ def write_run_manifest(
         "distance_arg": DISTANCE_ARG,
         "read_consistency": READ_CONSISTENCY,
         "write_ordering": WRITE_ORDERING,
+        "scalar_depth_profile": SCALAR_DEPTH_PROFILE,
+        "schema_style": SCHEMA_STYLE,
         "dynamic": bool(enable_dynamic_ops),
         "payload_mutations": bool(PAYLOAD_MUTATIONS_ENABLED),
         "chaos_rate": CHAOS_RATE,
+        "payload_index_rebuild_interval": PAYLOAD_INDEX_REBUILD_INTERVAL,
+        "dynamic_op_interval": DYNAMIC_OP_INTERVAL,
+        "schema_evolution_interval": SCHEMA_EVOLUTION_INTERVAL,
+        "equiv_pqs_dynamic_op_probability": EQUIV_PQS_DYNAMIC_OP_PROBABILITY,
+        "group_dynamic_op_probability": GROUP_DYNAMIC_OP_PROBABILITY,
+        "oracle_depth_range": list(ORACLE_DEPTH_RANGE),
+        "equiv_depth_range": list(EQUIV_DEPTH_RANGE),
+        "pqs_depth_range": list(PQS_DEPTH_RANGE),
+        "formula_oracle_probability": FORMULA_ORACLE_PROBABILITY,
+        "formula_pqs_probability": FORMULA_PQS_PROBABILITY,
+        "vector_check_ratio_range": list(VECTOR_CHECK_RATIO_RANGE),
+        "vector_topk_range": list(VECTOR_TOPK_RANGE),
         "schema_config": copy.deepcopy(schema_config) if schema_config is not None else None,
     }
     with open(manifest_path, "w", encoding="utf-8") as fout:
@@ -352,9 +647,16 @@ def write_run_manifest(
 
 
 def is_qdrant_format_error(exc):
-    """识别 Qdrant 400 JSON filter 格式错误（通常由无效条件或越界值触发）。"""
+    """识别应跳过的 Qdrant 400 请求错误（格式/数值域/非有限值）。"""
     msg = str(exc)
-    return ("Unexpected Response: 400" in msg) and ("Format error in JSON body" in msg)
+    if "Unexpected Response: 400" not in msg:
+        return False
+    known_markers = (
+        "Format error in JSON body",
+        "Wrong input:",
+        "non-finite number",
+    )
+    return any(marker in msg for marker in known_markers)
 
 # 混淆开关（默认关闭）
 CHAOS_RATE = 0.0
@@ -486,6 +788,10 @@ SAFE_INDEX_PROFILES = {
 
 
 def choose_index_profile(ftype):
+    if SCHEMA_STYLE == "operator-backed":
+        preferred = PREFERRED_INDEX_PROFILE.get(ftype)
+        if preferred:
+            return preferred
     choices = SAFE_INDEX_PROFILES.get(ftype)
     if not choices:
         return None
@@ -575,13 +881,13 @@ class DataManager:
         if data_seed is None:
             data_seed = int(np.random.randint(0, 2**31 - 1))
         self.data_seed = int(data_seed)
-        self.null_ratio = random.uniform(0.05, 0.15)
-        self.boundary_injection_rate = random.uniform(0.08, 0.22)
+        self.null_ratio = random.uniform(*NULL_RATIO_RANGE)
+        self.boundary_injection_rate = random.uniform(*BOUNDARY_INJECTION_RATE_RANGE)
         self.query_boundary_rate = min(0.35, self.boundary_injection_rate + 0.08)
-        self.array_capacity = random.randint(5, 50)
-        self.json_max_depth = random.randint(1, 5)
-        self.int_range = random.randint(5000, 100000)
-        self.double_scale = random.uniform(100, 10000)
+        self.array_capacity = random.randint(*ARRAY_CAPACITY_RANGE)
+        self.json_max_depth = random.randint(*JSON_MAX_DEPTH_RANGE)
+        self.int_range = random.randint(*INT_RANGE_RANGE)
+        self.double_scale = random.uniform(*DOUBLE_SCALE_RANGE)
 
     KEY_POOL = [f"k_{i}" for i in range(20)] + ["user", "log", "data", "a_b", "test_key"]
     COUNTRY_CITY_POOL = {
@@ -1155,55 +1461,82 @@ class DataManager:
     def generate_schema(self):
         print("🎲 1. Defining Dynamic Schema...")
         self.schema_config = []
-        num_fields = random.randint(3, 20)
-        types_pool = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.UUID, FieldType.DATETIME]
-
-        for i in range(num_fields):
-            ftype = random.choice(types_pool)
-            self.schema_config.append({"name": f"c{i}", "type": ftype})
-
-        # 添加 JSON 字段（Qdrant 中作为嵌套 payload）
-        self.schema_config.append({"name": "meta_json", "type": FieldType.JSON})
-        
-        # 添加 Array 字段
-        self.schema_config.append({
-            "name": "tags_array",
-            "type": FieldType.ARRAY_INT,
-            "max_capacity": self.array_capacity
-        })
-        
-        # 添加字符串数组
-        self.schema_config.append({
-            "name": "labels_array",
-            "type": FieldType.ARRAY_STR,
-            "max_capacity": self.array_capacity
-        })
-
-        # 添加浮点数组
-        self.schema_config.append({
-            "name": "scores_array",
-            "type": FieldType.ARRAY_FLOAT,
-            "max_capacity": self.array_capacity
-        })
-
-        # 添加 GEO 字段（经纬度坐标）
-        self.schema_config.append({"name": "location_geo", "type": FieldType.GEO})
-
-        # 添加 Nested 对象数组字段（用于 NestedCondition 测试）
-        self.schema_config.append({
-            "name": "items_nested",
-            "type": FieldType.ARRAY_OBJECT,
-            "sub_fields": [
-                {"name": "score", "type": "int"},
-                {"name": "label", "type": "str"},
-                {"name": "active", "type": "bool"},
+        if SCHEMA_STYLE == "operator-backed":
+            self.schema_config = [
+                {"name": "core_int", "type": FieldType.INT},
+                {"name": "core_float", "type": FieldType.FLOAT},
+                {"name": "core_bool", "type": FieldType.BOOL},
+                {"name": "core_text", "type": FieldType.STRING},
+                {"name": "core_uuid", "type": FieldType.UUID},
+                {"name": "core_dt", "type": FieldType.DATETIME},
+                {"name": "meta_json", "type": FieldType.JSON},
+                {"name": "tags_array", "type": FieldType.ARRAY_INT, "max_capacity": self.array_capacity},
+                {"name": "labels_array", "type": FieldType.ARRAY_STR, "max_capacity": self.array_capacity},
+                {"name": "scores_array", "type": FieldType.ARRAY_FLOAT, "max_capacity": self.array_capacity},
+                {"name": "location_geo", "type": FieldType.GEO},
+                {
+                    "name": "items_nested",
+                    "type": FieldType.ARRAY_OBJECT,
+                    "sub_fields": [
+                        {"name": "score", "type": "int"},
+                        {"name": "label", "type": "str"},
+                        {"name": "active", "type": "bool"},
+                    ],
+                },
             ]
-        })
+            extra_low, extra_high = SCHEMA_EXTRA_FIELDS_RANGE
+            extra_types_pool = [
+                FieldType.INT,
+                FieldType.FLOAT,
+                FieldType.BOOL,
+                FieldType.STRING,
+                FieldType.UUID,
+                FieldType.DATETIME,
+            ]
+            extra_count = random.randint(extra_low, extra_high)
+            for i in range(extra_count):
+                ftype = random.choice(extra_types_pool)
+                self.schema_config.append({"name": f"aux_{i}_{ftype.lower()}", "type": ftype})
+        else:
+            num_fields = random.randint(*SCHEMA_EXTRA_FIELDS_RANGE)
+            types_pool = [FieldType.INT, FieldType.FLOAT, FieldType.BOOL, FieldType.STRING, FieldType.UUID, FieldType.DATETIME]
+
+            for i in range(num_fields):
+                ftype = random.choice(types_pool)
+                self.schema_config.append({"name": f"c{i}", "type": ftype})
+
+            self.schema_config.append({"name": "meta_json", "type": FieldType.JSON})
+            self.schema_config.append({
+                "name": "tags_array",
+                "type": FieldType.ARRAY_INT,
+                "max_capacity": self.array_capacity
+            })
+            self.schema_config.append({
+                "name": "labels_array",
+                "type": FieldType.ARRAY_STR,
+                "max_capacity": self.array_capacity
+            })
+            self.schema_config.append({
+                "name": "scores_array",
+                "type": FieldType.ARRAY_FLOAT,
+                "max_capacity": self.array_capacity
+            })
+            self.schema_config.append({"name": "location_geo", "type": FieldType.GEO})
+            self.schema_config.append({
+                "name": "items_nested",
+                "type": FieldType.ARRAY_OBJECT,
+                "sub_fields": [
+                    {"name": "score", "type": "int"},
+                    {"name": "label", "type": "str"},
+                    {"name": "active", "type": "bool"},
+                ]
+            })
 
         for field in self.schema_config:
             field["index_profile"] = choose_index_profile(field["type"])
 
         print(f"   -> Generated {len(self.schema_config)} dynamic fields (plus id & vector).")
+        print(f"   -> Schema style: {SCHEMA_STYLE}")
         print("   -> Schema Structure:")
         for f in self.schema_config:
             t_name = get_type_name(f["type"])
@@ -5317,6 +5650,406 @@ class PQSQueryGenerator(OracleQueryGenerator):
         return self._gen_fallback_tautology()
 
 
+class FormulaQueryGenerator(OracleQueryGenerator):
+    """为主 Oracle/PQS 模式生成可解释、可对账的 FormulaQuery 子案例。"""
+
+    def _numeric_scalar(self, value):
+        if self._is_na_like(value):
+            return None
+        if isinstance(value, (bool, np.bool_)):
+            return None
+        if hasattr(value, "item"):
+            try:
+                value = value.item()
+            except Exception:
+                return None
+        try:
+            numeric = float(value)
+        except Exception:
+            return None
+        if not math.isfinite(numeric):
+            return None
+        return numeric
+
+    def _score_is_safe(self, value: float | None) -> bool:
+        if value is None:
+            return False
+        return math.isfinite(value) and abs(float(value)) <= FORMULA_SAFE_SCORE_LIMIT
+
+    def _numeric_field_names(self) -> list[str]:
+        return [field["name"] for field in self.schema if field["type"] in (FieldType.INT, FieldType.FLOAT)]
+
+    def _series_numeric_mask(self, name: str, predicate=None) -> pd.Series:
+        series = self.df[name]
+        present_mask = self._field_presence(name)
+
+        def _check(value):
+            numeric = self._numeric_scalar(value)
+            if numeric is None:
+                return False
+            if predicate is not None and not predicate(numeric):
+                return False
+            return True
+
+        return self._safe_apply(series, _check).astype(bool) & present_mask
+
+    def _row_numeric_value(self, row, name: str):
+        return self._numeric_scalar(row.get(name))
+
+    def _pivot_has_field(self, pivot_row, name: str) -> bool:
+        if pivot_row is None:
+            return True
+        pivot_id = pivot_row.get("id")
+        if pivot_id is None:
+            return False
+        matched = self.df.index[self.df["id"] == int(pivot_id)].tolist()
+        if not matched:
+            return False
+        return bool(self._field_presence(name).loc[matched[0]])
+
+    def _range_filter(self, name: str, *, gt=None, gte=None, lt=None, lte=None):
+        kwargs = {}
+        if gt is not None:
+            kwargs["gt"] = gt
+        if gte is not None:
+            kwargs["gte"] = gte
+        if lt is not None:
+            kwargs["lt"] = lt
+        if lte is not None:
+            kwargs["lte"] = lte
+        return Filter(must=[FieldCondition(key=name, range=Range(**kwargs))])
+
+    def _all_filters(self, *filters):
+        normalized = []
+        for item in filters:
+            if item is None:
+                continue
+            if isinstance(item, Filter):
+                normalized.append(item)
+            else:
+                normalized.append(Filter(must=[item]))
+        if not normalized:
+            return None
+        if len(normalized) == 1:
+            return normalized[0]
+        return Filter(must=normalized)
+
+    def _bounded_abs_filter(self, name: str, bound: float | None):
+        if bound is None:
+            return None
+        try:
+            numeric_bound = float(bound)
+        except Exception:
+            return None
+        if not math.isfinite(numeric_bound) or numeric_bound <= 0:
+            return None
+        return self._range_filter(name, gte=-numeric_bound, lte=numeric_bound)
+
+    def _build_case(self, *, mask: pd.Series, formula_query: FormulaQuery, prefetch_filter, expr: str, scorer):
+        clean_mask = self._as_bool_mask(mask).fillna(False).astype(bool)
+        if not bool(clean_mask.any()):
+            return None
+
+        expected_scores: dict[int, float] = {}
+        for idx in self.df.index[clean_mask]:
+            row = self.df.loc[idx]
+            point_id = int(row["id"])
+            try:
+                value = scorer(row)
+            except Exception:
+                return None
+            if not self._score_is_safe(value):
+                return None
+            expected_scores[point_id] = float(value)
+
+        if not expected_scores:
+            return None
+
+        return {
+            "query": formula_query,
+            "prefetch_filter": prefetch_filter,
+            "expected_scores": expected_scores,
+            "expr": expr,
+            "query_limit": len(expected_scores),
+        }
+
+    def _build_unary_case(self, *, name: str, mask: pd.Series, query_expr: FormulaQuery, expr: str, scorer, extra_filters=None):
+        filters = [self._qdrant_not_empty_filter(name)]
+        if extra_filters:
+            filters.extend(extra_filters)
+        prefilter = self._all_filters(*filters)
+        return self._build_case(mask=mask, formula_query=query_expr, prefetch_filter=prefilter, expr=expr, scorer=scorer)
+
+    def _build_binary_case(
+        self,
+        *,
+        left_name: str,
+        right_name: str | None,
+        mask: pd.Series,
+        query_expr: FormulaQuery,
+        expr: str,
+        scorer,
+        extra_filters=None,
+    ):
+        filters = [self._qdrant_not_empty_filter(left_name)]
+        if right_name is not None:
+            filters.append(self._qdrant_not_empty_filter(right_name))
+        if extra_filters:
+            filters.extend(extra_filters)
+        prefilter = self._all_filters(*filters)
+        return self._build_case(mask=mask, formula_query=query_expr, prefetch_filter=prefilter, expr=expr, scorer=scorer)
+
+    def _pick_numeric_field(self, *, pivot_row=None, predicate=None):
+        candidates = self._numeric_field_names()
+        random.shuffle(candidates)
+        for name in candidates:
+            mask = self._series_numeric_mask(name, predicate=predicate)
+            if not bool(mask.any()):
+                continue
+            if pivot_row is not None:
+                if not self._pivot_has_field(pivot_row, name):
+                    continue
+                pivot_value = self._row_numeric_value(pivot_row, name)
+                if pivot_value is None or (predicate is not None and not predicate(pivot_value)):
+                    continue
+            return name, mask
+        return None, None
+
+    def _pick_numeric_pair(self, *, pivot_row=None, predicate=None):
+        fields = self._numeric_field_names()
+        random.shuffle(fields)
+        for left_name in fields:
+            for right_name in fields:
+                if left_name == right_name:
+                    continue
+                left_series = self.df[left_name]
+                right_series = self.df[right_name]
+
+                def _pair_ok(row):
+                    row_index = row.name
+                    if not bool(self._field_presence(left_name).loc[row_index]):
+                        return False
+                    if not bool(self._field_presence(right_name).loc[row_index]):
+                        return False
+                    left_value = self._numeric_scalar(row[left_name])
+                    right_value = self._numeric_scalar(row[right_name])
+                    if left_value is None or right_value is None:
+                        return False
+                    if predicate is not None and not predicate(left_value, right_value):
+                        return False
+                    return True
+
+                mask = self.df.apply(_pair_ok, axis=1).astype(bool)
+                if not bool(mask.any()):
+                    continue
+                if pivot_row is not None:
+                    if not self._pivot_has_field(pivot_row, left_name) or not self._pivot_has_field(pivot_row, right_name):
+                        continue
+                    left_value = self._row_numeric_value(pivot_row, left_name)
+                    right_value = self._row_numeric_value(pivot_row, right_name)
+                    if left_value is None or right_value is None:
+                        continue
+                    if predicate is not None and not predicate(left_value, right_value):
+                        continue
+                return left_name, right_name, mask
+        return None, None, None
+
+    def _abs_case(self, pivot_row=None):
+        name, mask = self._pick_numeric_field(pivot_row=pivot_row)
+        if not name:
+            return None
+        query = FormulaQuery(formula=AbsExpression(abs=name))
+        scorer = lambda row, n=name: abs(self._numeric_scalar(row[n]))
+        return self._build_unary_case(name=name, mask=mask, query_expr=query, expr=f"score := abs({name})", scorer=scorer)
+
+    def _neg_case(self, pivot_row=None):
+        name, mask = self._pick_numeric_field(pivot_row=pivot_row)
+        if not name:
+            return None
+        query = FormulaQuery(formula=NegExpression(neg=name))
+        scorer = lambda row, n=name: -self._numeric_scalar(row[n])
+        return self._build_unary_case(name=name, mask=mask, query_expr=query, expr=f"score := -{name}", scorer=scorer)
+
+    def _exp_case(self, pivot_row=None):
+        name, mask = self._pick_numeric_field(
+            pivot_row=pivot_row,
+            predicate=lambda value: FORMULA_SAFE_EXP_MIN <= value <= FORMULA_SAFE_EXP_MAX,
+        )
+        if not name:
+            return None
+        range_filter = self._range_filter(name, gte=FORMULA_SAFE_EXP_MIN, lte=FORMULA_SAFE_EXP_MAX)
+        query = FormulaQuery(formula=ExpExpression(exp=name))
+        scorer = lambda row, n=name: math.exp(self._numeric_scalar(row[n]))
+        return self._build_case(mask=mask, formula_query=query, prefetch_filter=range_filter, expr=f"score := exp({name})", scorer=scorer)
+
+    def _ln_case(self, pivot_row=None):
+        name, mask = self._pick_numeric_field(
+            pivot_row=pivot_row,
+            predicate=lambda value: value > FORMULA_SAFE_LOG_MIN,
+        )
+        if not name:
+            return None
+        range_filter = self._range_filter(name, gt=FORMULA_SAFE_LOG_MIN)
+        query = FormulaQuery(formula=LnExpression(ln=name))
+        scorer = lambda row, n=name: math.log(self._numeric_scalar(row[n]))
+        return self._build_case(mask=mask, formula_query=query, prefetch_filter=range_filter, expr=f"score := ln({name})", scorer=scorer)
+
+    def _log10_case(self, pivot_row=None):
+        name, mask = self._pick_numeric_field(
+            pivot_row=pivot_row,
+            predicate=lambda value: value > FORMULA_SAFE_LOG_MIN,
+        )
+        if not name:
+            return None
+        range_filter = self._range_filter(name, gt=FORMULA_SAFE_LOG_MIN)
+        query = FormulaQuery(formula=Log10Expression(log10=name))
+        scorer = lambda row, n=name: math.log10(self._numeric_scalar(row[n]))
+        return self._build_case(mask=mask, formula_query=query, prefetch_filter=range_filter, expr=f"score := log10({name})", scorer=scorer)
+
+    def _sqrt_case(self, pivot_row=None):
+        name, mask = self._pick_numeric_field(
+            pivot_row=pivot_row,
+            predicate=lambda value: 0.0 <= value <= FORMULA_MAX_ABS_INPUT,
+        )
+        if not name:
+            return None
+        range_filter = self._range_filter(name, gte=0.0, lte=FORMULA_MAX_ABS_INPUT)
+        query = FormulaQuery(formula=SqrtExpression(sqrt=name))
+        scorer = lambda row, n=name: math.sqrt(self._numeric_scalar(row[n]))
+        return self._build_case(mask=mask, formula_query=query, prefetch_filter=range_filter, expr=f"score := sqrt({name})", scorer=scorer)
+
+    def _div_const_case(self, pivot_row=None):
+        divisor = random.choice([0.5, 2.0, -2.0])
+        name, mask = self._pick_numeric_field(
+            pivot_row=pivot_row,
+            predicate=lambda value, d=divisor: self._score_is_safe(value / d),
+        )
+        if not name:
+            return None
+        query = FormulaQuery(formula=DivExpression(div=DivParams(left=name, right=divisor)))
+        scorer = lambda row, n=name, d=divisor: self._numeric_scalar(row[n]) / d
+        safe_input_bound = FORMULA_SAFE_SCORE_LIMIT * abs(float(divisor))
+        return self._build_unary_case(
+            name=name,
+            mask=mask,
+            query_expr=query,
+            expr=f"score := {name} / {divisor}",
+            scorer=scorer,
+            extra_filters=[self._bounded_abs_filter(name, safe_input_bound)],
+        )
+
+    def _pow_square_case(self, pivot_row=None):
+        name, mask = self._pick_numeric_field(
+            pivot_row=pivot_row,
+            predicate=lambda value: abs(value) <= math.sqrt(FORMULA_SAFE_SCORE_LIMIT),
+        )
+        if not name:
+            return None
+        query = FormulaQuery(formula=PowExpression(pow=PowParams(base=name, exponent=2.0)))
+        scorer = lambda row, n=name: self._numeric_scalar(row[n]) ** 2.0
+        return self._build_unary_case(
+            name=name,
+            mask=mask,
+            query_expr=query,
+            expr=f"score := pow({name}, 2.0)",
+            scorer=scorer,
+            extra_filters=[self._bounded_abs_filter(name, math.sqrt(FORMULA_SAFE_SCORE_LIMIT))],
+        )
+
+    def _sum_fields_case(self, pivot_row=None):
+        left_name, right_name, mask = self._pick_numeric_pair(
+            pivot_row=pivot_row,
+            predicate=lambda left, right: self._score_is_safe(left + right),
+        )
+        if not left_name or not right_name:
+            return None
+        query = FormulaQuery(formula=SumExpression(sum=[left_name, right_name]))
+        scorer = lambda row, a=left_name, b=right_name: self._numeric_scalar(row[a]) + self._numeric_scalar(row[b])
+        return self._build_binary_case(
+            left_name=left_name,
+            right_name=right_name,
+            mask=mask,
+            query_expr=query,
+            expr=f"score := {left_name} + {right_name}",
+            scorer=scorer,
+            extra_filters=[
+                self._bounded_abs_filter(left_name, FORMULA_SAFE_SCORE_LIMIT / 2.0),
+                self._bounded_abs_filter(right_name, FORMULA_SAFE_SCORE_LIMIT / 2.0),
+            ],
+        )
+
+    def _mult_fields_case(self, pivot_row=None):
+        left_name, right_name, mask = self._pick_numeric_pair(
+            pivot_row=pivot_row,
+            predicate=lambda left, right: self._score_is_safe(left * right),
+        )
+        if not left_name or not right_name:
+            return None
+        query = FormulaQuery(formula=MultExpression(mult=[left_name, right_name]))
+        scorer = lambda row, a=left_name, b=right_name: self._numeric_scalar(row[a]) * self._numeric_scalar(row[b])
+        return self._build_binary_case(
+            left_name=left_name,
+            right_name=right_name,
+            mask=mask,
+            query_expr=query,
+            expr=f"score := {left_name} * {right_name}",
+            scorer=scorer,
+            extra_filters=[
+                self._bounded_abs_filter(left_name, math.sqrt(FORMULA_SAFE_SCORE_LIMIT)),
+                self._bounded_abs_filter(right_name, math.sqrt(FORMULA_SAFE_SCORE_LIMIT)),
+            ],
+        )
+
+    def gen_formula_case(self, pivot_row=None):
+        builders = [
+            self._abs_case,
+            self._neg_case,
+            self._exp_case,
+            self._ln_case,
+            self._log10_case,
+            self._sqrt_case,
+            self._div_const_case,
+            self._pow_square_case,
+            self._sum_fields_case,
+            self._mult_fields_case,
+        ]
+        random.shuffle(builders)
+        for builder in builders:
+            case = builder(pivot_row=pivot_row)
+            if not case:
+                continue
+            if pivot_row is not None:
+                pivot_id = int(pivot_row["id"])
+                if pivot_id not in case["expected_scores"]:
+                    continue
+                case["pivot_id"] = pivot_id
+            return case
+        return None
+
+
+def execute_formula_query_case(qm, dm, formula_case: dict[str, object]) -> dict[int, float]:
+    if dm.vectors is None or len(dm.vectors) == 0:
+        return {}
+    query_limit = max(1, int(formula_case.get("query_limit") or len(formula_case.get("expected_scores") or {})))
+    vector_index = random.randint(0, len(dm.vectors) - 1)
+    query_vector = dm.vectors[vector_index].tolist()
+    prefetch = Prefetch(
+        query=query_vector,
+        filter=formula_case.get("prefetch_filter"),
+        limit=max(1, len(dm.df)),
+        params=SearchParams(exact=True),
+    )
+    response = qm.query_points(
+        collection_name=COLLECTION_NAME,
+        prefetch=prefetch,
+        query=formula_case["query"],
+        limit=query_limit,
+        with_payload=False,
+        with_vectors=False,
+    )
+    return {int(point.id): float(point.score) for point in response.points}
+
+
 # --- 6. Dynamic Data Operations & Schema Evolution Helpers ---
 
 def _to_native_point_id(value):
@@ -5911,6 +6644,7 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
     print(f"🚀 开始测试 (控制台仅显示失败案例)...")
 
     qg = OracleQueryGenerator(dm)
+    formula_qg = FormulaQueryGenerator(dm)
     failed_cases = []
     known_bug_cases = []
     total_test = rounds
@@ -5943,22 +6677,80 @@ def run(rounds=100, seed=None, enable_dynamic_ops=False):
         for i in range(total_test):
             print(f"\r⏳ Running Test {i+1}/{total_test}...", end="", flush=True)
 
-            # --- Payload 索引随机重建 (每50轮) ---
-            if i > 0 and i % 50 == 0:
+            # --- Payload 索引随机重建 ---
+            if PAYLOAD_INDEX_REBUILD_INTERVAL > 0 and i > 0 and i % PAYLOAD_INDEX_REBUILD_INTERVAL == 0:
                 rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
                 if rebuilt:
                     file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
 
             # --- 动态插入/删除/Upsert ---
-            if enable_dynamic_ops and i > 0 and i % 10 == 0:
+            if enable_dynamic_ops and DYNAMIC_OP_INTERVAL > 0 and i > 0 and i % DYNAMIC_OP_INTERVAL == 0:
                 _do_dynamic_op(dm, qm, file_log)
 
-            # --- Schema Evolution (每30轮) ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            # --- Schema Evolution ---
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 _do_schema_evolution(dm, qm, file_log)
 
+            formula_case = None
+            if random.random() < FORMULA_ORACLE_PROBABILITY:
+                formula_case = formula_qg.gen_formula_case()
+            if formula_case is not None:
+                expr_str = str(formula_case["expr"])
+                expected_scores = dict(formula_case["expected_scores"])
+                expected_ids = set(expected_scores)
+                file_log(f"\n[Test {i}] Formula Expr: {expr_str}")
+                try:
+                    start_t = time.time()
+                    actual_scores = execute_formula_query_case(qm, dm, formula_case)
+                    cost = (time.time() - start_t) * 1000
+                    ok, detail = compare_score_dicts(actual_scores, expected_scores)
+                    file_log(
+                        f"  Formula: Pandas={len(expected_scores)} | Qdrant={len(actual_scores)} | Time: {cost:.1f}ms"
+                    )
+                    if ok:
+                        file_log("  -> MATCH")
+                    else:
+                        print(f"\n❌ [Test {i}] FORMULA MISMATCH!")
+                        print(f"   Expr: {expr_str}")
+                        print(f"   Detail: {detail}")
+                        print(f"   🔑 复现此bug: {reproduce_command}\n")
+                        file_log(f"  -> MISMATCH! {detail}")
+                        actual_ids = set(actual_scores)
+                        missing = expected_ids - actual_ids
+                        extra = actual_ids - expected_ids
+                        if missing:
+                            file_log(f"  Missing rows sample: {sample_rows(missing)}")
+                        if extra:
+                            file_log(f"  Extra rows sample: {sample_rows(extra)}")
+                        failed_cases.append(
+                            {
+                                "id": i,
+                                "expr": expr_str,
+                                "detail": detail,
+                                "seed": current_seed,
+                            }
+                        )
+                    continue
+                except Exception as e:
+                    if is_qdrant_format_error(e):
+                        file_log(f"  -> SKIP INVALID FORMULA QUERY (Qdrant 400 format): {e}")
+                        continue
+                    print(f"\n⚠️ [Test {i}] FORMULA CRASHED!")
+                    print(f"   Expr: {expr_str}")
+                    print(f"   Error: {e}\n")
+                    file_log(f"  -> FORMULA ERROR: {e}")
+                    failed_cases.append(
+                        {
+                            "id": i,
+                            "expr": expr_str,
+                            "detail": f"Formula exception: {e}",
+                            "seed": current_seed,
+                        }
+                    )
+                    continue
+
             # 生成查询
-            depth = random.randint(1, 15)
+            depth = random.randint(*ORACLE_DEPTH_RANGE)
             filter_obj = None
             for _ in range(10):
                 filter_obj, pandas_mask, expr_str = qg.gen_complex_expr(depth)
@@ -6273,24 +7065,24 @@ def run_equivalence_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         for i in range(rounds):
             print(f"\r⚖️  Test {i+1}/{rounds}...", end="", flush=True)
 
-            # --- Payload 索引随机重建 (每50轮) ---
-            if i > 0 and i % 50 == 0:
+            # --- Payload 索引随机重建 ---
+            if PAYLOAD_INDEX_REBUILD_INTERVAL > 0 and i > 0 and i % PAYLOAD_INDEX_REBUILD_INTERVAL == 0:
                 rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
                 if rebuilt:
                     file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
 
-            # --- 动态操作（20% 概率）---
-            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+            # --- 动态操作 ---
+            if enable_dynamic_ops and i > 0 and random.random() < EQUIV_PQS_DYNAMIC_OP_PROBABILITY:
                 _do_dynamic_op(dm, qm, file_log)
 
-            # --- Schema Evolution (每30轮) ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            # --- Schema Evolution ---
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 _do_schema_evolution(dm, qm, file_log)
 
             # 生成基础查询
             base_filter = None
             for _ in range(10):
-                base_filter, _, base_expr = qg.gen_complex_expr(depth=random.randint(1, 12))
+                base_filter, _, base_expr = qg.gen_complex_expr(depth=random.randint(*EQUIV_DEPTH_RANGE))
                 if base_filter: break
             
             if not base_filter: continue
@@ -6466,6 +7258,7 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         print(f"🔧 Synced FLOAT payloads from Qdrant for oracle alignment: {synced} rows.")
 
     pqs_gen = PQSQueryGenerator(dm)
+    formula_qg = FormulaQueryGenerator(dm)
     errors = []
     successful_tests = 0
     skipped_tests = 0
@@ -6502,30 +7295,90 @@ def run_pqs_mode(rounds=100, seed=None, enable_dynamic_ops=False):
         file_log("=" * 80)
 
         for i in range(rounds):
-            # --- Payload 索引随机重建 (每50轮) ---
-            if i > 0 and i % 50 == 0:
+            # --- Payload 索引随机重建 ---
+            if PAYLOAD_INDEX_REBUILD_INTERVAL > 0 and i > 0 and i % PAYLOAD_INDEX_REBUILD_INTERVAL == 0:
                 rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
                 if rebuilt:
                     file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
 
-            # --- 动态操作（20% 概率）---
-            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+            # --- 动态操作 ---
+            if enable_dynamic_ops and i > 0 and random.random() < EQUIV_PQS_DYNAMIC_OP_PROBABILITY:
                 _do_dynamic_op(dm, qm, file_log)
 
-            # --- Schema Evolution (每30轮) ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            # --- Schema Evolution ---
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 _do_schema_evolution(dm, qm, file_log)
 
             random_idx = random.randint(0, len(dm.df) - 1)
             pivot_row = dataframe_row_to_dict(dm.df, random_idx)
             pivot_id = int(pivot_row["id"])
 
+            formula_case = None
+            if random.random() < FORMULA_PQS_PROBABILITY:
+                formula_case = formula_qg.gen_formula_case(pivot_row=pivot_row)
+            if formula_case is not None:
+                expr = str(formula_case["expr"])
+                expected_scores = dict(formula_case["expected_scores"])
+                print(f"\r🧮 [Round {i+1}/{rounds}] Formula check ID: {pivot_id}...", end="", flush=True)
+                log_header = f"[Round {i}] Target ID: {pivot_id}"
+                file_log(f"\n{log_header}")
+                file_log(f"  Formula Expr: {expr}")
+                try:
+                    start_t = time.time()
+                    actual_scores = execute_formula_query_case(qm, dm, formula_case)
+                    cost = (time.time() - start_t) * 1000
+                    ok, detail = compare_score_dicts(actual_scores, expected_scores)
+                    successful_tests += 1
+                    if ok and pivot_id in actual_scores:
+                        file_log(
+                            f"  -> FORMULA PASS | Found: {len(actual_scores)} hits | Time: {cost:.2f}ms"
+                        )
+                    else:
+                        if ok and pivot_id not in actual_scores:
+                            detail = f"pivot {pivot_id} missing from formula result set"
+                        safe_row = safe_format_row(pivot_row)
+                        json_data = safe_row.get("meta_json", {})
+                        scalar_data = {k: v for k, v in safe_row.items() if k != "meta_json"}
+                        print(f"\n\n❌ PQS FORMULA ERROR [Round {i}]")
+                        print(f"   Target ID: {pivot_id}")
+                        print(f"   Expression: {expr}")
+                        print(f"   Detail: {detail}")
+                        print("-" * 50)
+                        print("   🔎 EVIDENCE (Target Row Data):")
+                        print("   [meta_json]:")
+                        print(json.dumps(json_data, indent=4, ensure_ascii=False))
+                        print("   [Scalars]:")
+                        for k, v in scalar_data.items():
+                            print(f"     {k:<15}: {v}")
+                        print("-" * 50)
+                        file_log(f"  -> ❌ FORMULA FAIL! {detail}")
+                        file_log(f"  -> Row Data: {safe_row}")
+                        actual_ids = set(actual_scores)
+                        expected_ids = set(expected_scores)
+                        missing = expected_ids - actual_ids
+                        extra = actual_ids - expected_ids
+                        if missing:
+                            print_diff_evidence(dm, qm, missing, "PQS FORMULA MISSING", expr, file_log)
+                        if extra:
+                            print_diff_evidence(dm, qm, extra, "PQS FORMULA EXTRA", expr, file_log)
+                        errors.append({"id": pivot_id, "expr": expr, "detail": detail, "kind": "formula"})
+                    continue
+                except Exception as e:
+                    if is_qdrant_format_error(e):
+                        skipped_tests += 1
+                        file_log(f"  -> SKIP INVALID FORMULA QUERY (Qdrant 400 format): {e}")
+                        continue
+                    print(f"\n\n⚠️ Formula Execution Error [Round {i}]: {e}")
+                    file_log(f"  -> FORMULA EXECUTION ERROR: {e}")
+                    errors.append({"id": pivot_id, "expr": expr, "detail": f"Formula exception: {e}", "kind": "formula"})
+                    continue
+
             filter_obj = None
             expr = ""
             # 增加重试次数到 20 次
             for retry in range(20):
                 try:
-                    filter_obj, expr = pqs_gen.gen_pqs_filter(pivot_row, depth=random.randint(5, 13))
+                    filter_obj, expr = pqs_gen.gen_pqs_filter(pivot_row, depth=random.randint(*PQS_DEPTH_RANGE))
                     if filter_obj: break
                 except Exception as e:
                     if retry == 19:  # 最后一次重试时记录错误
@@ -6701,18 +7554,18 @@ def run_group_test(rounds=50, seed=None, enable_dynamic_ops=False):
         for i in range(rounds):
             print(f"\r📊 GroupBy Test {i+1}/{rounds}...", end="", flush=True)
 
-            # --- Payload 索引随机重建 (每50轮) ---
-            if i > 0 and i % 50 == 0:
+            # --- Payload 索引随机重建 ---
+            if PAYLOAD_INDEX_REBUILD_INTERVAL > 0 and i > 0 and i % PAYLOAD_INDEX_REBUILD_INTERVAL == 0:
                 rebuilt = qm.rebuild_payload_indexes(dm.schema_config)
                 if rebuilt:
                     file_log(f"[IndexRebuild] Rebuilt indexes for: {rebuilt}")
 
-            # --- 动态操作（20% 概率）---
-            if enable_dynamic_ops and i > 0 and random.random() < 0.2:
+            # --- 动态操作 ---
+            if enable_dynamic_ops and i > 0 and random.random() < GROUP_DYNAMIC_OP_PROBABILITY:
                 _do_dynamic_op(dm, qm, file_log)
 
-            # --- Schema Evolution (每30轮) ---
-            if enable_dynamic_ops and i > 0 and i % 30 == 0:
+            # --- Schema Evolution ---
+            if enable_dynamic_ops and SCHEMA_EVOLUTION_INTERVAL > 0 and i > 0 and i % SCHEMA_EVOLUTION_INTERVAL == 0:
                 _do_schema_evolution(dm, qm, file_log)
 
             group_field = random.choice(potential_group_fields)
@@ -6796,6 +7649,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
   python qdrant_fuzz_oracle.py --dynamic --rounds 300  # 动态操作模式
   python qdrant_fuzz_oracle.py --dynamic --payload-mutations # 动态 payload 更新/删除/覆盖
   python qdrant_fuzz_oracle.py --dynamic --evo-null-sync # 演进字段严格 IsNull 语义
+  python qdrant_fuzz_oracle.py --pqs --scalar-depth-profile pqs-scalar
   python qdrant_fuzz_oracle.py --scroll-mode paged     # 强制使用分页 scroll 路径
   python qdrant_fuzz_oracle.py --prefer-grpc            # 使用 gRPC 查询路径
   python qdrant_fuzz_oracle.py --read-consistency all --write-ordering strong
@@ -6842,6 +7696,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["random", *DISTANCE_NAME_MAP.keys()],
         default="random",
         help="向量距离类型；默认 random，会在每次运行中随机选取一个",
+    )
+    p.add_argument(
+        "--scalar-depth-profile",
+        type=str,
+        choices=sorted(QDRANT_SCALAR_DEPTH_PROFILES.keys()),
+        default=None,
+        help="标量 profile；默认按 mode 自动选择更聚焦的 operator-backed 配置",
     )
     p.add_argument(
         "--log-dir",
@@ -6909,6 +7770,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="允许通用 fuzz 注入已知不稳定的 int64 极值边界（默认关闭，以减少误报）",
     )
+    p.add_argument("--payload-index-rebuild-interval", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--dynamic-op-interval", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--schema-evolution-interval", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--equiv-pqs-dynamic-op-probability", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--group-dynamic-op-probability", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--formula-oracle-probability", type=float, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--formula-pqs-probability", type=float, default=None, help=argparse.SUPPRESS)
 
     return p.parse_args(argv)
 
@@ -6925,16 +7793,39 @@ def main(argv: list[str] | None = None) -> None:
     global _global_id_counter
     global RUN_ID, DISTANCE_ARG, SCROLL_MODE
     global FORCED_COLLECTION_NAME
+    global PAYLOAD_INDEX_REBUILD_INTERVAL, DYNAMIC_OP_INTERVAL, SCHEMA_EVOLUTION_INTERVAL
+    global EQUIV_PQS_DYNAMIC_OP_PROBABILITY, GROUP_DYNAMIC_OP_PROBABILITY
+    global FORMULA_ORACLE_PROBABILITY, FORMULA_PQS_PROBABILITY
 
     args = parse_args(argv)
     if args.payload_mutations:
         args.dynamic = True
+
+    selected_profile = apply_scalar_depth_profile(infer_scalar_depth_profile(args.mode, args.scalar_depth_profile))
+
+    def clamp_probability(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
 
     # 处理 chaos 相关逻辑
     if args.chaos_rate > 0:
         CHAOS_RATE = args.chaos_rate
     elif args.chaos:
         CHAOS_RATE = 0.1
+
+    if args.payload_index_rebuild_interval is not None:
+        PAYLOAD_INDEX_REBUILD_INTERVAL = max(0, int(args.payload_index_rebuild_interval))
+    if args.dynamic_op_interval is not None:
+        DYNAMIC_OP_INTERVAL = max(0, int(args.dynamic_op_interval))
+    if args.schema_evolution_interval is not None:
+        SCHEMA_EVOLUTION_INTERVAL = max(0, int(args.schema_evolution_interval))
+    if args.equiv_pqs_dynamic_op_probability is not None:
+        EQUIV_PQS_DYNAMIC_OP_PROBABILITY = clamp_probability(args.equiv_pqs_dynamic_op_probability)
+    if args.group_dynamic_op_probability is not None:
+        GROUP_DYNAMIC_OP_PROBABILITY = clamp_probability(args.group_dynamic_op_probability)
+    if args.formula_oracle_probability is not None:
+        FORMULA_ORACLE_PROBABILITY = clamp_probability(args.formula_oracle_probability)
+    if args.formula_pqs_probability is not None:
+        FORMULA_PQS_PROBABILITY = clamp_probability(args.formula_pqs_probability)
 
     SCHEMA_EVOLUTION_EXPLICIT_NULL_SYNC = bool(args.evo_null_sync)
     PAYLOAD_MUTATIONS_ENABLED = bool(args.payload_mutations)
@@ -6972,6 +7863,16 @@ def main(argv: list[str] | None = None) -> None:
     print(f"   读一致性:   {READ_CONSISTENCY}")
     print(f"   写排序:     {WRITE_ORDERING}")
     print(f"   数据规模:   rows={N}, dim={DIM}, batch={BATCH_SIZE}, sleep={SLEEP_INTERVAL}")
+    print(f"   Scalar配置: profile={selected_profile}, schema={SCHEMA_STYLE}")
+    print(
+        "   调度节奏:   "
+        f"rebuild={PAYLOAD_INDEX_REBUILD_INTERVAL}, dynamic={DYNAMIC_OP_INTERVAL}, "
+        f"evolution={SCHEMA_EVOLUTION_INTERVAL}"
+    )
+    print(
+        "   公式占比:   "
+        f"oracle={FORMULA_ORACLE_PROBABILITY:.2f}, pqs={FORMULA_PQS_PROBABILITY:.2f}"
+    )
     print(f"   Scroll策略: {SCROLL_MODE}")
     print(f"   距离度量:   {args.distance}")
     print(f"   日志目录:   {display_path(LOG_DIR)}")
@@ -6990,10 +7891,18 @@ def main(argv: list[str] | None = None) -> None:
     print("   已知边界标记: ±float32 最大有限值保留参与 fuzz，相关 mismatch 会标记为边界候选")
     if args.dynamic:
         effective_rounds = args.pqs_rounds if args.mode == "pqs" else args.rounds
-        if effective_rounds < 30:
-            print("   ⚠️  提示: 当前 dynamic 轮次 < 30，Schema Evolution 不会触发，missing-field 语义覆盖有限")
+        if SCHEMA_EVOLUTION_INTERVAL <= 0:
+            print("   Missing覆盖: 当前 profile 已关闭 Schema Evolution")
+        elif effective_rounds < SCHEMA_EVOLUTION_INTERVAL:
+            print(
+                "   ⚠️  提示: 当前 dynamic 轮次 < "
+                f"{SCHEMA_EVOLUTION_INTERVAL}，Schema Evolution 不会触发，missing-field 语义覆盖有限"
+            )
         else:
-            print("   Missing覆盖: 将在第 30 轮触发 Schema Evolution，覆盖真正 missing field 路径")
+            print(
+                "   Missing覆盖: 将在第 "
+                f"{SCHEMA_EVOLUTION_INTERVAL} 轮触发 Schema Evolution，覆盖真正 missing field 路径"
+            )
     print("=" * 80)
 
     # Dispatch

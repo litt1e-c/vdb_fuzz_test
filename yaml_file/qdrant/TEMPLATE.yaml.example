@@ -1,0 +1,21 @@
+# Field template for a Qdrant operator oracle entry.
+# Required fields use concrete placeholders. Optional fields may stay empty.
+
+operator_id: example_operator
+family: comparison
+syntax_examples:
+  - 'FieldCondition(key="price", range=Range(gte=100, lte=200))'
+  - 'FieldCondition(key="status", match=MatchValue(value="active"))'
+doc_status: operator_documented
+doc_source_urls:
+  - https://qdrant.tech/documentation/concepts/filtering/
+doc_supported_types:
+  - scalar_numeric
+doc_semantics: Replace this with the official documented semantics only.
+doc_notes: []
+verify_status: not_tested
+observed_summary: null
+oracle_support: []
+case_refs: []
+repro_path: null
+oracle_mapping: Replace this with a short 1-2 sentence oracle mapping note.

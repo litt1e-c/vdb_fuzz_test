@@ -1,34 +1,30 @@
 operator_id: payload_mutation
 family: other
 syntax_examples:
-  - 'set_payload(collection_name, payload={"status":"published","score":35}, points=[2])'
-  - 'overwrite_payload(collection_name, payload={"status":"review","city":"lisbon"}, points=[3])'
-  - 'delete_payload(collection_name, keys=["status"], points=Filter(must=[FieldCondition(key="city", match=MatchValue(value="rome"))]))'
-  - 'clear_payload(collection_name, points_selector=[6])'
-
+- set_payload(collection_name, payload={"status":"published","score":35}, points=[2])
+- overwrite_payload(collection_name, payload={"status":"review","city":"lisbon"}, points=[3])
+- delete_payload(collection_name, keys=["status"], points=Filter(must=[FieldCondition(key="city", match=MatchValue(value="rome"))]))
 doc_status: family_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/payload/
-  - https://qdrant.tech/documentation/concepts/filtering/
+- https://qdrant.tech/documentation/concepts/payload/
+- https://qdrant.tech/documentation/concepts/filtering/
 doc_supported_types:
-  - scalar_numeric
-  - scalar_text
-  - scalar_bool
-  - dynamic_field
-doc_semantics: "Official Qdrant documentation describes `set_payload`, `overwrite_payload`, `delete_payload`, and `clear_payload` as payload mutation APIs that merge keys, replace the payload, remove selected keys, or clear payload values for selected points."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+- dynamic_field
+doc_semantics: Official Qdrant documentation describes `set_payload`, `overwrite_payload`, `delete_payload`, and `clear_payload` as payload mutation APIs that merge keys, replace the payload, remove selected keys, or clear payload values for selected points.
 doc_notes:
-  - "This YAML entry groups a documented family of payload mutation APIs under one validation target."
-  - "This oracle deliberately validates only post-mutation filter semantics that are already validated elsewhere in the repository: exact match, numeric range, `is_empty`, and `is_null`."
-  - "The mutation sequence mixes point-id and filter-based selectors because both are relevant to external black-box scalar fuzzing."
-  - "The overwrite case is included specifically because it can remove fields that later indexed filters depend on; this is a common source of subtle bugs."
-  - "The stable operator suite now also validates a safe index-rebuild subset after payload mutation: rebuilding `flag` and `status` indexes after merge/overwrite/delete should preserve the same observed post-mutation scalar truth sets."
-  - "Each post-mutation assertion is cross-checked through `scroll`, exact `count`, and exact `query_points` so update-path bugs can be separated from read-path bugs."
-  - "A stronger out-of-suite bug probe for `clear_payload` followed by payload-index rebuild currently lives in `history_find_bug/qdrant/poc_qdrant_payload_clear_rebuild_is_empty_inconsistency.py` so the main scalar operator suite remains reproducible and does not fail the whole coverage campaign on a known candidate issue."
-
+- This YAML entry groups a documented family of payload mutation APIs under one validation target.
+- 'This oracle deliberately validates only post-mutation filter semantics that are already validated elsewhere in the repository: exact match, numeric range, `is_empty`, and `is_null`.'
+- The mutation sequence mixes point-id and filter-based selectors because both are relevant to external black-box scalar fuzzing.
+- The overwrite case is included specifically because it can remove fields that later indexed filters depend on; this is a common source of subtle bugs.
+- 'The stable operator suite now also validates a safe index-rebuild subset after payload mutation: rebuilding `flag` and `status` indexes after merge/overwrite/delete should preserve the same observed post-mutation scalar truth sets.'
+- Each post-mutation assertion is cross-checked through `scroll`, exact `count`, and exact `query_points` so update-path bugs can be separated from read-path bugs.
+- A stronger out-of-suite bug probe for `clear_payload` followed by payload-index rebuild currently lives in `history_find_bug/qdrant/poc_qdrant_payload_clear_rebuild_is_empty_inconsistency.py` so the main scalar operator suite remains reproducible and does not fail the whole coverage campaign on a known candidate issue.
 verify_status: edge_validated
-observed_summary: "On the validated local setup, REST and gRPC agreed that set_payload merged selected fields both by point-id and filter selector, overwrite_payload replaced the whole payload, delete_payload selected by filter removed the requested key, and clear_payload removed all payload keys so subsequent match/range/is_empty/is_null results changed consistently with the validated scalar semantics. The strengthened operator also rebuilt `flag` and `status` payload indexes after safe mutation phases and observed the same post-mutation answers through scroll, exact count, and exact query_points."
+observed_summary: On the validated local setup, REST and gRPC agreed that set_payload merged selected fields both by point-id and filter selector, overwrite_payload replaced the whole payload, delete_payload selected by filter removed the requested key, and clear_payload removed all payload keys so subsequent match/range/is_empty/is_null results changed consistently with the validated scalar semantics. The strengthened operator also rebuilt `flag` and `status` payload indexes after safe mutation phases and observed the same post-mutation answers through scroll, exact count, and exact query_points.
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/payload_mutation_operator.py
-
-oracle_mapping: "`payload_mutation` does not use the generic pandas/PQS oracle. It applies a deterministic mutation sequence to a fixed fixture and checks only observable post-mutation scalar/filter consequences through `scroll`, exact `count`, and exact `query_points`. Missing-versus-null handling is explicit so deleted keys are not conflated with present null values. A safe rebuild-after-mutation subset is included for `flag` and `status` indexes, while the stronger `clear_payload(null) -> rebuild` candidate remains separate as a bug-repro path rather than part of the stable campaign subset."
+repro_path: ~/compare_test/operator_test/qdrant/payload_mutation_operator.py
+oracle_mapping: '`payload_mutation` does not use the generic pandas/PQS oracle. It applies a deterministic mutation sequence to a fixed fixture and checks only observable post-mutation scalar/filter consequences through `scroll`, exact `count`, and exact `query_points`. Missing-versus-null handling is explicit so deleted keys are not conflated with present null values. A safe rebuild-after-mutation subset is included for `flag` and `status` indexes, while the stronger `clear_payload(null) -> rebuild` candidate remains separate as a bug-repro path rather than part of the stable campaign subset.'

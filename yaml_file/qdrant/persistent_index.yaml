@@ -1,33 +1,29 @@
 operator_id: persistent_index
 family: other
 syntax_examples:
-  - 'create_payload_index(field_name="tenant_kw", field_schema={"type":"keyword","is_tenant":true,"on_disk":true})'
-  - 'create_payload_index(field_name="num_lookup", field_schema={"type":"integer","lookup":true,"range":false,"on_disk":true})'
-  - 'create_payload_index(field_name="num_range", field_schema={"type":"integer","lookup":false,"range":true,"is_principal":true,"on_disk":true})'
-  - 'restart Qdrant, then rerun deterministic filter/facet checks on the same collection'
-
+- create_payload_index(field_name="tenant_kw", field_schema={"type":"keyword","is_tenant":true,"on_disk":true})
+- create_payload_index(field_name="num_lookup", field_schema={"type":"integer","lookup":true,"range":false,"on_disk":true})
+- create_payload_index(field_name="num_range", field_schema={"type":"integer","lookup":false,"range":true,"is_principal":true,"on_disk":true})
 doc_status: derived
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/indexing/
-  - https://qdrant.tech/documentation/concepts/filtering/
-  - https://qdrant.tech/documentation/concepts/payload/
+- https://qdrant.tech/documentation/concepts/indexing/
+- https://qdrant.tech/documentation/concepts/filtering/
+- https://qdrant.tech/documentation/concepts/payload/
 doc_supported_types:
-  - scalar_numeric
-  - scalar_text
-  - scalar_bool
-  - scalar_datetime
-  - array_field
-doc_semantics: "Official Qdrant documentation describes explicit payload index creation, on-disk payload index configuration, filtering over indexed fields, and restart-safe collection state, but it does not define a separate `persistent_index` operator."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+- scalar_datetime
+- array_field
+doc_semantics: Official Qdrant documentation describes explicit payload index creation, on-disk payload index configuration, filtering over indexed fields, and restart-safe collection state, but it does not define a separate `persistent_index` operator.
 doc_notes:
-  - "This is a derived validation target rather than a native Qdrant operator name."
-  - "This file validates recovery of persisted payload index configuration, not just one-process filter correctness."
-  - "The current validated profile set covers keyword tenant, integer lookup-only, integer range-only principal, float principal, bool on-disk, datetime principal, uuid tenant, indexed text, and integer-array indexing."
-  - "This oracle is intentionally deterministic and uses a fixed small fixture so failures are easy to explain in a paper."
-
+- This is a derived validation target rather than a native Qdrant operator name.
+- This file validates recovery of persisted payload index configuration, not just one-process filter correctness.
+- The current validated profile set covers keyword tenant, integer lookup-only, integer range-only principal, float principal, bool on-disk, datetime principal, uuid tenant, indexed text, and integer-array indexing.
+- This oracle is intentionally deterministic and uses a fixed small fixture so failures are easy to explain in a paper.
 verify_status: edge_validated
-observed_summary: "On the local Qdrant setup used for this repository, a deterministic collection preserved keyword/integer/float/bool/datetime/uuid/text/integer-array payload index behavior across a graceful server restart, and both REST and gRPC returned the same post-restart answers."
+observed_summary: On the local Qdrant setup used for this repository, a deterministic collection preserved keyword/integer/float/bool/datetime/uuid/text/integer-array payload index behavior across a graceful server restart, and both REST and gRPC returned the same post-restart answers.
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/persistent_index_operator.py
-
-oracle_mapping: "`persistent_index` does not use the generic pandas/PQS oracle. It uses a two-phase deterministic oracle: prepare a collection with explicit payload index profiles, restart the server, then rerun the same validated filter/facet checks. The goal is to validate restart-aware semantic stability for documented scalar behavior."
+repro_path: ~/compare_test/operator_test/qdrant/persistent_index_operator.py
+oracle_mapping: '`persistent_index` does not use the generic pandas/PQS oracle. It uses a two-phase deterministic oracle: prepare a collection with explicit payload index profiles, restart the server, then rerun the same validated filter/facet checks. The goal is to validate restart-aware semantic stability for documented scalar behavior.'

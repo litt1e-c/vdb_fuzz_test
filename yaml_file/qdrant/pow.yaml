@@ -1,26 +1,23 @@
 operator_id: pow
-family: formula_expression
+family: arithmetic
 syntax_examples:
-  - '{"formula":{"pow":{"base":"price","exponent":2.0}}}'
-  - '{"formula":{"pow":{"base":"neg_price","exponent":0.5}}}'
-  - '{"formula":{"pow":{"base":"price","exponent":"missing_exp"}},"defaults":{"missing_exp":2.0}}'
-
+- '{"formula":{"pow":{"base":"price","exponent":2.0}}}'
+- '{"formula":{"pow":{"base":"neg_price","exponent":0.5}}}'
+- '{"formula":{"pow":{"base":"price","exponent":"missing_exp"}},"defaults":{"missing_exp":2.0}}'
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/concepts/search-relevance/
-  - https://api.qdrant.tech/api-reference/search/query-points
+- https://qdrant.tech/documentation/concepts/search-relevance/
+- https://api.qdrant.tech/api-reference/search/query-points
 doc_supported_types:
-  - numeric_expression
-doc_semantics: "The checked official search-relevance page lists `pow` as an arithmetic expression that raises one expression to the power of another within FormulaQuery-based rescoring."
+- scalar_numeric
+doc_semantics: The checked official search-relevance page lists `pow` as an arithmetic expression that raises one expression to the power of another within FormulaQuery-based rescoring.
 doc_notes:
-  - "The checked concept page does not clearly specify `0^0`, negative-base domain rules, zero-to-negative-exponent behavior, overflow/non-finite score handling, or output precision."
-  - "The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error."
-  - "The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering."
-
+- The checked concept page does not clearly specify `0^0`, negative-base domain rules, zero-to-negative-exponent behavior, overflow/non-finite score handling, or output precision.
+- 'The checked concept page is internally ambiguous about missing variables: one sentence says an absent variable without an explicit default uses `0.0`, while the considerations section says a missing score or variable without a default returns an error.'
+- The checked official page documents formula expressions as part of the Query API relevance pipeline rather than payload filtering.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: finite positive-base squaring worked, `0^0` returned 1, negative bases with integer exponents worked, defaults could supply a missing exponent, negative bases with fractional exponents were rejected, `0^-1` was rejected, and a query containing one overflowing rescored candidate was rejected as a whole rather than returning only the finite rows. Python `:memory:` differed only in using a raw `math domain error` message for the tested `0^-1` case."
+observed_summary: 'On local Qdrant v1.17.0 with qdrant-client v1.17.0, REST, gRPC, and Python `:memory:` agreed on the tested subset: finite positive-base squaring worked, `0^0` returned 1, negative bases with integer exponents worked, defaults could supply a missing exponent, negative bases with fractional exponents were rejected, `0^-1` was rejected, and a query containing one overflowing rescored candidate was rejected as a whole rather than returning only the finite rows. Python `:memory:` differed only in using a raw `math domain error` message for the tested `0^-1` case.'
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/formula/pow_operator.py
-
-oracle_mapping: "`pow` would be mapped to a numeric oracle by evaluating base and exponent over the prefetched candidate set, allowing non-negative bases and non-zero negative bases with integer exponents in the currently validated subset, treating `0^0` as 1, and rejecting domain-error or non-finite results rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `pow`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim."
+repro_path: ~/compare_test/operator_test/qdrant/formula/pow_operator.py
+oracle_mapping: '`pow` would be mapped to a numeric oracle by evaluating base and exponent over the prefetched candidate set, allowing non-negative bases and non-zero negative bases with integer exponents in the currently validated subset, treating `0^0` as 1, and rejecting domain-error or non-finite results rather than assigning scores; current main fuzzer coverage does not implement FormulaQuery or `pow`, so this record documents a validated design target rather than integrated oracle support. This is our oracle assumption, not an official claim.'

@@ -44,7 +44,7 @@ SCALAR_OPERATORS = {
     "heterogeneous_payload": OPERATOR_DIR / "heterogeneous_payload_operator.py",
 }
 
-DEFAULT_OPERATOR_SET = [
+ORACLE_BACKED_OPERATORS = [
     "must",
     "must_not",
     "should",
@@ -54,7 +54,6 @@ DEFAULT_OPERATOR_SET = [
     "range",
     "min_should",
     "datetime_range",
-    "datetime_profile",
     "is_null",
     "is_empty",
     "values_count",
@@ -67,10 +66,27 @@ DEFAULT_OPERATOR_SET = [
     "geo_radius",
     "uuid_match",
     "has_id",
+]
+
+SIDECAR_SEMANTIC_OPERATORS = [
+    "datetime_profile",
     "scroll_pagination",
     "payload_mutation",
     "filter_index_equivalence",
+]
+
+ROBUSTNESS_OPERATORS = [
     "heterogeneous_payload",
+]
+
+DEFAULT_OPERATOR_SET = [
+    *ORACLE_BACKED_OPERATORS,
+    *SIDECAR_SEMANTIC_OPERATORS,
+]
+
+ALL_OPERATOR_SET = [
+    *DEFAULT_OPERATOR_SET,
+    *ROBUSTNESS_OPERATORS,
 ]
 
 
@@ -85,8 +101,15 @@ def slugify(value: object, max_len: int = 48) -> str:
 
 def parse_operator_list(raw: str) -> list[str]:
     token = raw.strip().lower()
-    if token == "all":
-        return list(DEFAULT_OPERATOR_SET)
+    named_groups = {
+        "default": DEFAULT_OPERATOR_SET,
+        "all": ALL_OPERATOR_SET,
+        "oracle_backed": ORACLE_BACKED_OPERATORS,
+        "sidecar": SIDECAR_SEMANTIC_OPERATORS,
+        "robustness": ROBUSTNESS_OPERATORS,
+    }
+    if token in named_groups:
+        return list(named_groups[token])
 
     selected = [item.strip().lower() for item in raw.split(",") if item.strip()]
     unknown = sorted(set(selected) - set(SCALAR_OPERATORS))
@@ -179,8 +202,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--grpc-port", type=int, default=6334, dest="grpc_port", help="Qdrant gRPC port")
     parser.add_argument(
         "--operators",
-        default="all",
-        help="Comma-separated scalar operators to run, or 'all' (default: all)",
+        default="default",
+        help=(
+            "Comma-separated scalar operators to run, or one of "
+            "'default', 'all', 'oracle_backed', 'sidecar', 'robustness' "
+            "(default: default)"
+        ),
     )
     parser.add_argument("--run-id", default="scalar-operator-suite", help="Deterministic run id for collection naming")
     parser.add_argument("--list-operators", action="store_true", help="List available scalar operators and exit")
@@ -188,6 +215,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.list_operators:
+        print("groups: default, all, oracle_backed, sidecar, robustness")
         print("\n".join(SCALAR_OPERATORS))
         return 0
 

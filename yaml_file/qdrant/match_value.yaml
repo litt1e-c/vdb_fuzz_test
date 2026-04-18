@@ -1,31 +1,27 @@
 operator_id: match_value
-family: match_condition
+family: comparison
 syntax_examples:
-  - '{"key":"color","match":{"value":"red"}}'
-  - '{"key":"count","match":{"value":10}}'
-  - '{"key":"flag","match":{"value":true}}'
-
+- '{"key":"color","match":{"value":"red"}}'
+- '{"key":"count","match":{"value":10}}'
+- '{"key":"flag","match":{"value":true}}'
 doc_status: operator_documented
 doc_source_urls:
-  - https://qdrant.tech/documentation/search/filtering/
-  - https://qdrant.tech/documentation/concepts/payload/
+- https://qdrant.tech/documentation/search/filtering/
+- https://qdrant.tech/documentation/concepts/payload/
 doc_supported_types:
-  - keyword
-  - integer
-  - bool
-doc_semantics: "The simplest `match` condition checks whether the stored value equals the given one; it is documented for keyword, integer, and bool payloads, and if several values are stored at least one of them must match."
+- scalar_numeric
+- scalar_text
+- scalar_bool
+doc_semantics: The simplest `match` condition checks whether the stored value equals the given one; it is documented for keyword, integer, and bool payloads, and if several values are stored at least one of them must match.
 doc_notes:
-  - "The checked payload docs state that a filter is not satisfied when the stored value type does not fit the filtering condition."
-  - "The checked payload docs state that arrays satisfy a filter if at least one element meets the condition."
-  - "The checked `match.value` docs do not document float or datetime support."
-
+- The checked payload docs state that a filter is not satisfied when the stored value type does not fit the filtering condition.
+- The checked payload docs state that arrays satisfy a filter if at least one element meets the condition.
+- The checked `match.value` docs do not document float or datetime support.
 verify_status: edge_validated
-observed_summary: "On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched documented exact-equality semantics for keyword/integer/bool scalars and arrays, excluded missing/null and type-mismatched rows, and the tested client model rejected float `MatchValue(value=1.5)` construction."
+observed_summary: On local Qdrant v1.17.0 with qdrant-client v1.17.0, both REST and gRPC matched documented exact-equality semantics for keyword/integer/bool scalars and arrays, excluded missing/null and type-mismatched rows, and the tested client model rejected float `MatchValue(value=1.5)` construction.
 oracle_support:
-  - keyword/integer/bool exact equality
-  - any-element matching for arrays of those supported scalar types
-  - missing/null and type-mismatch treated as non-match in the validated subset
+- pandas
+- pqs
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/match_value_operator.py
-
-oracle_mapping: "`match_value` is mapped to pandas/PQS exact equality on keyword, integer, and bool payloads, with array fields matching if any element equals the target and with missing/null rows treated as non-matches; current fuzzer coverage is limited to that supported scalar subset and explicitly excludes float/datetime `match.value`, while datetime scalar comparison is modeled separately through `datetime_range` closed bounds. This is our oracle assumption, not an official claim."
+repro_path: ~/compare_test/operator_test/qdrant/match_value_operator.py
+oracle_mapping: '`match_value` is mapped to pandas/PQS exact equality on keyword, integer, and bool payloads, with array fields matching if any element equals the target and with missing/null rows treated as non-matches; current fuzzer coverage is limited to that supported scalar subset and explicitly excludes float/datetime `match.value`, while datetime scalar comparison is modeled separately through `datetime_range` closed bounds. This is our oracle assumption, not an official claim.'

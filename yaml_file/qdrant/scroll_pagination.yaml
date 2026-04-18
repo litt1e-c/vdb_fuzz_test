@@ -25,6 +25,6 @@ verify_status: edge_validated
 observed_summary: "The operator is designed to validate deterministic page boundaries, absence of duplicate IDs across pages, ascending/descending ordered scalar scroll, and payload projection across REST and gRPC."
 oracle_support: []
 case_refs: []
-repro_path: /home/caihao/compare_test/operator_test/qdrant/scroll_pagination_operator.py
+repro_path: ~/compare_test/operator_test/qdrant/scroll_pagination_operator.py
 
 oracle_mapping: "`scroll_pagination` does not use the generic pandas/PQS oracle. It uses a deterministic page-boundary oracle with fixed expected ID sequences and ordered results, complementing the main random fuzzer's full-result scroll checks."
